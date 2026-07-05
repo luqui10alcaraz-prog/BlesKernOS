@@ -2,7 +2,7 @@
 
 BlesKernOS is an 32-bit operating system written from scratch in x86 Assembly and C.
 
-It features a custom bootloader, a protected-mode kernel, a graphical desktop environment, a FAT filesystem, native applications, and an experimental Doom port.
+It features a custom bootloader, a protected-mode kernel, a graphical desktop environment, a FAT filesystem, native applications, and an Doom port.
 
 
 ---
