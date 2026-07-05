@@ -4,13 +4,10 @@ BlesKernOS is an experimental 32-bit operating system written from scratch in x8
 
 It features a custom bootloader, a protected-mode kernel, a graphical desktop environment, a FAT filesystem, native applications, and an experimental Doom port.
 
-> ⚠️ Alpha software — intended for learning, experimentation, and OS development.
 
 ---
 
 ## Screenshot
-
-![Desktop](screenshots/desktop.png)
 
 ---
 
