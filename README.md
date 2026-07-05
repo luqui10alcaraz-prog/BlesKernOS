@@ -122,3 +122,4 @@ MIT License.
 - OSDev Wiki
 - James Molloy's Kernel Tutorial
 - Bochs VBE documentation
+- KolibriOS
