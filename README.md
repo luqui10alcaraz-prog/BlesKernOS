@@ -13,6 +13,7 @@ It features a custom bootloader, a protected-mode kernel, a graphical desktop en
 <img width="802" height="602" alt="Captura de pantalla 2026-07-02 224058" src="https://github.com/user-attachments/assets/7512fe19-1ada-4eeb-9eda-c0d91d44f89f" />
 <img width="799" height="600" alt="Captura de pantalla 2026-07-02 224512" src="https://github.com/user-attachments/assets/6f9c2add-6da9-4880-a63b-575e7b3ccf2c" />
 <img width="799" height="599" alt="Captura de pantalla 2026-07-02 224002" src="https://github.com/user-attachments/assets/e7134b00-7bca-4d60-8192-2383515afa01" />
+<img width="796" height="603" alt="Captura de pantalla 2026-07-05 031647" src="https://github.com/user-attachments/assets/01e41ead-1915-4838-b1f8-db01a0f76a2e" />
 <img width="802" height="600" alt="Captura de pantalla 2026-07-05 032937" src="https://github.com/user-attachments/assets/38775fc8-bc0f-4db5-badc-7464a4f49fa9" />
 ---
 
