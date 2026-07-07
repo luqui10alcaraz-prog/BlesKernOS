@@ -40,11 +40,13 @@ It features a custom bootloader, a protected-mode kernel, a graphical desktop en
 
 ### Desktop
 - Window manager
-- Taskbar
+- Taskbar / deskbar
 - Desktop icons
-- Image loading (BMP/GIF)
 - Configurable desktop via INI files
-
+- BMP/GIF image loading
+- Packed icon loading through ICONS.PAK
+- Screensavers
+  
 ### Applications
 - File Browser
 - Text Editor
