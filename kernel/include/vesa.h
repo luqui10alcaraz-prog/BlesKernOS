@@ -4,7 +4,12 @@
 #include "gfx.h"
 
 #define VESA_BOOTINFO_ADDR  0x00000700
-#define VESA_BOOTINFO_MAGIC 0x31495547
+#define VESA_BOOTINFO_MAGIC 0x31495547 /* 'GUI1' */
+
+#define VGA_BOOTINFO_MAGIC  0x31414756 /* 'VGA1' */
+#define VGA_BOOTINFO_TEXT   0
+#define VGA_BOOTINFO_13H    1
+#define VGA_BOOTINFO_12H    2
 
 bool vesa_init_from_bootinfo(gfx_info_t *info);
 bool vesa_attach_lfb(gfx_info_t *info, uint32_t framebuffer, uint16_t width, uint16_t height, uint16_t pitch, uint8_t bpp);

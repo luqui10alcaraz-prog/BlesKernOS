@@ -4,6 +4,11 @@
 
 static gfx_info_t g_gfx;
 
+static uint32_t gfx_bootinfo_read32(uint32_t offset) {
+    volatile uint32_t *p = (volatile uint32_t *)(VESA_BOOTINFO_ADDR + offset);
+    return *p;
+}
+
 static uint32_t gfx_palette_rgb(uint8_t color) {
     static const uint32_t palette[16] = {
         0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA,
@@ -78,12 +83,33 @@ static void gfx_clip_rect(int *x, int *y, int *w, int *h) {
 }
 
 void gfx_init(void) {
+    uint32_t magic;
+
     g_gfx.mode = GFX_MODE_TEXT;
     g_gfx.framebuffer = 0x000B8000;
     g_gfx.width = 80;
     g_gfx.height = 25;
     g_gfx.pitch = 160;
     g_gfx.bpp = 16;
+
+    magic = gfx_bootinfo_read32(0);
+
+    if (magic == VGA_BOOTINFO_MAGIC) {
+        uint32_t requested = gfx_bootinfo_read32(4);
+
+        if (requested == VGA_BOOTINFO_13H) {
+            if (!gfx_vga_set_mode13h(&g_gfx)) gfx_vga_set_text_mode(&g_gfx);
+            return;
+        }
+
+        if (requested == VGA_BOOTINFO_12H) {
+            if (!gfx_vga_set_mode12h(&g_gfx)) gfx_vga_set_text_mode(&g_gfx);
+            return;
+        }
+
+        gfx_vga_set_text_mode(&g_gfx);
+        return;
+    }
 
     (void)vesa_init_from_bootinfo(&g_gfx);
 }

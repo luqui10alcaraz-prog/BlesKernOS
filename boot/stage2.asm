@@ -19,12 +19,25 @@ KERNEL_LOAD_ADDR equ 0x10000    ; Donde cargamos el kernel (64KB mark)
 %ifndef KERNEL_SECTORS
 %define KERNEL_SECTORS 1024     ; Sectores reservados para el kernel (512KB)
 %endif
-KERNEL_START_LBA equ 5          ; LBA donde empieza el kernel en disco
+KERNEL_START_LBA equ 9          ; LBA donde empieza el kernel en disco (Stage2 ahora ocupa 8 sectores)
 FLOPPY_TRACK_SPAN equ 36
 FLOPPY_SECTORS_PER_TRACK equ 18
 BOOTINFO_ADDR    equ 0x0700     ; Datos de video que stage2 pasa al kernel
 VBE_MODEINFO     equ 0x0800     ; Buffer temporal VBE mode info
+VBE_INFO         equ 0x0900     ; Buffer temporal VBE controller info (512 bytes)
+VBE_MAX_PRINTED  equ 18         ; Evita scrollear toda la pantalla si la BIOS lista demasiado
 VBE_DEFAULT_MODE equ 0x114      ; 800x600x16, modo VESA estandar
+
+; Bootinfo extendido para pedir modos VGA desde el kernel.
+; Magic 'VGA1' en little endian: bytes 56 47 41 31.
+VGA_BOOTINFO_MAGIC equ 0x31414756
+VGA_BOOTINFO_TEXT  equ 0
+VGA_BOOTINFO_13H   equ 1
+VGA_BOOTINFO_12H   equ 2
+
+SELECTED_VGA_TEXT  equ 0xFFFF
+SELECTED_VGA_13H   equ 0xFF13
+SELECTED_VGA_12H   equ 0xFF12
 
 ; Dirección donde guardamos el mapa de memoria para pasarle al kernel
 MEM_MAP_ADDR     equ 0x0500
@@ -80,6 +93,9 @@ stage2_start:
 .kernel_ok:
     mov si, msg_kernel_ok
     call print_string
+
+    ; ----- Mostrar modos graficos antes de saltar a VESA -----
+    call select_video_mode
 
     ; ----- PASO 4: Entrar a Modo Protegido -----
     mov si, msg_entering_pm
@@ -403,6 +419,207 @@ load_kernel:
     ret
 
 ; =============================================================================
+; LISTAR Y ELEGIR MODO DE VIDEO ANTES DE ACTIVAR GRAFICOS
+;
+; Nota importante:
+; - Los modos VGA clasicos no se descubren con VBE. Se listan como fallback
+;   fijo porque vienen del estandar VGA/BIOS: texto 03h, 13h y 12h.
+; - Para VESA no dependemos de la lista global 4F00h, porque algunas BIOS la
+;   publican raro. En su lugar probamos exactamente la misma tabla que despues
+;   usa setup_vesa. Asi, lo que se muestra coincide con lo que BlesKernOS puede
+;   intentar usar realmente.
+; =============================================================================
+select_video_mode:
+    pusha
+    push es
+
+    mov word [selected_vbe_mode], 0
+    mov byte [vbe_menu_count], 0
+
+    mov si, msg_vga_header
+    call print_string
+    mov si, msg_vga_text_choice
+    call print_string
+    mov si, msg_vga_13h_note
+    call print_string
+    mov si, msg_vga_12h_note
+    call print_string
+
+    mov si, msg_vesa_header
+    call print_string
+    xor bp, bp                           ; contador de modos VESA validos
+    mov si, vbe_mode_candidates
+
+.vesa_loop:
+    lodsw
+    test ax, ax
+    jz .vesa_done
+    mov [vbe_current_mode], ax
+
+    ; Consultar el modo candidato. Guardamos SI/DS porque algunas BIOS tocan registros.
+    push si
+    push ds
+    xor ax, ax
+    mov es, ax
+    mov di, VBE_MODEINFO
+    mov ax, 0x4F01
+    mov cx, [vbe_current_mode]
+    int 0x10
+    pop ds
+    pop si
+    cmp ax, 0x004F
+    jne .vesa_loop
+
+    ; Filtrar: modo soportado + Linear Framebuffer disponible.
+    test word [VBE_MODEINFO], 0x0001
+    jz .vesa_loop
+    test word [VBE_MODEINFO], 0x0080
+    jz .vesa_loop
+
+    ; El kernel ya maneja estos bpp en vesa_attach_lfb().
+    mov al, [VBE_MODEINFO + 25]
+    cmp al, 16
+    je .store_and_print
+    cmp al, 24
+    je .store_and_print
+    cmp al, 32
+    jne .vesa_loop
+
+.store_and_print:
+    ; Guardar modo en tabla de opciones: opcion 1 => indice 0.
+    cmp bp, 9
+    jae .vesa_loop                       ; menu simple: maximo 9 opciones numericas
+    mov bx, bp
+    shl bx, 1
+    mov ax, [vbe_current_mode]
+    mov [vbe_menu_modes + bx], ax
+
+    ; IMPORTANTE: SI apunta al proximo candidato de vbe_mode_candidates.
+    ; print_string tambien usa SI, asi que hay que guardarlo durante todo el print.
+    push si
+    mov si, msg_choice_prefix
+    call print_string
+    mov ax, bp
+    inc ax
+    call print_dec16
+    mov si, msg_choice_mid
+    call print_string
+    mov ax, [vbe_current_mode]
+    call print_hex16
+    mov si, msg_mode_sep
+    call print_string
+    mov ax, [VBE_MODEINFO + 18]          ; XResolution
+    call print_dec16
+    mov al, 'x'
+    call print_char
+    mov ax, [VBE_MODEINFO + 20]          ; YResolution
+    call print_dec16
+    mov al, 'x'
+    call print_char
+    xor ah, ah
+    mov al, [VBE_MODEINFO + 25]          ; BitsPerPixel
+    call print_dec16
+    mov si, msg_bpp_suffix
+    call print_string
+    pop si
+
+    inc bp
+    mov ax, bp
+    mov [vbe_menu_count], al
+    jmp .vesa_loop
+
+.vesa_done:
+    test bp, bp
+    jnz .ask_choice
+    mov si, msg_no_vesa_modes
+    call print_string
+
+.ask_choice:
+    mov si, msg_choose_mode
+    call print_string
+    xor ax, ax
+    int 0x16                              ; AL = tecla ASCII
+
+    cmp al, '0'
+    je .auto_mode
+    cmp al, 't'
+    je .text_mode
+    cmp al, 'T'
+    je .text_mode
+    cmp al, 'g'
+    je .vga_13h_mode
+    cmp al, 'G'
+    je .vga_13h_mode
+    cmp al, 'h'
+    je .vga_12h_mode
+    cmp al, 'H'
+    je .vga_12h_mode
+
+    ; Elegir VESA por numero 1..9.
+    cmp al, '1'
+    jb .invalid_choice
+    cmp al, '9'
+    ja .invalid_choice
+    sub al, '1'                           ; AL = indice 0..8
+
+    mov bl, [vbe_menu_count]
+    cmp al, bl
+    jae .invalid_choice
+
+    xor bx, bx
+    mov bl, al
+    shl bx, 1
+    mov ax, [vbe_menu_modes + bx]
+    mov [selected_vbe_mode], ax
+
+    mov si, msg_selected_vesa
+    call print_string
+    mov ax, [selected_vbe_mode]
+    call print_hex16
+    mov si, msg_newline
+    call print_string
+    jmp .done
+
+.auto_mode:
+    mov word [selected_vbe_mode], 0
+    mov si, msg_selected_auto
+    call print_string
+    jmp .done
+
+.text_mode:
+    ; Seguro: deja BIOS en modo texto 03h y pide texto al kernel.
+    mov ax, 0x0003
+    int 0x10
+    mov word [selected_vbe_mode], SELECTED_VGA_TEXT
+    mov si, msg_selected_text
+    call print_string
+    jmp .done
+
+.vga_13h_mode:
+    ; No usamos BIOS aca: el kernel aplicara los registros VGA desde gfx_init().
+    mov word [selected_vbe_mode], SELECTED_VGA_13H
+    mov si, msg_selected_13h
+    call print_string
+    jmp .done
+
+.vga_12h_mode:
+    ; No usamos BIOS aca: el kernel aplicara los registros VGA desde gfx_init().
+    mov word [selected_vbe_mode], SELECTED_VGA_12H
+    mov si, msg_selected_12h
+    call print_string
+    jmp .done
+
+.invalid_choice:
+    mov si, msg_invalid_choice
+    call print_string
+    jmp .ask_choice
+
+.done:
+    pop es
+    popa
+    ret
+
+; =============================================================================
 ; CONFIGURAR VESA LFB ANTES DE MODO PROTEGIDO
 ; Bootinfo en 0x0700:
 ;   +0 dword magic 'GUI1'
@@ -418,8 +635,28 @@ setup_vesa:
     push es
 
     mov dword [BOOTINFO_ADDR], 0
+    mov dword [BOOTINFO_ADDR + 4], 0
+
+    ; Si el usuario eligio un modo VGA clasico, no activar VESA.
+    ; Dejamos una marca para que kernel/gfx_init() cambie al modo pedido.
+    cmp word [selected_vbe_mode], SELECTED_VGA_TEXT
+    je .bootinfo_text
+    cmp word [selected_vbe_mode], SELECTED_VGA_13H
+    je .bootinfo_13h
+    cmp word [selected_vbe_mode], SELECTED_VGA_12H
+    je .bootinfo_12h
+
     xor ax, ax
     mov es, ax
+
+    ; Si el usuario eligio un modo VESA concreto, probar ese primero.
+    mov ax, [selected_vbe_mode]
+    test ax, ax
+    jz .auto_list
+    mov [BOOTINFO_ADDR + 15], ax
+    jmp .query_mode
+
+.auto_list:
     mov si, vbe_mode_candidates
 
 .try_mode:
@@ -428,6 +665,8 @@ setup_vesa:
     jz .done
     mov [BOOTINFO_ADDR + 15], ax
 
+.query_mode:
+
     mov di, VBE_MODEINFO
     mov ax, 0x4F01
     mov cx, [BOOTINFO_ADDR + 15]
@@ -435,21 +674,50 @@ setup_vesa:
     int 0x10
     pop si
     cmp ax, 0x004F
-    jne .try_mode
+    jne .mode_failed
 
     test word [VBE_MODEINFO], 0x0001
-    jz .try_mode
+    jz .mode_failed
     test word [VBE_MODEINFO], 0x0080
-    jz .try_mode
+    jz .mode_failed
     mov al, [VBE_MODEINFO + 25]
     cmp al, 16
     je .set_mode
     cmp al, 24
     je .set_mode
     cmp al, 32
-    jne .try_mode
+    je .set_mode
+    jmp .mode_failed
+
+.mode_failed:
+    ; Si era seleccion manual, no seguir leyendo la tabla con SI indefinido.
+    cmp word [selected_vbe_mode], 0
+    jne .done
+    jmp .try_mode
 
 .set_mode:
+    push si
+    mov si, msg_vesa_using
+    call print_string
+    mov ax, [BOOTINFO_ADDR + 15]
+    call print_hex16
+    mov si, msg_mode_sep
+    call print_string
+    mov ax, [VBE_MODEINFO + 18]
+    call print_dec16
+    mov al, 'x'
+    call print_char
+    mov ax, [VBE_MODEINFO + 20]
+    call print_dec16
+    mov al, 'x'
+    call print_char
+    xor ah, ah
+    mov al, [VBE_MODEINFO + 25]
+    call print_dec16
+    mov si, msg_bpp_suffix
+    call print_string
+    pop si
+
     mov ax, 0x4F02
     mov bx, [BOOTINFO_ADDR + 15]
     or bx, 0x4000
@@ -457,7 +725,7 @@ setup_vesa:
     int 0x10
     pop si
     cmp ax, 0x004F
-    jne .try_mode
+    jne .mode_failed
 
     mov dword [BOOTINFO_ADDR], 0x31495547
     mov eax, [VBE_MODEINFO + 40]
@@ -470,6 +738,21 @@ setup_vesa:
     mov [BOOTINFO_ADDR + 12], ax
     mov al, [VBE_MODEINFO + 25]
     mov [BOOTINFO_ADDR + 14], al
+    jmp .done
+
+.bootinfo_text:
+    mov dword [BOOTINFO_ADDR], VGA_BOOTINFO_MAGIC
+    mov word [BOOTINFO_ADDR + 4], VGA_BOOTINFO_TEXT
+    jmp .done
+
+.bootinfo_13h:
+    mov dword [BOOTINFO_ADDR], VGA_BOOTINFO_MAGIC
+    mov word [BOOTINFO_ADDR + 4], VGA_BOOTINFO_13H
+    jmp .done
+
+.bootinfo_12h:
+    mov dword [BOOTINFO_ADDR], VGA_BOOTINFO_MAGIC
+    mov word [BOOTINFO_ADDR + 4], VGA_BOOTINFO_12H
 
 .done:
     pop es
@@ -493,6 +776,77 @@ print_string:
     jz .done
     int 0x10
     jmp .loop
+.done:
+    popa
+    ret
+
+
+print_char:
+    pusha
+    mov ah, 0x0E
+    mov bh, 0x00
+    mov bl, 0x0F
+    int 0x10
+    popa
+    ret
+
+print_hex16:
+    pusha
+    mov dx, ax
+    mov cx, 4
+.hex_loop:
+    rol dx, 4
+    mov al, dl
+    and al, 0x0F
+    cmp al, 9
+    jbe .digit
+    add al, 'A' - 10
+    jmp .emit
+.digit:
+    add al, '0'
+.emit:
+    ; Algunas BIOS no preservan CX/BX en int 10h.
+    ; Guardamos CX porque lo usa LOOP y no usamos BX para guardar el numero.
+    push cx
+    mov ah, 0x0E
+    mov bh, 0x00
+    mov bl, 0x0F
+    int 0x10
+    pop cx
+    loop .hex_loop
+    popa
+    ret
+
+print_dec16:
+    pusha
+    cmp ax, 0
+    jne .convert
+    mov al, '0'
+    mov ah, 0x0E
+    mov bh, 0x00
+    mov bl, 0x0F
+    int 0x10
+    jmp .done
+.convert:
+    xor cx, cx
+    mov bx, 10
+.div_loop:
+    xor dx, dx
+    div bx
+    push dx
+    inc cx
+    test ax, ax
+    jnz .div_loop
+.print_loop:
+    pop ax
+    add al, '0'
+    push cx
+    mov ah, 0x0E
+    mov bh, 0x00
+    mov bl, 0x0F
+    int 0x10
+    pop cx
+    loop .print_loop
 .done:
     popa
     ret
@@ -554,6 +908,30 @@ msg_loading_kernel  db '  > Cargando kernel...', 0x0D, 0x0A, 0
 msg_kernel_ok       db '  [OK] Kernel en memoria.', 0x0D, 0x0A, 0
 msg_kernel_fail     db '  [ERROR] No se pudo cargar kernel!', 0x0D, 0x0A, 0
 msg_entering_pm     db '  > Entrando a Modo Protegido...', 0x0D, 0x0A, 0
+msg_vga_header      db '  > Modos VGA compatibles:', 0x0D, 0x0A, 0
+msg_vga_text_choice db '    T. VGA 03h: 80x25 texto', 0x0D, 0x0A, 0
+msg_vga_13h_note    db '    G. VGA 13h: 320x200x8', 0x0D, 0x0A, 0
+msg_vga_12h_note    db '    H. VGA 12h: 640x480x4', 0x0D, 0x0A, 0
+msg_vesa_header     db '  > Modos VESA LFB compatibles:', 0x0D, 0x0A, 0
+msg_choice_prefix   db '    ', 0
+msg_choice_mid      db '. VESA 0x', 0
+msg_mode_prefix     db '    - VESA 0x', 0
+msg_mode_sep        db ': ', 0
+msg_bpp_suffix      db ' bpp', 0x0D, 0x0A, 0
+msg_no_vesa_modes   db '    No se encontraron modos VESA LFB compatibles.', 0x0D, 0x0A, 0
+msg_choose_mode     db '  Elegi modo: 1-9 VESA, 0 auto, T texto, G 13h, H 12h: ', 0
+msg_invalid_choice  db 0x0D, 0x0A, '  Opcion invalida.', 0x0D, 0x0A, 0
+msg_selected_vesa   db 0x0D, 0x0A, '  > Seleccionado VESA 0x', 0
+msg_selected_auto   db 0x0D, 0x0A, '  > Seleccion automatica VESA.', 0x0D, 0x0A, 0
+msg_selected_text   db 0x0D, 0x0A, '  > Seleccionado VGA texto.', 0x0D, 0x0A, 0
+msg_selected_13h    db 0x0D, 0x0A, '  > Seleccionado VGA 13h. El kernel aplicara el modo.', 0x0D, 0x0A, 0
+msg_selected_12h    db 0x0D, 0x0A, '  > Seleccionado VGA 12h. El kernel aplicara el modo.', 0x0D, 0x0A, 0
+msg_newline         db 0x0D, 0x0A, 0
+msg_vesa_using      db '  > Usando modo VESA 0x', 0
+vbe_current_mode    dw 0
+selected_vbe_mode   dw 0       ; 0=auto, 0xFFFF=VGA texto, otro=modo VESA elegido
+vbe_menu_count      db 0
+vbe_menu_modes      times 9 dw 0
 
 ; =============================================================================
 ; CÓDIGO DE 32 BITS — Modo Protegido
@@ -602,5 +980,5 @@ pm_print:
 
 pm_msg db '  [32-bit] Modo Protegido OK! Saltando al kernel...', 0
 
-; Rellenar hasta el limite de Stage 2 (4 sectores = 2048 bytes)
-times (4 * 512) - ($ - $$) db 0
+; Rellenar hasta el limite de Stage 2 (8 sectores = 4096 bytes)
+times (8 * 512) - ($ - $$) db 0

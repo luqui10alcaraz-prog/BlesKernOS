@@ -12,8 +12,9 @@
 #define DESKBAR_MENU_W         240
 #define DESKBAR_SUBMENU_W      200
 #define DESKBAR_ITEM_H         32
-#define DESKBAR_MAIN_ITEMS     5
-#define DESKBAR_MAX_SUB_ITEMS  12
+#define DESKBAR_MAIN_ITEMS     7
+#define DESKBAR_MAX_SUB_ITEMS  16
+#define DESKBAR_MAX_CASCADE_LEVELS 4
 #define DESKBAR_CALENDAR_W      405
 #define DESKBAR_CALENDAR_H      285
 
@@ -23,6 +24,7 @@ typedef struct {
     char label[24];
     char path[VFS_MAX_PATH];
     bool enabled;
+    bool is_dir;
 } deskbar_sub_item_t;
 
 typedef struct {
@@ -38,13 +40,24 @@ typedef struct {
     int open_section;
     int hovered_sub_item;
     int pressed_sub_item;
+    int pressed_cascade_level;
+    int pressed_cascade_item;
     int cached_section;
     int cached_count;
     deskbar_sub_item_t cached_items[DESKBAR_MAX_SUB_ITEMS];
+
+    int open_cascade_levels;
+    int cascade_parent_index[DESKBAR_MAX_CASCADE_LEVELS];
+    int hovered_cascade_item[DESKBAR_MAX_CASCADE_LEVELS];
+    int cascade_count[DESKBAR_MAX_CASCADE_LEVELS];
+    char cascade_path[DESKBAR_MAX_CASCADE_LEVELS][VFS_MAX_PATH];
+    deskbar_sub_item_t cascade_items[DESKBAR_MAX_CASCADE_LEVELS][DESKBAR_MAX_SUB_ITEMS];
 } deskbar_state_t;
 
 static const char *g_main_items[DESKBAR_MAIN_ITEMS] = {
     "Sobre BlesKernOS",
+    "Ejecutar...",
+    "Este equipo",
     "Programs",
     "Documents",
     "Misc",
@@ -58,6 +71,26 @@ static void deskbar_copy_text(char *dst, size_t dst_len, const char *src) {
     dst[dst_len - 1] = '\0';
 }
 
+static void deskbar_clear_cascade_from(deskbar_state_t *state, int level) {
+    if (!state) return;
+    if (level < 0) level = 0;
+    if (level > DESKBAR_MAX_CASCADE_LEVELS) level = DESKBAR_MAX_CASCADE_LEVELS;
+
+    for (int i = level; i < DESKBAR_MAX_CASCADE_LEVELS; i++) {
+        state->cascade_parent_index[i] = -1;
+        state->hovered_cascade_item[i] = -1;
+        state->cascade_count[i] = 0;
+        state->cascade_path[i][0] = '\0';
+    }
+
+    if (state->open_cascade_levels > level)
+        state->open_cascade_levels = level;
+    if (state->pressed_cascade_level >= level) {
+        state->pressed_cascade_level = -1;
+        state->pressed_cascade_item = -1;
+    }
+}
+
 static void deskbar_reset_menu_state(deskbar_state_t *state) {
     if (!state) return;
     state->hovered_main_item = -1;
@@ -65,8 +98,12 @@ static void deskbar_reset_menu_state(deskbar_state_t *state) {
     state->open_section = 0;
     state->hovered_sub_item = -1;
     state->pressed_sub_item = -1;
+    state->pressed_cascade_level = -1;
+    state->pressed_cascade_item = -1;
     state->cached_section = -1;
     state->cached_count = 0;
+    state->open_cascade_levels = 0;
+    deskbar_clear_cascade_from(state, 0);
 }
 
 static void deskbar_reset_state(deskbar_state_t *state) {
@@ -142,6 +179,66 @@ static gui_rect_t deskbar_sub_item_rect(const gui_desktop_t *desktop, int sectio
     return (gui_rect_t){menu.x + 3, menu.y + 3 + (item_index * DESKBAR_ITEM_H), menu.w - 6, DESKBAR_ITEM_H};
 }
 
+static gui_rect_t deskbar_cascade_item_rect(const gui_desktop_t *desktop,
+                                            const deskbar_state_t *state,
+                                            int level, int item_index,
+                                            int item_count);
+
+static gui_rect_t deskbar_submenu_from_parent_rect(const gui_desktop_t *desktop,
+                                                   gui_rect_t parent,
+                                                   int item_count) {
+    int height = item_count * DESKBAR_ITEM_H + 6;
+    int y = parent.y;
+    if (y + height > desktop->surface.height - DESKBAR_HEIGHT + 1) {
+        y = (desktop->surface.height - DESKBAR_HEIGHT + 1) - height;
+    }
+    if (y < 0) y = 0;
+    return (gui_rect_t){parent.x + parent.w - 1, y, DESKBAR_SUBMENU_W, height};
+}
+
+static gui_rect_t deskbar_cascade_rect(const gui_desktop_t *desktop,
+                                       const deskbar_state_t *state,
+                                       int level, int item_count) {
+    gui_rect_t parent;
+
+    if (!desktop || !state || level < 0 ||
+        level >= DESKBAR_MAX_CASCADE_LEVELS ||
+        item_count <= 0) {
+        return (gui_rect_t){0, 0, 0, 0};
+    }
+
+    if (level == 0) {
+        parent = deskbar_sub_item_rect(desktop, state->open_section,
+                                       state->cascade_parent_index[0],
+                                       state->cached_count);
+    } else {
+        parent = deskbar_cascade_item_rect(desktop, state, level - 1,
+                                           state->cascade_parent_index[level],
+                                           state->cascade_count[level - 1]);
+    }
+
+    return deskbar_submenu_from_parent_rect(desktop, parent, item_count);
+}
+
+static gui_rect_t deskbar_cascade_item_rect(const gui_desktop_t *desktop,
+                                            const deskbar_state_t *state,
+                                            int level, int item_index,
+                                            int item_count) {
+    gui_rect_t menu = deskbar_cascade_rect(desktop, state, level, item_count);
+    return (gui_rect_t){menu.x + 3, menu.y + 3 + (item_index * DESKBAR_ITEM_H),
+                        menu.w - 6, DESKBAR_ITEM_H};
+}
+
+static int deskbar_hit_cascade_item(const gui_desktop_t *desktop,
+                                    const deskbar_state_t *state,
+                                    int level, int item_count, int x, int y) {
+    for (int i = 0; i < item_count; i++) {
+        if (gui_rect_contains(deskbar_cascade_item_rect(desktop, state,
+                level, i, item_count), x, y)) return i;
+    }
+    return -1;
+}
+
 static void deskbar_draw_panel(gui_surface_t *surface, gui_rect_t rect, uint32_t face, bool sunken) {
     if (!surface || rect.w <= 0 || rect.h <= 0) return;
 
@@ -202,7 +299,7 @@ static void deskbar_power_off(void) {
 }
 
 static bool deskbar_main_item_has_submenu(int index) {
-    return index > 0 && index < DESKBAR_MAIN_ITEMS - 1;
+    return index >= 2 && index < DESKBAR_MAIN_ITEMS - 1;
 }
 
 static void deskbar_make_pretty_name(const char *src, char *dst, size_t dst_len) {
@@ -244,7 +341,7 @@ static void deskbar_join_path(char *dst, size_t dst_len, const char *base, const
 
 static bool deskbar_should_list_entry(const vfs_dir_entry_t *entry) {
     if (!entry) return false;
-    if (entry->type != VFS_NODE_FILE) return false;
+    if (entry->type != VFS_NODE_FILE && entry->type != VFS_NODE_DIR) return false;
     if (!entry->name[0]) return false;
     if (entry->name[0] == '.') return false;
     return true;
@@ -262,43 +359,98 @@ static bool deskbar_is_executable(const char *filename) {
     return false;
 }
 
-static int deskbar_build_submenu(int section, deskbar_sub_item_t *items, int max_items) {
-    const char *dir = NULL;
-    const char *empty_label = "Coming soon";
+static void deskbar_add_menu_entry(deskbar_sub_item_t *item,
+                                   const char *dir,
+                                   const vfs_dir_entry_t *entry) {
+    if (!item || !entry) return;
+    deskbar_make_pretty_name(entry->name, item->label, sizeof(item->label));
+    deskbar_join_path(item->path, sizeof(item->path), dir, entry->name);
+    item->enabled = true;
+    item->is_dir = entry->type == VFS_NODE_DIR;
+}
+
+static int deskbar_build_dir_menu(const char *dir, deskbar_sub_item_t *items,
+                                  int max_items, const char *empty_label) {
     vfs_dir_entry_t entries[DESKBAR_MAX_SUB_ITEMS];
     uint32_t count = 0;
     int actual = 0;
 
     if (!items || max_items <= 0) return 0;
-    if (section == 1) dir = "/PROGRAMS";
-    else if (section == 2) dir = "/DOCS";
-    else if (section == 3) dir = "/MISC";
-    else return 0;
-    if (section == 1) empty_label = "Shell missing";
+    if (!dir) dir = "/";
+    if (!empty_label) empty_label = "Empty";
 
     if (!vfs_listdir(dir, entries, DESKBAR_MAX_SUB_ITEMS, &count) || count == 0) {
         deskbar_copy_text(items[0].label, sizeof(items[0].label), empty_label);
         items[0].path[0] = '\0';
         items[0].enabled = false;
+        items[0].is_dir = false;
         return 1;
     }
 
-    for (uint32_t i = 0; i < count && actual < max_items; i++) {
-        if (!deskbar_should_list_entry(&entries[i])) continue;
-        deskbar_make_pretty_name(entries[i].name, items[actual].label, sizeof(items[actual].label));
-        deskbar_join_path(items[actual].path, sizeof(items[actual].path), dir, entries[i].name);
-        items[actual].enabled = true;
-        actual++;
+    /*
+     * Estilo Windows 95: carpetas primero, archivos despues.
+     * Asi al pasar el cursor por una carpeta se abre la continuacion
+     * hacia la derecha.
+     */
+    for (uint32_t pass = 0; pass < 2 && actual < max_items; pass++) {
+        for (uint32_t i = 0; i < count && actual < max_items; i++) {
+            if (!deskbar_should_list_entry(&entries[i])) continue;
+            if (pass == 0 && entries[i].type != VFS_NODE_DIR) continue;
+            if (pass == 1 && entries[i].type == VFS_NODE_DIR) continue;
+            deskbar_add_menu_entry(&items[actual], dir, &entries[i]);
+            actual++;
+        }
     }
 
     if (actual == 0) {
         deskbar_copy_text(items[0].label, sizeof(items[0].label), empty_label);
         items[0].path[0] = '\0';
         items[0].enabled = false;
+        items[0].is_dir = false;
         return 1;
     }
 
     return actual;
+}
+
+static int deskbar_build_submenu(int section, deskbar_sub_item_t *items, int max_items) {
+    const char *dir = NULL;
+    const char *empty_label = "Coming soon";
+
+    if (section == 2) {
+        dir = "/";
+        empty_label = "Empty";
+    } else if (section == 3) {
+        dir = "/PROGRAMS";
+        empty_label = "Shell missing";
+    } else if (section == 4) {
+        dir = "/DOCS";
+    } else if (section == 5) {
+        dir = "/MISC";
+    } else return 0;
+
+    return deskbar_build_dir_menu(dir, items, max_items, empty_label);
+}
+
+static void deskbar_open_cascade_level(deskbar_state_t *state, int level,
+                                       const char *path, int parent_index) {
+    if (!state || !path) return;
+    if (level < 0 || level >= DESKBAR_MAX_CASCADE_LEVELS) return;
+
+    if (state->open_cascade_levels > level &&
+        state->cascade_parent_index[level] == parent_index &&
+        kstrcmp(state->cascade_path[level], path) == 0) {
+        return;
+    }
+
+    deskbar_clear_cascade_from(state, level);
+    state->cascade_parent_index[level] = parent_index;
+    deskbar_copy_text(state->cascade_path[level],
+                      sizeof(state->cascade_path[level]), path);
+    state->cascade_count[level] = deskbar_build_dir_menu(
+        path, state->cascade_items[level], DESKBAR_MAX_SUB_ITEMS, "Empty");
+    state->hovered_cascade_item[level] = -1;
+    state->open_cascade_levels = level + 1;
 }
 
 static void deskbar_cache_submenu(deskbar_state_t *state, int section) {
@@ -307,6 +459,7 @@ static void deskbar_cache_submenu(deskbar_state_t *state, int section) {
     state->cached_count = deskbar_build_submenu(
         section, state->cached_items, DESKBAR_MAX_SUB_ITEMS);
     state->cached_section = section;
+    deskbar_clear_cascade_from(state, 0);
 }
 
 static int deskbar_window_item_width(gui_window_t *window) {
@@ -421,6 +574,17 @@ static void deskbar_draw_windows(gui_desktop_t *desktop, gui_surface_t *surface,
     task_preempt_enable();
 }
 
+static void deskbar_launch_menu_item(gui_desktop_t *desktop,
+                                     const deskbar_sub_item_t *item) {
+    if (!desktop || !item || !item->enabled || item->is_dir) return;
+
+    if (deskbar_is_executable(item->path)) {
+        (void)program_execute_path(desktop, item->path);
+    } else {
+        texteditor_open(desktop, item->path);
+    }
+}
+
 static void deskbar_paint(gui_program_t *program, gui_desktop_t *desktop, gui_surface_t *surface) {
     deskbar_state_t *state = (deskbar_state_t *)program->state;
     gui_rect_t bar;
@@ -485,7 +649,7 @@ static void deskbar_paint(gui_program_t *program, gui_desktop_t *desktop, gui_su
             deskbar_draw_menu_item(surface, item, g_main_items[i], active,
                                    i == state->pressed_main_item, true,
                                    deskbar_main_item_has_submenu(i));
-            if (i == 0) {
+            if (i == 0 || i == 1) {
                 gui_gfx_fill_rect(surface, (gui_rect_t){item.x + 2, item.y + item.h - 1, item.w - 4, 1}, 0x00807C74);
                 gui_gfx_fill_rect(surface, (gui_rect_t){item.x + 2, item.y + item.h, item.w - 4, 1}, 0x00FFFFFF);
             }
@@ -513,7 +677,33 @@ static void deskbar_paint(gui_program_t *program, gui_desktop_t *desktop, gui_su
                     deskbar_draw_menu_item(surface, item,
                         state->cached_items[i].label, active,
                         i == state->pressed_sub_item,
-                        state->cached_items[i].enabled, false);
+                        state->cached_items[i].enabled,
+                        state->cached_items[i].enabled &&
+                        state->cached_items[i].is_dir);
+                }
+            }
+
+            for (int level = 0; level < state->open_cascade_levels; level++) {
+                int count = state->cascade_count[level];
+                if (count <= 0) continue;
+
+                gui_rect_t cascade = deskbar_cascade_rect(desktop, state,
+                                                          level, count);
+                deskbar_draw_panel(surface, cascade, 0x00C8C8C0, false);
+
+                for (int i = 0; i < count; i++) {
+                    gui_rect_t item = deskbar_cascade_item_rect(desktop,
+                        state, level, i, count);
+                    bool active = i == state->hovered_cascade_item[level];
+                    bool pressed = state->pressed_cascade_level == level &&
+                                   state->pressed_cascade_item == i;
+
+                    deskbar_draw_menu_item(surface, item,
+                        state->cascade_items[level][i].label, active,
+                        pressed,
+                        state->cascade_items[level][i].enabled,
+                        state->cascade_items[level][i].enabled &&
+                        state->cascade_items[level][i].is_dir);
                 }
             }
         }
@@ -534,11 +724,17 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
     int main_hit = -1;
     int sub_hit = -1;
     int sub_count = 0;
+    int cascade_hit_level = -1;
+    int cascade_hit_item = -1;
     gui_window_t *hit_window;
 
     if (!desktop || !event || !state) return false;
-    if (event->type != GUI_EVENT_MOUSE_MOVE && event->type != GUI_EVENT_MOUSE_DOWN && event->type != GUI_EVENT_MOUSE_UP) return false;
-    if (desktop->drag_window && !state->menu_open && !state->button_pressed && state->pressed_window_id == 0) {
+    if (event->type != GUI_EVENT_MOUSE_MOVE &&
+        event->type != GUI_EVENT_MOUSE_DOWN &&
+        event->type != GUI_EVENT_MOUSE_UP) return false;
+
+    if (desktop->drag_window && !state->menu_open &&
+        !state->button_pressed && state->pressed_window_id == 0) {
         state->button_hovered = false;
         state->clock_hovered = false;
         state->hovered_window_id = 0;
@@ -557,14 +753,38 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
     if (state->menu_open) {
         on_menu = gui_rect_contains(menu, event->x, event->y);
         main_hit = deskbar_hit_main_item(desktop, event->x, event->y);
+
         if (deskbar_main_item_has_submenu(state->open_section)) {
             deskbar_cache_submenu(state, state->open_section);
             sub_count = state->cached_count;
+
             if (sub_count > 0) {
-                gui_rect_t submenu = deskbar_submenu_rect(desktop, state->open_section, sub_count);
-                on_submenu = gui_rect_contains(submenu, event->x, event->y);
-                sub_hit = deskbar_hit_sub_item(desktop, state->open_section,
-                    state->cached_items, sub_count, event->x, event->y);
+                gui_rect_t submenu = deskbar_submenu_rect(desktop,
+                    state->open_section, sub_count);
+                if (gui_rect_contains(submenu, event->x, event->y)) {
+                    on_submenu = true;
+                    sub_hit = deskbar_hit_sub_item(desktop,
+                        state->open_section, state->cached_items,
+                        sub_count, event->x, event->y);
+                }
+            }
+
+            for (int level = 0;
+                 level < state->open_cascade_levels &&
+                 level < DESKBAR_MAX_CASCADE_LEVELS;
+                 level++) {
+                int count = state->cascade_count[level];
+                if (count <= 0) continue;
+
+                gui_rect_t cascade = deskbar_cascade_rect(desktop, state,
+                                                          level, count);
+                if (gui_rect_contains(cascade, event->x, event->y)) {
+                    on_submenu = true;
+                    cascade_hit_level = level;
+                    cascade_hit_item = deskbar_hit_cascade_item(desktop,
+                        state, level, count, event->x, event->y);
+                    break;
+                }
             }
         }
     }
@@ -575,15 +795,54 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
         state->hovered_window_id = hit_window ? hit_window->id : 0;
 
         if (state->menu_open) {
-            state->hovered_main_item = main_hit;
-            state->hovered_sub_item = sub_hit;
-            if (deskbar_main_item_has_submenu(main_hit) &&
-                state->open_section != main_hit) {
-                state->open_section = main_hit;
-                deskbar_cache_submenu(state, main_hit);
-            } else if (main_hit >= 0 &&
-                       !deskbar_main_item_has_submenu(main_hit)) {
-                state->open_section = 0;
+            for (int i = 0; i < DESKBAR_MAX_CASCADE_LEVELS; i++)
+                state->hovered_cascade_item[i] = -1;
+
+            if (cascade_hit_level >= 0) {
+                state->hovered_main_item = -1;
+                state->hovered_sub_item = -1;
+                state->hovered_cascade_item[cascade_hit_level] =
+                    cascade_hit_item;
+
+                if (cascade_hit_item >= 0 &&
+                    cascade_hit_level < state->open_cascade_levels) {
+                    deskbar_sub_item_t *item =
+                        &state->cascade_items[cascade_hit_level]
+                                             [cascade_hit_item];
+
+                    if (item->enabled && item->is_dir) {
+                        deskbar_open_cascade_level(state,
+                            cascade_hit_level + 1, item->path,
+                            cascade_hit_item);
+                    } else {
+                        deskbar_clear_cascade_from(state,
+                            cascade_hit_level + 1);
+                    }
+                }
+            } else {
+                state->hovered_main_item = main_hit;
+                state->hovered_sub_item = sub_hit;
+
+                if (deskbar_main_item_has_submenu(main_hit) &&
+                    state->open_section != main_hit) {
+                    state->open_section = main_hit;
+                    deskbar_cache_submenu(state, main_hit);
+                    deskbar_clear_cascade_from(state, 0);
+                } else if (main_hit >= 0 &&
+                           !deskbar_main_item_has_submenu(main_hit)) {
+                    state->open_section = 0;
+                    deskbar_clear_cascade_from(state, 0);
+                } else if (sub_hit >= 0 && sub_hit < sub_count) {
+                    deskbar_sub_item_t *item = &state->cached_items[sub_hit];
+                    if (item->enabled && item->is_dir) {
+                        deskbar_open_cascade_level(state, 0, item->path,
+                                                   sub_hit);
+                    } else {
+                        deskbar_clear_cascade_from(state, 0);
+                    }
+                } else if (!on_submenu && main_hit >= 0) {
+                    deskbar_clear_cascade_from(state, 0);
+                }
             }
         }
 
@@ -598,6 +857,8 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
             state->pressed_window_id = 0;
             state->pressed_main_item = -1;
             state->pressed_sub_item = -1;
+            state->pressed_cascade_level = -1;
+            state->pressed_cascade_item = -1;
             return true;
         }
 
@@ -607,6 +868,8 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
             state->pressed_window_id = 0;
             state->pressed_main_item = -1;
             state->pressed_sub_item = -1;
+            state->pressed_cascade_level = -1;
+            state->pressed_cascade_item = -1;
             return true;
         }
 
@@ -617,20 +880,38 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
             state->pressed_window_id = hit_window->id;
             state->pressed_main_item = -1;
             state->pressed_sub_item = -1;
+            state->pressed_cascade_level = -1;
+            state->pressed_cascade_item = -1;
             return true;
         }
 
         if (state->menu_open) {
-            if (sub_hit >= 0) {
-                state->pressed_sub_item = sub_hit;
+            if (cascade_hit_level >= 0 && cascade_hit_item >= 0) {
+                state->pressed_cascade_level = cascade_hit_level;
+                state->pressed_cascade_item = cascade_hit_item;
+                state->pressed_sub_item = -1;
                 state->pressed_main_item = -1;
                 return true;
             }
+
+            if (sub_hit >= 0) {
+                state->pressed_sub_item = sub_hit;
+                state->pressed_cascade_level = -1;
+                state->pressed_cascade_item = -1;
+                state->pressed_main_item = -1;
+                return true;
+            }
+
             if (main_hit >= 0) {
                 state->pressed_main_item = main_hit;
                 state->pressed_sub_item = -1;
+                state->pressed_cascade_level = -1;
+                state->pressed_cascade_item = -1;
                 return true;
             }
+
+            if (on_menu || on_submenu) return true;
+
             state->menu_open = false;
             deskbar_reset_menu_state(state);
             return on_bar || on_status;
@@ -648,8 +929,8 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
                 state->menu_open = !state->menu_open;
                 deskbar_reset_menu_state(state);
                 if (state->menu_open) {
-                    state->open_section = 1;
-                    deskbar_cache_submenu(state, 1);
+                    state->open_section = 2;
+                    deskbar_cache_submenu(state, 2);
                 }
                 handled = true;
             }
@@ -670,25 +951,49 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
                 handled = true;
             }
             state->pressed_window_id = 0;
+        } else if (state->pressed_cascade_level >= 0) {
+            int level = state->pressed_cascade_level;
+            int pressed = state->pressed_cascade_item;
+
+            if (cascade_hit_level == level &&
+                cascade_hit_item == pressed &&
+                level >= 0 && level < DESKBAR_MAX_CASCADE_LEVELS &&
+                pressed >= 0 && pressed < state->cascade_count[level]) {
+                deskbar_sub_item_t *item = &state->cascade_items[level][pressed];
+
+                if (item->enabled && item->is_dir) {
+                    deskbar_open_cascade_level(state, level + 1,
+                                               item->path, pressed);
+                } else if (item->enabled) {
+                    deskbar_launch_menu_item(desktop, item);
+                    state->menu_open = false;
+                    deskbar_reset_menu_state(state);
+                }
+                handled = true;
+            }
+
+            state->pressed_cascade_level = -1;
+            state->pressed_cascade_item = -1;
         } else if (state->pressed_sub_item >= 0) {
             if (deskbar_main_item_has_submenu(state->open_section)) {
                 deskbar_cache_submenu(state, state->open_section);
                 sub_count = state->cached_count;
                 sub_hit = deskbar_hit_sub_item(desktop, state->open_section,
                     state->cached_items, sub_count, event->x, event->y);
-                if (sub_hit == state->pressed_sub_item && sub_hit < sub_count &&
+
+                if (sub_hit == state->pressed_sub_item &&
+                    sub_hit < sub_count &&
                     state->cached_items[sub_hit].enabled) {
-                    // Verificar si es un ejecutable
-                    if (deskbar_is_executable(
-                            state->cached_items[sub_hit].path)) {
-                        (void)program_execute_path(
-                            desktop, state->cached_items[sub_hit].path);
+                    deskbar_sub_item_t *item = &state->cached_items[sub_hit];
+
+                    if (item->is_dir) {
+                        deskbar_open_cascade_level(state, 0,
+                                                   item->path, sub_hit);
                     } else {
-                        texteditor_open(
-                            desktop, state->cached_items[sub_hit].path);
+                        deskbar_launch_menu_item(desktop, item);
+                        state->menu_open = false;
+                        deskbar_reset_menu_state(state);
                     }
-                    state->menu_open = false;
-                    deskbar_reset_menu_state(state);
                     handled = true;
                 }
             }
@@ -697,8 +1002,11 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
             main_hit = deskbar_hit_main_item(desktop, event->x, event->y);
             if (main_hit == state->pressed_main_item) {
                 if (main_hit == 0) {
-                    // Usar la nueva ventana que lista la raíz
                     about_open(desktop);
+                    state->menu_open = false;
+                    deskbar_reset_menu_state(state);
+                } else if (main_hit == 1) {
+                    runbox_open_from_desktop(desktop);
                     state->menu_open = false;
                     deskbar_reset_menu_state(state);
                 } else if (main_hit == DESKBAR_MAIN_ITEMS - 1) {
@@ -718,13 +1026,22 @@ static bool deskbar_handle_event(gui_program_t *program, gui_desktop_t *desktop,
         if (!state->menu_open) {
             state->hovered_main_item = -1;
             state->hovered_sub_item = -1;
+            for (int i = 0; i < DESKBAR_MAX_CASCADE_LEVELS; i++)
+                state->hovered_cascade_item[i] = -1;
         } else {
             state->hovered_main_item = main_hit;
             state->hovered_sub_item = sub_hit;
+            for (int i = 0; i < DESKBAR_MAX_CASCADE_LEVELS; i++)
+                state->hovered_cascade_item[i] = -1;
+            if (cascade_hit_level >= 0)
+                state->hovered_cascade_item[cascade_hit_level] =
+                    cascade_hit_item;
         }
+
         state->button_hovered = on_button;
         state->clock_hovered = on_status;
         state->hovered_window_id = hit_window ? hit_window->id : 0;
+
         return handled || on_bar || on_menu || on_submenu || on_status ||
                hit_window != NULL;
     }

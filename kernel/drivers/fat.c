@@ -7,6 +7,15 @@ static fat_fs_t g_current_fs;
 static bool g_fs_ready = false;
 static const char *g_active_name = "none";
 
+/*
+ * Cache minimo de un sector FAT/VFS. En floppy evita releer una y otra vez
+ * la FAT/root directory desde el FDC sincrono.
+ */
+static bool g_sector_cache_valid = false;
+static block_device_t *g_sector_cache_dev = NULL;
+static uint32_t g_sector_cache_lba = 0;
+static uint8_t g_sector_cache[BLOCK_SECTOR_SIZE];
+
 static uint16_t read_le16(const uint8_t *p) {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
@@ -61,9 +70,26 @@ static bool parse_dir_entry(const uint8_t *entry, fat_dir_entry_t *out) {
 }
 
 static bool read_sector(const fat_fs_t *fs, uint32_t sector, void *buffer) {
+    uint32_t lba;
+
     if (!fs || !fs->device || !buffer) return false;
     if (fs->bytes_per_sector != BLOCK_SECTOR_SIZE) return false;
-    return block_read(fs->device, fs->volume_lba + sector, 1, buffer);
+
+    lba = fs->volume_lba + sector;
+    if (g_sector_cache_valid &&
+        g_sector_cache_dev == fs->device &&
+        g_sector_cache_lba == lba) {
+        kmemcpy(buffer, g_sector_cache, BLOCK_SECTOR_SIZE);
+        return true;
+    }
+
+    if (!block_read(fs->device, lba, 1, buffer)) return false;
+
+    g_sector_cache_valid = true;
+    g_sector_cache_dev = fs->device;
+    g_sector_cache_lba = lba;
+    kmemcpy(g_sector_cache, buffer, BLOCK_SECTOR_SIZE);
+    return true;
 }
 
 static bool read_cluster(const fat_fs_t *fs, uint32_t cluster, void *buffer) {
@@ -261,8 +287,10 @@ bool fat_mount(fat_fs_t *fs, block_device_t *dev, uint32_t volume_lba) {
     }
 
     kprintf("fat_mount: block_read OK\n");
-    kprintf("OEM: %.8s\n", bpb + 3);
-    kprintf("Firma: %02X %02X\n", bpb[510], bpb[511]);
+    kprintf("OEM: ");
+    for (uint32_t i = 0; i < 8; i++) kprintf("%c", bpb[3 + i]);
+    kprintf("\n");
+    kprintf("Firma: %x %x\n", bpb[510], bpb[511]);
 
     if (!looks_like_fat_bpb(bpb)) {
         kprintf("fat_mount: BPB invalido\n");
@@ -382,41 +410,174 @@ static bool read_partition_lba(block_device_t *dev, uint32_t part_index, uint32_
     return *lba != 0;
 }
 
+static bool is_supported_partition_type(uint8_t type) {
+    switch (type) {
+        case 0x01: /* FAT12 */
+        case 0x04: /* FAT16 <32M */
+        case 0x06: /* FAT16 */
+        case 0x0B: /* FAT32 CHS */
+        case 0x0C: /* FAT32 LBA */
+        case 0x0E: /* FAT16 LBA */
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool partition_entry_lba(const uint8_t *sector, uint32_t index,
+                                const block_device_t *dev, uint32_t *lba_out) {
+    uint32_t off;
+    uint8_t bootable;
+    uint8_t type;
+    uint32_t lba;
+    uint32_t sectors;
+
+    if (!sector || !lba_out || index >= 4) return false;
+
+    off = 446 + (index * 16);
+    bootable = sector[off + 0];
+    type = sector[off + 4];
+    lba = read_le32(sector + off + 8);
+    sectors = read_le32(sector + off + 12);
+
+    if (type == 0 || lba == 0 || sectors == 0) return false;
+    if (bootable != 0x00 && bootable != 0x80) return false;
+    if (!is_supported_partition_type(type)) return false;
+
+    if (dev && dev->sector_count) {
+        if (lba >= dev->sector_count) return false;
+        if (sectors > dev->sector_count - lba) return false;
+    }
+
+    *lba_out = lba;
+    return true;
+}
+
 static bool fat_try_mount_device(fat_fs_t *fs, block_device_t *dev, const char *active_name) {
     uint8_t sector[512];
-    bool has_partitions = false;
 
     if (!fs || !dev) return false;
+
+    /*
+     * Primero probamos superfloppy/volumen directo.
+     *
+     * Un boot sector FAT tambien termina en 55 AA, pero los bytes 446..509
+     * pertenecen al codigo del bootloader, no a una tabla de particiones.
+     * Si interpretamos esos bytes como MBR, aparecen "particiones" falsas y
+     * nunca llegamos a montar LBA 0. Eso es justo lo que pasa en la imagen
+     * de disquete de BlesKernOS.
+     */
+    if (fat_mount(fs, dev, 0)) {
+        g_active_name = active_name;
+        return true;
+    }
+
+    /*
+     * Si LBA 0 no era FAT, entonces si intentamos tratarlo como MBR.
+     * Solo aceptamos entradas de particion razonables para evitar falsos
+     * positivos dentro de codigo de arranque.
+     */
     if (!block_read(dev, 0, 1, sector)) return false;
     if (sector[510] != 0x55 || sector[511] != 0xAA) return false;
 
     for (uint32_t i = 0; i < 4; i++) {
-        uint32_t off = 446 + (i * 16);
-        uint32_t lba = read_le32(sector + off + 8);
-        uint8_t type = sector[off + 4];
-        if (type == 0 && lba == 0) continue;
-        has_partitions = true;
+        uint32_t lba = 0;
+        if (!partition_entry_lba(sector, i, dev, &lba)) continue;
         if (fat_mount(fs, dev, lba)) {
             g_active_name = active_name;
             return true;
         }
     }
 
-    if (has_partitions) {
-        return false;
-    }
-
-    if (fat_mount(fs, dev, 0)) {
-        g_active_name = active_name;
-        return true;
-    }
-
     return false;
 }
 
+static inline uint32_t fat_irq_save(void) {
+    uint32_t flags;
+    __asm__ volatile ("pushfl; popl %0; cli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void fat_irq_restore(uint32_t flags) {
+    if (flags & (1U << 9)) {
+        __asm__ volatile ("sti" : : : "memory");
+    }
+}
+
+/*
+ * IMPORTANTE:
+ * En i386, el compilador puede transformar una copia de struct en REP MOVSL.
+ * REP MOVSL usa DS:ESI como origen y ES:EDI como destino.
+ *
+ * Si alguna IRQ/syscall/task/ring3 dejó ES con un selector que no es el
+ * selector de datos del kernel, la copia "*fs = g_current_fs" dispara
+ * GENERAL PROTECTION FAULT (#13) en hardware real.
+ *
+ * Este helper deja los segmentos de datos apuntando otra vez al data segment
+ * del kernel antes de copiar estructuras.
+ */
+static inline void fat_reload_kernel_segments(void) {
+    __asm__ volatile (
+        "cld\n\t"
+        "movw $0x10, %%ax\n\t"
+        "movw %%ax, %%ds\n\t"
+        "movw %%ax, %%es\n\t"
+        "movw %%ax, %%fs\n\t"
+        "movw %%ax, %%gs\n\t"
+        :
+        :
+        : "ax", "memory"
+    );
+}
+
 bool fat_get_current(fat_fs_t *fs) {
-    if (!fs || !g_fs_ready) return false;
-    *fs = g_current_fs;
+    uint32_t flags;
+
+    if (!fs) return false;
+
+    /*
+     * Mantener la copia corta e indivisible: si una IRQ entra entre recargar
+     * ES y copiar, y el handler no restaura ES, vuelve el bug.
+     */
+    flags = fat_irq_save();
+    fat_reload_kernel_segments();
+
+    if (!g_fs_ready) {
+        fat_irq_restore(flags);
+        return false;
+    }
+
+    /*
+     * No usar "*fs = g_current_fs".
+     * Eso generó:
+     *   rep movsl %ds:(%esi),%es:(%edi)
+     * y en hardware real explotó con #GP si ES estaba sucio.
+     */
+    fs->device = g_current_fs.device;
+    fs->volume_lba = g_current_fs.volume_lba;
+    fs->type = g_current_fs.type;
+    fs->bytes_per_sector = g_current_fs.bytes_per_sector;
+    fs->sectors_per_cluster = g_current_fs.sectors_per_cluster;
+    fs->reserved_sector_count = g_current_fs.reserved_sector_count;
+    fs->num_fats = g_current_fs.num_fats;
+    fs->root_entry_count = g_current_fs.root_entry_count;
+    fs->total_sectors = g_current_fs.total_sectors;
+    fs->fat_size_sectors = g_current_fs.fat_size_sectors;
+    fs->first_fat_sector = g_current_fs.first_fat_sector;
+    fs->first_data_sector = g_current_fs.first_data_sector;
+    fs->total_clusters = g_current_fs.total_clusters;
+    fs->root_dir_cluster = g_current_fs.root_dir_cluster;
+    fs->root_dir_sectors = g_current_fs.root_dir_sectors;
+
+    for (uint32_t i = 0; i < sizeof(fs->volume_label); i++) {
+        fs->volume_label[i] = g_current_fs.volume_label[i];
+    }
+
+    for (uint32_t i = 0; i < sizeof(fs->fs_name); i++) {
+        fs->fs_name[i] = g_current_fs.fs_name[i];
+    }
+
+    fat_irq_restore(flags);
     return true;
 }
 bool fat_set_active(const char *name) {
@@ -484,12 +645,11 @@ bool fat_set_active(const char *name) {
 
 bool fat_mount_default(void) {
     /*
-     * The boot image is exposed both as a floppy and as an ATA disk by the
-     * normal launcher.  Prefer ATA: its PIO data path is reliable after boot
-     * and it also provides the writer used by vfs_write_all().  The floppy
-     * remains a fallback for machines which do not expose an ATA disk.
+     * Para builds booteadas desde disquete real o QEMU if=floppy, la raiz
+     * vive normalmente en fd0. ATA queda como fallback para builds donde la
+     * imagen se expone como disco duro.
      */
-    const char *preferred[] = {"ata0", "ata1", "ata2", "ata3", "fd0"};
+    const char *preferred[] = {"fd0", "ata0", "ata1", "ata2", "ata3"};
 
     for (uint32_t i = 0; i < sizeof(preferred)/sizeof(preferred[0]); i++) {
         kprintf("Intentando montar %s...\n", preferred[i]);
@@ -667,9 +827,23 @@ bool fat_read_file(const fat_fs_t *fs, const fat_dir_entry_t *entry, void *buffe
     return fat_read_file_at(fs, entry, 0, buffer, max_size, bytes_read);
 }
 
+static bool fat_device_writable(const fat_fs_t *fs) {
+    return fs && fs->device && !fs->device->read_only && fs->device->write;
+}
+
 static bool write_sector(const fat_fs_t *fs, uint32_t sector, const void *buffer) {
-    return fs && fs->device && buffer &&
-           block_write(fs->device, fs->volume_lba + sector, 1, buffer);
+    uint32_t lba;
+
+    if (!fat_device_writable(fs) || !buffer) return false;
+    lba = fs->volume_lba + sector;
+    if (!block_write(fs->device, lba, 1, buffer)) return false;
+
+    if (g_sector_cache_valid &&
+        g_sector_cache_dev == fs->device &&
+        g_sector_cache_lba == lba) {
+        g_sector_cache_valid = false;
+    }
+    return true;
 }
 
 static uint16_t fat12_table_get(const uint8_t *fat, uint32_t cluster) {
@@ -809,6 +983,14 @@ static bool fat_store_path(fat_fs_t *fs, const char *path, const void *data,
     uint32_t first = 0;
     uint32_t previous = 0;
 
+    /*
+     * Si el dispositivo no tiene writer, no intentes modificar FAT.
+     * fd0 por ahora es lectura solamente; sin este corte temprano, cualquier
+     * vfs_write_all()/mkdir escanea la FAT y lee varios sectores del floppy
+     * antes de fallar, congelando la GUI.
+     */
+    if (!fat_device_writable(fs)) return false;
+
     if (!fs || fs->type != FAT_TYPE_FAT12 ||
         !fat_split_parent(path, parent_path, name) ||
         !fat_make_short_name(name, raw_name) ||
@@ -820,7 +1002,6 @@ static bool fat_store_path(fat_fs_t *fs, const char *path, const void *data,
     if (exists && old.is_directory != directory) return false;
 
     fat_bytes = fs->fat_size_sectors * fs->bytes_per_sector;
-    kprintf("FAT kmalloc(fat_store_path): %u\n", fat_bytes);
     table = (uint8_t *)kmalloc(fat_bytes);
     if (!table) return false;
     for (uint32_t s = 0; s < fs->fat_size_sectors; s++)

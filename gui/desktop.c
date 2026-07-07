@@ -1,6 +1,7 @@
 #include "gui.h"
 #include "../kernel/include/memory.h"
 #include "../kernel/include/task.h"
+#include "../programs/programs.h"
 
 static void copy_text(char *dst, size_t dst_len, const char *src) {
     if (!dst || !dst_len) return;
@@ -41,6 +42,24 @@ gui_program_t *gui_desktop_register_program(gui_desktop_t *desktop, const char *
     desktop->last_program = program;
     if (!desktop->first_program) desktop->first_program = program;
     return program;
+}
+
+
+void gui_desktop_unregister_program(gui_desktop_t *desktop, gui_program_t *program) {
+    if (!desktop || !program) return;
+    task_preempt_disable();
+
+    if (program->prev) program->prev->next = program->next;
+    if (program->next) program->next->prev = program->prev;
+    if (desktop->first_program == program) desktop->first_program = program->next;
+    if (desktop->last_program == program) desktop->last_program = program->prev;
+
+    program->prev = NULL;
+    program->next = NULL;
+    task_preempt_enable();
+
+    if (program->destroy) program->destroy(program);
+    kfree(program);
 }
 
 gui_window_t *gui_desktop_create_window(gui_desktop_t *desktop, int x, int y, int w, int h, const char *title) {
@@ -132,7 +151,10 @@ void gui_desktop_handle_event(gui_desktop_t *desktop, const gui_event_t *event) 
         desktop->mouse_buttons = event->buttons;
     }
 
-    program = desktop->last_program;
+    /* Screensavers must close before normal windows/apps consume the input.
+       Without this, SSLOGO can remain active behind the desktop and leave
+       black regions while other apps keep receiving events. */
+program = desktop->last_program;
     while (program) {
         if (program->handle_event && program->handle_event(program, desktop, event)) {
             return;

@@ -51,15 +51,33 @@ static bool gui_gfx_allocate(gui_surface_t *surface) {
 }
 
 bool gui_gfx_init(gui_surface_t *surface) {
+    const gfx_info_t *info;
+
     if (!surface) return false;
     surface->pixels = NULL;
     surface->width = 0;
     surface->height = 0;
     surface->pitch = 0;
 
-    if (gfx_get_info()->mode != GFX_MODE_VESA_LFB) {
+    info = gfx_get_info();
+    if (!info) return false;
+
+    /*
+     * Respetar el modo que eligio Stage2/gfx_init().
+     *
+     * Antes, cualquier modo que no fuera VESA terminaba forzado a VGA 13h.
+     * Por eso VGA 12h y VGA texto caian en 320x200x8.
+     */
+    if (info->mode == GFX_MODE_TEXT) {
+        return false; /* No iniciar GUI en modo texto. */
+    }
+
+    if (info->mode != GFX_MODE_VESA_LFB &&
+        info->mode != GFX_MODE_VGA_13H &&
+        info->mode != GFX_MODE_VGA_12H) {
         if (!gfx_set_mode13h()) return false;
     }
+
     return gui_gfx_allocate(surface);
 }
 
@@ -86,10 +104,27 @@ void gui_gfx_shutdown(gui_surface_t *surface) {
     g_shadow_pixels = 0;
 }
 
+void gui_gfx_invalidate_front(void) {
+    if (!g_front_shadow) return;
+    for (uint32_t i = 0; i < g_shadow_pixels; i++)
+        g_front_shadow[i] = 0xFFFFFFFF;
+}
+
 void gui_gfx_present(const gui_surface_t *surface) {
     const gfx_info_t *info = gfx_get_info();
     if (!surface || !surface->pixels) return;
 
+    /*
+     * No invalidar g_front_shadow en cada frame.
+     *
+     * El shadow existe para evitar copiar al framebuffer los píxeles que no
+     * cambiaron. Si se invalida acá, gui_gfx_present() termina reescribiendo
+     * casi toda la pantalla en cada repaint, justo lo que mata rendimiento al
+     * mover el mouse o subir resolución.
+     *
+     * Invalidate solo debe llamarse cuando cambia el modo/resolución, al
+     * arrancar, o si se necesita forzar un repaint completo.
+     */
     if (info->mode == GFX_MODE_VGA_13H || info->mode == GFX_MODE_VGA_12H) {
         for (uint16_t y = 0; y < surface->height; y++) {
             for (uint16_t x = 0; x < surface->width; x++) {

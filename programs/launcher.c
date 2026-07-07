@@ -31,6 +31,20 @@ bool program_is_object(const char *path) {
     return dot && program_name_is(dot, ".O");
 }
 
+
+static bool launcher_match_name(const char *path, const char *name) {
+    const char *base;
+
+    if (!path || !name) return false;
+
+    base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+
+    return kstrcmp(base, name) == 0;
+}
+
 bool program_execute_path(gui_desktop_t *desktop, const char *path) {
     const char *name;
 
@@ -52,6 +66,10 @@ bool program_execute_path(gui_desktop_t *desktop, const char *path) {
         midamp_open_from_desktop(desktop);
     } else if (program_name_is(name, "VIEWER.O")) {
         imageviewer_open_from_desktop(desktop);
+    if (launcher_match_name(path, "RUNBOX.O")) {
+        runbox_open_from_desktop(desktop);
+        return true;
+    }
     } else if (program_name_is(name, "GEARS.O")) {
         gears_open_from_desktop(desktop);
     } else if (program_name_is(name, "PAINT.O")) {

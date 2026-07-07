@@ -6,12 +6,34 @@
 #include "../kernel/include/pit.h"
 #include "../kernel/include/task.h"
 
+/*
+ * PIT actual: si lo tenés en 1000 Hz, 16 ticks ≈ 16 ms ≈ 60 FPS.
+ * Esto agrupa movimientos del mouse y evita repintar pantalla completa cientos
+ * de veces por segundo, sin romper la respuesta inmediata de clics/teclas.
+ */
+#define GUI_PAINT_INTERVAL_TICKS 4U
+#define GUI_CLOCK_UPDATE_TICKS 100U
+
 static gui_desktop_t g_desktop;
 static gui_event_queue_t g_events;
 static uint8_t g_cpu_usage;
+static volatile uint32_t g_last_input_tick;
+static volatile bool g_paint_requested;
 
 uint8_t gui_get_cpu_usage(void) {
     return g_cpu_usage;
+}
+
+gui_desktop_t *gui_get_desktop(void) {
+    return &g_desktop;
+}
+
+uint32_t gui_get_last_input_tick(void) {
+    return g_last_input_tick;
+}
+
+void gui_request_paint(void) {
+    g_paint_requested = true;
 }
 
 bool gui_change_resolution(gui_desktop_t *desktop, uint16_t width,
@@ -38,6 +60,8 @@ void gui_init(void) {
 
     gui_desktop_init(&g_desktop, surface);
     gui_event_init(&g_events);
+    g_last_input_tick = pit_get_ticks();
+    g_paint_requested = true;
     deskmanager_install(&g_desktop);
     about_install(&g_desktop);
     filebrowser_install(&g_desktop);
@@ -50,6 +74,7 @@ void gui_init(void) {
     games_install(&g_desktop);
     settings_install(&g_desktop);
     deskbar_install(&g_desktop);
+    screensaverd_install(&g_desktop);
 }
 
 void gui_run(void) {
@@ -64,6 +89,7 @@ void gui_run(void) {
     while (true) {
         gui_event_poll(&g_events);
         while (gui_event_next(&g_events, &event)) {
+            g_last_input_tick = pit_get_ticks();
             gui_desktop_handle_event(&g_desktop, &event);
             activity += 4;
             needs_paint = true;
@@ -77,14 +103,24 @@ void gui_run(void) {
                 urgent_paint = true;
         }
         uint32_t now = pit_get_ticks();
+        if (g_paint_requested) {
+            g_paint_requested = false;
+            needs_paint = true;
+        }
         if (!needs_paint && gui_desktop_has_dirty(&g_desktop))
             needs_paint = true;
-        if (now - last_clock_tick >= 100) {
+        if (now - last_clock_tick >= GUI_CLOCK_UPDATE_TICKS) {
             last_clock_tick = now;
             needs_paint = true;
         }
+
+        /*
+         * Los eventos urgentes se pintan ya. El mouse move se limita al ritmo
+         * máximo de paint para evitar que el escritorio entero se redibuje a
+         * velocidad absurda durante movimiento continuo.
+         */
         if (needs_paint &&
-            (urgent_paint || now - last_paint_tick >= 3U)) {
+            (urgent_paint || now - last_paint_tick >= GUI_PAINT_INTERVAL_TICKS)) {
             gui_desktop_paint(&g_desktop);
             activity += 2;
             needs_paint = false;

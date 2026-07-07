@@ -4,6 +4,31 @@
 #include "include/pit.h"
 #include "include/gdt.h"
 
+/*
+ * Scheduler tuning:
+ *
+ * TASK_QUANTUM_TICKS controls how many real PIT ticks a normal task may keep
+ * the CPU before round-robin switches to another READY task. A value of 2 is a
+ * good middle point for a small GUI OS: less context-switch overhead than
+ * switching every tick, but still responsive.
+ *
+ * TASK_YIELD_BUDGET_PER_TICK controls how many voluntary yields may return
+ * inside the same PIT tick before the task is throttled with HLT. This keeps
+ * animation/app loops from going completely uncapped, but avoids the old
+ * behavior where every single yield waited a whole hardware tick.
+ *
+ * You can override both from the Makefile with:
+ *   -DTASK_QUANTUM_TICKS=1
+ *   -DTASK_YIELD_BUDGET_PER_TICK=1
+ */
+#ifndef TASK_QUANTUM_TICKS
+#define TASK_QUANTUM_TICKS 3U
+#endif
+
+#ifndef TASK_YIELD_BUDGET_PER_TICK
+#define TASK_YIELD_BUDGET_PER_TICK 8U
+#endif
+
 static task_t tasks[TASK_MAX];
 static int current_index;
 static uint32_t next_pid;
@@ -13,6 +38,33 @@ static uint32_t busy_ticks;
 static uint32_t sample_ticks;
 static uint32_t sample_busy;
 static uint8_t cpu_usage;
+static uint32_t current_quantum;
+static uint32_t yield_tick[TASK_MAX];
+static uint8_t yield_budget[TASK_MAX];
+
+static int task_pick_next(void) {
+    int next = -1;
+
+    /*
+     * Prefer real work over idle. Round-robin starts after current_index, so a
+     * task that just ran goes to the back of the line once its quantum expires.
+     */
+    for (int checked = 0; checked < TASK_MAX; checked++) {
+        int candidate = (current_index + checked + 1) % TASK_MAX;
+        if (tasks[candidate].state == TASK_READY && !tasks[candidate].idle) {
+            next = candidate;
+            break;
+        }
+    }
+
+    if (next >= 0) return next;
+
+    for (int i = 0; i < TASK_MAX; i++) {
+        if (tasks[i].state == TASK_READY) return i;
+    }
+
+    return current_index;
+}
 
 static void idle_main(void *argument UNUSED) {
     for (;;) __asm__ volatile ("hlt");
@@ -29,6 +81,9 @@ void task_init(void) {
     kmemset(tasks, 0, sizeof(tasks));
     current_index = 0;
     next_pid = 1;
+    current_quantum = 0;
+    kmemset(yield_tick, 0, sizeof(yield_tick));
+    kmemset(yield_budget, 0, sizeof(yield_budget));
     tasks[0].pid = next_pid++;
     kstrcpy(tasks[0].name, "kernel-gui");
     tasks[0].state = TASK_RUNNING;
@@ -67,16 +122,38 @@ int task_create(const char *name, task_entry_t entry, void *argument) {
     task->context = (registers_t *)((uint8_t *)stack + TASK_STACK_SIZE -
                                     sizeof(registers_t));
     kmemset(task->context, 0, sizeof(registers_t));
-    task->context->ds = 0x10;
+
+    /*
+     * Los stubs de interrupción restauran segmentos desde registers_t:
+     *
+     *   pop gs
+     *   pop fs
+     *   pop es
+     *   pop ds
+     *
+     * Antes sólo inicializábamos DS. Entonces las tareas kernel nuevas
+     * arrancaban con ES/FS/GS en 0. En i386, el compilador usa REP MOVSL
+     * para copiar structs, y REP MOVSL escribe usando ES:EDI.
+     *
+     * Resultado en hardware real: GENERAL PROTECTION FAULT (#13) al abrir
+     * apps como Calendar, File Browser, Process Manager, etc.
+     */
+    task->context->ds = GDT_KERNEL_DATA;
+    task->context->es = GDT_KERNEL_DATA;
+    task->context->fs = GDT_KERNEL_DATA;
+    task->context->gs = GDT_KERNEL_DATA;
+
     task->entry = entry;
     task->argument = argument;
     task->context->int_no = 32;
     task->context->eip = (uint32_t)task_bootstrap;
-    task->context->cs = 0x08;
+    task->context->cs = GDT_KERNEL_CODE;
     task->context->eflags = 0x202;
     task->context->useresp = (uint32_t)task_exit;
     task->state = TASK_READY;
     task->memory_bytes = TASK_STACK_SIZE;
+    yield_tick[index] = 0;
+    yield_budget[index] = TASK_YIELD_BUDGET_PER_TICK;
     task_preempt_enable();
     return (int)task->pid;
 }
@@ -131,52 +208,60 @@ int task_create_user(const char *name, void (*entry)(void)) {
     task->state = TASK_READY;
     task->user = true;
     task->memory_bytes = TASK_STACK_SIZE * 2U;
+    yield_tick[index] = 0;
+    yield_budget[index] = TASK_YIELD_BUDGET_PER_TICK;
     task_preempt_enable();
     return (int)task->pid;
 }
 
 registers_t *task_schedule(registers_t *frame) {
     schedule_ticks++;
+
     bool ran_quantum = tasks[current_index].state == TASK_RUNNING;
-    if (ran_quantum && !tasks[current_index].idle) busy_ticks++;
+    if (ran_quantum && !tasks[current_index].idle) {
+        busy_ticks++;
+        sample_busy++;
+    }
     tasks[current_index].cpu_ticks++;
+
     if (++sample_ticks >= 100) {
-        cpu_usage = (uint8_t)sample_busy;
+        cpu_usage = (uint8_t)(sample_busy > 100U ? 100U : sample_busy);
         sample_ticks = 0;
         sample_busy = 0;
-    } else if (ran_quantum && !tasks[current_index].idle) {
-        sample_busy++;
     }
 
     uint32_t now = pit_get_ticks();
-    for (int i = 0; i < TASK_MAX; i++)
+    for (int i = 0; i < TASK_MAX; i++) {
         if (tasks[i].state == TASK_SLEEPING &&
-            (int32_t)(now - tasks[i].wake_tick) >= 0)
+            (int32_t)(now - tasks[i].wake_tick) >= 0) {
             tasks[i].state = TASK_READY;
+        }
+    }
 
     if (preempt_depth || !frame) return frame;
-    tasks[current_index].context = frame;
-    if (tasks[current_index].state == TASK_RUNNING)
-        tasks[current_index].state = TASK_READY;
 
-    int next = -1;
-    for (int checked = 0; checked < TASK_MAX; checked++) {
-        int candidate = (current_index + checked + 1) % TASK_MAX;
-        if (tasks[candidate].state == TASK_READY && !tasks[candidate].idle) {
-            next = candidate;
-            break;
+    task_t *current = &tasks[current_index];
+    current->context = frame;
+
+    /*
+     * Do not round-robin on every timer interrupt. Keeping the same task for a
+     * tiny quantum reduces scheduler overhead and makes GUI drawing feel less
+     * choppy, while the PIT still enforces a hard limit.
+     */
+    if (current->state == TASK_RUNNING && !current->idle) {
+        if (++current_quantum < TASK_QUANTUM_TICKS) {
+            return current->context;
         }
     }
-    if (next < 0) {
-        for (int i = 0; i < TASK_MAX; i++) {
-            if (tasks[i].state == TASK_READY) {
-                next = i;
-                break;
-            }
-        }
+
+    if (current->state == TASK_RUNNING) {
+        current->state = TASK_READY;
     }
-    if (next < 0) next = current_index;
+
+    int next = task_pick_next();
     current_index = next;
+    current_quantum = 0;
+
     tasks[current_index].state = TASK_RUNNING;
     if (tasks[current_index].stack) {
         tss_set_kernel_stack((uint32_t)(uintptr_t)
@@ -193,9 +278,30 @@ void task_yield(void) {
      * kernel treat a yield as a timer tick, so kernel_ticks advances faster than
      * real time. That makes sleeps, GUI timing and games run at superspeed.
      *
-     * Instead, halt until the next real hardware interrupt. The real PIT IRQ
-     * will enter the normal scheduler path without faking time.
+     * The old safe version used "sti; hlt" on every yield. That prevented
+     * superspeed, but it also forced every animation/app loop to wait a full
+     * PIT tick per yield. Instead we allow a small per-task yield budget inside
+     * each real PIT tick, then throttle with HLT once the budget is exhausted.
      */
+    int index = current_index;
+
+    if (tasks[index].idle || tasks[index].state != TASK_RUNNING) {
+        __asm__ volatile ("sti; hlt");
+        return;
+    }
+
+    uint32_t now = pit_get_ticks();
+    if (yield_tick[index] != now) {
+        yield_tick[index] = now;
+        yield_budget[index] = TASK_YIELD_BUDGET_PER_TICK;
+    }
+
+    if (yield_budget[index] > 0) {
+        yield_budget[index]--;
+        __asm__ volatile ("pause");
+        return;
+    }
+
     __asm__ volatile ("sti; hlt");
 }
 

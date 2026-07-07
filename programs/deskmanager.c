@@ -216,9 +216,166 @@ static uint32_t *desk_load_bmp_scaled(const char *path,
     return pixels;
 }
 
+#ifndef BK_ICONPAK_CENTRAL_LOADER
+#define BK_ICONPAK_CENTRAL_LOADER 1
+
+static void *bk_iconpak_data = NULL;
+static uint32_t bk_iconpak_size = 0;
+
+static uint32_t bk_iconpak_rd32(const uint8_t *p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static bool bk_iconpak_load_once(void) {
+    if (bk_iconpak_data) return true;
+
+    if (vfs_read_all("/ICONS/ICONS.PAK", &bk_iconpak_data, &bk_iconpak_size))
+        return true;
+
+    if (vfs_read_all("/ICONS.PAK", &bk_iconpak_data, &bk_iconpak_size))
+        return true;
+
+    return false;
+}
+
+static bool bk_iconpak_make_name_from_bmp_path(const char *path, char out[16]) {
+    const char *base;
+    uint32_t i = 0;
+
+    if (!path || !out) return false;
+
+    base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+
+    while (base[i] && base[i] != '.' && i < 15) {
+        char c = base[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        out[i++] = c;
+    }
+
+    out[i] = '\0';
+    return i > 0;
+}
+
+static bool bk_iconpak_name16_eq(const uint8_t *name16, const char *name) {
+    uint32_t i = 0;
+
+    if (!name16 || !name) return false;
+
+    while (i < 16 && name[i]) {
+        if ((char)name16[i] != name[i]) return false;
+        i++;
+    }
+
+    return i < 16 && name16[i] == '\0';
+}
+
+static bool bk_iconpak_path_is_icon_bmp(const char *path) {
+    const char *dot = NULL;
+    const char *base;
+
+    if (!path) return false;
+
+    base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+        if (*p == '.') dot = p;
+    }
+
+    if (!dot) return false;
+
+    return (dot[0] == '.' &&
+           (dot[1] == 'B' || dot[1] == 'b') &&
+           (dot[2] == 'M' || dot[2] == 'm') &&
+           (dot[3] == 'P' || dot[3] == 'p') &&
+            dot[4] == '\0' &&
+            base[0] != '\0');
+}
+
+static uint32_t *bk_iconpak_load_bmp_path(const char *path,
+                                          int out_w,
+                                          int out_h) {
+    char wanted[16];
+    uint8_t *data;
+    uint32_t count;
+
+    if (!bk_iconpak_path_is_icon_bmp(path)) return NULL;
+    if (out_w <= 0 || out_h <= 0) return NULL;
+    if (!bk_iconpak_make_name_from_bmp_path(path, wanted)) return NULL;
+    if (!bk_iconpak_load_once()) return NULL;
+
+    data = (uint8_t *)bk_iconpak_data;
+
+    if (!data || bk_iconpak_size < 12) return NULL;
+    if (data[0] != 'B' || data[1] != 'K' ||
+        data[2] != 'I' || data[3] != 'P') return NULL;
+    if (bk_iconpak_rd32(data + 4) != 1) return NULL;
+
+    count = bk_iconpak_rd32(data + 8);
+    if (12U + count * 32U > bk_iconpak_size) return NULL;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t *e = data + 12U + i * 32U;
+        uint32_t w = bk_iconpak_rd32(e + 16);
+        uint32_t h = bk_iconpak_rd32(e + 20);
+        uint32_t off = bk_iconpak_rd32(e + 24);
+        uint32_t size = bk_iconpak_rd32(e + 28);
+        uint32_t need;
+        uint32_t *src;
+        uint32_t *out;
+
+        if (!bk_iconpak_name16_eq(e, wanted)) continue;
+        if (!w || !h) return NULL;
+
+        need = w * h * sizeof(uint32_t);
+        if (size < need) return NULL;
+        if (off > bk_iconpak_size || off + need > bk_iconpak_size)
+            return NULL;
+
+        src = (uint32_t *)(data + off);
+        out = (uint32_t *)kmalloc((uint32_t)out_w *
+                                  (uint32_t)out_h *
+                                  sizeof(uint32_t));
+        if (!out) return NULL;
+
+        for (int y = 0; y < out_h; y++) {
+            uint32_t sy = ((uint32_t)y * h) / (uint32_t)out_h;
+            for (int x = 0; x < out_w; x++) {
+                uint32_t sx = ((uint32_t)x * w) / (uint32_t)out_w;
+                out[y * out_w + x] = src[sy * w + sx];
+            }
+        }
+
+        return out;
+    }
+
+    return NULL;
+}
+
+#endif /* BK_ICONPAK_CENTRAL_LOADER */
+
+
+static void bk_iconpak_preload_on_gui_start(void) {
+    /*
+     * Precarga temprana. Si VFS todavía no está listo, falla barato;
+     * la primera carga real volverá a intentar.
+     */
+    (void)bk_iconpak_load_once();
+}
+
+
+
 uint32_t *program_load_bmp_icon_scaled(const char *path,
                                        uint16_t output_width,
                                        uint16_t output_height) {
+    uint32_t *bk_pak_icon = bk_iconpak_load_bmp_path(path, (int)output_width, (int)output_height);
+    if (bk_pak_icon) return bk_pak_icon;
+
     return desk_load_bmp_scaled(path, output_width, output_height, true);
 }
 
@@ -831,6 +988,8 @@ void deskmanager_refresh_layout(void) {
  * ────────────────────────────────────────────────────────────────────────── */
 
 void deskmanager_install(gui_desktop_t *desktop) {
+    bk_iconpak_preload_on_gui_start();
+
     deskmanager_state_t *st;
     gui_program_t *prog;
 

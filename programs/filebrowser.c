@@ -99,30 +99,199 @@ static fb_state_t *g_fb = NULL;
 static char g_fb_clipboard[VFS_MAX_PATH];
 static void fb_main(void *argument);
 
-static void fb_load_resources(fb_state_t *st) {
-#define FB_LOAD_ICON(field, path) do { \
-    st->field = program_load_bmp_icon_scaled(path, 48, 48); \
-    task_yield(); \
+/* ICONS.PAK cache.
+ *
+ * Formato:
+ *   magic    "BKIP"
+ *   u32      version = 1
+ *   u32      count
+ *   entries[count]:
+ *      char name[16]   // sin .BMP, ej: FOLDER
+ *      u32  width
+ *      u32  height
+ *      u32  offset
+ *      u32  size
+ *   payload:
+ *      uint32_t pixels[width * height] en RGB32/ARGB32
+ */
+typedef struct {
+    bool loaded;
+    void *pak_data;
+    uint32_t pak_size;
+
+    uint32_t *folder_icon;
+    uint32_t *file_icon;
+    uint32_t *text_icon;
+    uint32_t *config_icon;
+    uint32_t *image_icon;
+    uint32_t *object_icon;
+    uint32_t *midi_icon;
+    uint32_t *hdd_icon;
+    uint32_t *cd_icon;
+    uint32_t *usb_icon;
+    uint32_t *floppy_icon;
+    uint32_t *shell_icon;
+    uint32_t *editor_icon;
+    uint32_t *calc_icon;
+    uint32_t *files_icon;
+    uint32_t *midamp_icon;
+
+    void *associations;
+    uint32_t associations_size;
+} fb_icon_cache_t;
+
+static fb_icon_cache_t g_fb_icon_cache;
+
+static uint32_t fb_rd32(const uint8_t *p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static bool fb_name16_eq(const uint8_t *name16, const char *name) {
+    uint32_t i = 0;
+    if (!name) return false;
+    while (i < 16 && name[i]) {
+        if ((char)name16[i] != name[i]) return false;
+        i++;
+    }
+    return i < 16 && name16[i] == '\0';
+}
+
+static uint32_t *fb_pak_find_icon(const char *name) {
+    uint8_t *data = (uint8_t *)g_fb_icon_cache.pak_data;
+    uint32_t count;
+
+    if (!data || g_fb_icon_cache.pak_size < 12) return NULL;
+    if (data[0] != 'B' || data[1] != 'K' ||
+        data[2] != 'I' || data[3] != 'P') return NULL;
+    if (fb_rd32(data + 4) != 1) return NULL;
+
+    count = fb_rd32(data + 8);
+    if (12U + count * 32U > g_fb_icon_cache.pak_size) return NULL;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t *e = data + 12U + i * 32U;
+        uint32_t w = fb_rd32(e + 16);
+        uint32_t h = fb_rd32(e + 20);
+        uint32_t off = fb_rd32(e + 24);
+        uint32_t size = fb_rd32(e + 28);
+        uint32_t need = w * h * sizeof(uint32_t);
+
+        if (!fb_name16_eq(e, name)) continue;
+        if (w != FB_ICON_SIZE || h != FB_ICON_SIZE) return NULL;
+        if (size < need) return NULL;
+        if (off > g_fb_icon_cache.pak_size ||
+            off + need > g_fb_icon_cache.pak_size) return NULL;
+
+        return (uint32_t *)(data + off);
+    }
+
+    return NULL;
+}
+
+static bool fb_load_icon_pak(void) {
+/*
+     * fb_load_icon_pak disabled: central loader.
+     *
+     * Antes el filebrowser leía /ICONS/ICONS.PAK otra vez con su propia cache.
+     * Eso duplicaba la lectura del PAK desde disquete.
+     *
+     * Ahora dejamos que el fallback use program_load_bmp_icon_scaled().
+     * Esa función ya resuelve /ICONS/*.BMP desde el PAK central cacheado.
+     */
+    return false;
+}
+
+static void fb_cache_load_resources(void) {
+    if (g_fb_icon_cache.loaded) return;
+
+    if (fb_load_icon_pak()) {
+        g_fb_icon_cache.folder_icon = fb_pak_find_icon("FOLDER");
+        g_fb_icon_cache.file_icon = fb_pak_find_icon("FILE");
+        g_fb_icon_cache.text_icon = fb_pak_find_icon("TEXT");
+        g_fb_icon_cache.config_icon = fb_pak_find_icon("CONFIG");
+        g_fb_icon_cache.image_icon = fb_pak_find_icon("IMAGE");
+        g_fb_icon_cache.object_icon = fb_pak_find_icon("OBJECT");
+        g_fb_icon_cache.midi_icon = fb_pak_find_icon("MIDI");
+        g_fb_icon_cache.hdd_icon = fb_pak_find_icon("HDD");
+        g_fb_icon_cache.cd_icon = fb_pak_find_icon("CD");
+        g_fb_icon_cache.usb_icon = fb_pak_find_icon("USB");
+        g_fb_icon_cache.floppy_icon = fb_pak_find_icon("FLOPPY");
+        g_fb_icon_cache.shell_icon = fb_pak_find_icon("SHELL");
+        g_fb_icon_cache.editor_icon = fb_pak_find_icon("EDITOR");
+        g_fb_icon_cache.calc_icon = fb_pak_find_icon("CALC");
+        g_fb_icon_cache.files_icon = fb_pak_find_icon("FILES");
+        g_fb_icon_cache.midamp_icon = fb_pak_find_icon("MIDAMP");
+    }
+
+#define FB_CACHE_LOAD_ICON(field, path) do { \
+    if (!g_fb_icon_cache.field) { \
+        g_fb_icon_cache.field = program_load_bmp_icon_scaled(path, 48, 48); \
+        task_yield(); \
+    } \
 } while (0)
-    FB_LOAD_ICON(folder_icon, "/ICONS/FOLDER.BMP");
-    FB_LOAD_ICON(file_icon, "/ICONS/FILE.BMP");
-    FB_LOAD_ICON(text_icon, "/ICONS/TEXT.BMP");
-    FB_LOAD_ICON(config_icon, "/ICONS/CONFIG.BMP");
-    FB_LOAD_ICON(image_icon, "/ICONS/IMAGE.BMP");
-    FB_LOAD_ICON(object_icon, "/ICONS/OBJECT.BMP");
-    FB_LOAD_ICON(midi_icon, "/ICONS/MIDI.BMP");
-    FB_LOAD_ICON(hdd_icon, "/ICONS/HDD.BMP");
-    FB_LOAD_ICON(cd_icon, "/ICONS/CD.BMP");
-    FB_LOAD_ICON(usb_icon, "/ICONS/USB.BMP");
-    FB_LOAD_ICON(floppy_icon, "/ICONS/FLOPPY.BMP");
-    FB_LOAD_ICON(shell_icon, "/ICONS/SHELL.BMP");
-    FB_LOAD_ICON(editor_icon, "/ICONS/EDITOR.BMP");
-    FB_LOAD_ICON(calc_icon, "/ICONS/CALC.BMP");
-    FB_LOAD_ICON(files_icon, "/ICONS/FILES.BMP");
-    FB_LOAD_ICON(midamp_icon, "/ICONS/MIDAMP.BMP");
-#undef FB_LOAD_ICON
-    (void)vfs_read_all("/ASSOC.INI", &st->associations,
-                       &st->associations_size);
+
+    /*
+     * Fallback compatible: si ICONS.PAK no existe o falta algún icono,
+     * cargamos el BMP viejo. Si BK_ICON_PAK_ONLY=1 y no hay BMPs, simplemente
+     * quedarán NULL; fb_draw_bmp_icon() lo tolera.
+     */
+    FB_CACHE_LOAD_ICON(folder_icon, "/ICONS/FOLDER.BMP");
+    FB_CACHE_LOAD_ICON(file_icon, "/ICONS/FILE.BMP");
+    FB_CACHE_LOAD_ICON(text_icon, "/ICONS/TEXT.BMP");
+    FB_CACHE_LOAD_ICON(config_icon, "/ICONS/CONFIG.BMP");
+    FB_CACHE_LOAD_ICON(image_icon, "/ICONS/IMAGE.BMP");
+    FB_CACHE_LOAD_ICON(object_icon, "/ICONS/OBJECT.BMP");
+    FB_CACHE_LOAD_ICON(midi_icon, "/ICONS/MIDI.BMP");
+    FB_CACHE_LOAD_ICON(hdd_icon, "/ICONS/HDD.BMP");
+    FB_CACHE_LOAD_ICON(cd_icon, "/ICONS/CD.BMP");
+    FB_CACHE_LOAD_ICON(usb_icon, "/ICONS/USB.BMP");
+    FB_CACHE_LOAD_ICON(floppy_icon, "/ICONS/FLOPPY.BMP");
+    FB_CACHE_LOAD_ICON(shell_icon, "/ICONS/SHELL.BMP");
+    FB_CACHE_LOAD_ICON(editor_icon, "/ICONS/EDITOR.BMP");
+    FB_CACHE_LOAD_ICON(calc_icon, "/ICONS/CALC.BMP");
+    FB_CACHE_LOAD_ICON(files_icon, "/ICONS/FILES.BMP");
+    FB_CACHE_LOAD_ICON(midamp_icon, "/ICONS/MIDAMP.BMP");
+
+#undef FB_CACHE_LOAD_ICON
+
+    if (!vfs_read_all("/ASSOC.INI",
+                      &g_fb_icon_cache.associations,
+                      &g_fb_icon_cache.associations_size)) {
+        (void)vfs_read_all("/Associations.INI",
+                           &g_fb_icon_cache.associations,
+                           &g_fb_icon_cache.associations_size);
+    }
+
+    g_fb_icon_cache.loaded = true;
+}
+
+static void fb_load_resources(fb_state_t *st) {
+    if (!st) return;
+
+    fb_cache_load_resources();
+
+    st->folder_icon = g_fb_icon_cache.folder_icon;
+    st->file_icon = g_fb_icon_cache.file_icon;
+    st->text_icon = g_fb_icon_cache.text_icon;
+    st->config_icon = g_fb_icon_cache.config_icon;
+    st->image_icon = g_fb_icon_cache.image_icon;
+    st->object_icon = g_fb_icon_cache.object_icon;
+    st->midi_icon = g_fb_icon_cache.midi_icon;
+    st->hdd_icon = g_fb_icon_cache.hdd_icon;
+    st->cd_icon = g_fb_icon_cache.cd_icon;
+    st->usb_icon = g_fb_icon_cache.usb_icon;
+    st->floppy_icon = g_fb_icon_cache.floppy_icon;
+    st->shell_icon = g_fb_icon_cache.shell_icon;
+    st->editor_icon = g_fb_icon_cache.editor_icon;
+    st->calc_icon = g_fb_icon_cache.calc_icon;
+    st->files_icon = g_fb_icon_cache.files_icon;
+    st->midamp_icon = g_fb_icon_cache.midamp_icon;
+
+    st->associations = g_fb_icon_cache.associations;
+    st->associations_size = g_fb_icon_cache.associations_size;
 }
 
 static bool fb_devices_share_boot_sector(const char *lhs,
@@ -179,6 +348,7 @@ static void fb_join_path(char *out, uint32_t capacity,
 
 static void fb_draw_bmp_icon(gui_surface_t *s, int x, int y,
                              const uint32_t *pixels) {
+    if (!pixels) return;
     program_draw_icon_pixels(s, x, y, pixels, FB_ICON_SIZE, FB_ICON_SIZE);
 }
 
@@ -746,30 +916,15 @@ static void fb_cleanup(fb_state_t *st) {
         gui_window_destroy(st->window);
         task_bind_window(NULL);
     }
-    if (st->folder_icon) kfree(st->folder_icon);
-    if (st->file_icon) kfree(st->file_icon);
-    if (st->text_icon) kfree(st->text_icon);
-    if (st->config_icon) kfree(st->config_icon);
-    if (st->image_icon) kfree(st->image_icon);
-    if (st->object_icon) kfree(st->object_icon);
-    if (st->midi_icon) kfree(st->midi_icon);
-    if (st->hdd_icon) kfree(st->hdd_icon);
-    if (st->cd_icon) kfree(st->cd_icon);
-    if (st->usb_icon) kfree(st->usb_icon);
-    if (st->floppy_icon) kfree(st->floppy_icon);
-    if (st->shell_icon) kfree(st->shell_icon);
-    if (st->editor_icon) kfree(st->editor_icon);
-    if (st->calc_icon) kfree(st->calc_icon);
-    if (st->files_icon) kfree(st->files_icon);
-    if (st->midamp_icon) kfree(st->midamp_icon);
-    if (st->associations) kfree(st->associations);
+
+    /*
+     * Los iconos y Associations.INI viven en g_fb_icon_cache.
+     * No se liberan por ventana: así el filebrowser no vuelve a leer
+     * ICONS.PAK/BMPs cada vez que se abre.
+     */
     if (g_fb == st) g_fb = NULL;
     kfree(st);
 }
-
-/* ══════════════════════════════════════════════════
- *  API pública: abrir ventana (llamado por deskmanager)
- * ══════════════════════════════════════════════════ */
 
 void filebrowser_open_path(gui_desktop_t *desktop, const char *path) {
     fb_state_t *st;

@@ -176,11 +176,15 @@ typedef struct {
 void gui_init(void);
 void gui_run(void);
 uint8_t gui_get_cpu_usage(void);
+gui_desktop_t *gui_get_desktop(void);
+uint32_t gui_get_last_input_tick(void);
+void gui_request_paint(void);
 
 bool gui_gfx_init(gui_surface_t *surface);
 bool gui_gfx_reconfigure(gui_surface_t *surface);
 void gui_gfx_shutdown(gui_surface_t *surface);
 void gui_gfx_present(const gui_surface_t *surface);
+void gui_gfx_invalidate_front(void);
 void gui_gfx_clear(gui_surface_t *surface, uint32_t color);
 void gui_gfx_putpixel(gui_surface_t *surface, int x, int y, uint32_t color);
 void gui_gfx_fill_rect(gui_surface_t *surface, gui_rect_t rect, uint32_t color);
@@ -210,6 +214,7 @@ gui_window_t *gui_desktop_create_window(gui_desktop_t *desktop, int x, int y, in
 void gui_desktop_add_window(gui_desktop_t *desktop, gui_window_t *window);
 void gui_desktop_raise_window(gui_desktop_t *desktop, gui_window_t *window);
 void gui_desktop_remove_window(gui_desktop_t *desktop, gui_window_t *window);
+void gui_desktop_unregister_program(gui_desktop_t *desktop, gui_program_t *program);
 gui_window_t *gui_desktop_window_at(gui_desktop_t *desktop, int x, int y);
 void gui_desktop_handle_event(gui_desktop_t *desktop, const gui_event_t *event);
 void gui_desktop_paint(gui_desktop_t *desktop);

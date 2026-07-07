@@ -3,6 +3,53 @@ import struct
 import sys
 import os
 
+
+# --- BlesKernOS ICONS.PAK hook ---
+def bk_iconpak_try_prepare(argv):
+    # Crea assets/icons/ICONS.PAK automáticamente antes de poblar la imagen FAT.
+    # Por defecto reemplaza el directorio de iconos por build/icons_pak_only,
+    # para que el disquete reciba solo ICONS.PAK y no todos los BMP sueltos.
+    #
+    # Para dejar también los BMP sueltos:
+    #     BK_ICON_PAK_ONLY=0 make run
+    try:
+        import os
+        import shutil
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        root = Path.cwd()
+        pak_only = os.environ.get("BK_ICON_PAK_ONLY", "1") != "0"
+
+        for i, arg in enumerate(list(argv)):
+            p = Path(arg)
+            if not p.exists() or not p.is_dir():
+                continue
+            if p.name.lower() != "icons":
+                continue
+
+            out_pak = p / "ICONS.PAK"
+            tool = root / "tools" / "build_icons_pak.py"
+
+            if tool.exists():
+                subprocess.check_call([sys.executable, str(tool), str(p), str(out_pak)])
+            else:
+                print("[ICONPAK] tools/build_icons_pak.py no existe; no se generó ICONS.PAK")
+                return
+
+            if pak_only:
+                tmp = root / "build" / "icons_pak_only"
+                tmp.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(out_pak, tmp / "ICONS.PAK")
+                argv[i] = str(tmp)
+
+            return
+    except Exception as exc:
+        print("[ICONPAK] warning:", exc)
+# --- end ICONS.PAK hook ---
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SECTOR_SIZE = 512
@@ -102,13 +149,15 @@ def script_path(*parts):
 
 
 def main():
+    bk_iconpak_try_prepare(sys.argv)
     global RESERVED_SECTORS, DATA_START_SECTOR
 
     if len(sys.argv) < 2:
         print(
             "usage: build_fat_floppy.py <image> [shell.o] [filebrowser.o] "
             "[texteditor.o] [calculator.o] [midamp.o] [processmanager.o] [calendar.o] [desktop.ini] "
-            "[icons_dir] [about.gif] [associations.ini] [reserved_sectors]",
+            "[icons_dir] [about.gif] [associations.ini] [reserved_sectors] "
+            "[screensaverd.o] [ss_logo.o] [ss_pipes.o] [screensv.ini]",
             file=sys.stderr,
         )
         return 1
@@ -126,6 +175,10 @@ def main():
     about_gif_path = sys.argv[11] if len(sys.argv) > 11 else script_path("..", "assets", "gif", "abount.gif")
     associations_path = sys.argv[12] if len(sys.argv) > 12 else None
     RESERVED_SECTORS = int(sys.argv[13]) if len(sys.argv) > 13 else DEFAULT_RESERVED_SECTORS
+    screensaverd_path = sys.argv[14] if len(sys.argv) > 14 else None
+    ss_logo_path = sys.argv[15] if len(sys.argv) > 15 else None
+    ss_pipes_path = sys.argv[16] if len(sys.argv) > 16 else None
+    screensv_path = sys.argv[17] if len(sys.argv) > 17 else None
     DATA_START_SECTOR = RESERVED_SECTORS + FAT_COUNT * FAT_SECTORS + ROOT_DIR_SECTORS
     
     with open(image_path, "rb") as handle:
@@ -197,6 +250,23 @@ def main():
     midamp_data = load_program(midamp_path, "Midamp")
     processmanager_data = load_program(processmanager_path, "Processmanager")
     calendar_data = load_program(calendar_path, "Calendar")
+    screensaverd_data = load_program(screensaverd_path, "ScreenSaver daemon")
+    ss_logo_data = load_program(ss_logo_path, "ScreenSaver logo")
+    ss_pipes_data = load_program(ss_pipes_path, "ScreenSaver pipes")
+
+    screensv_data = (
+        b"enabled=1\r\n"
+        b"timeout=300\r\n"
+        b"path=/PROGRAMS/SSLOGO.O\r\n"
+    )
+    if screensv_path:
+        try:
+            with open(screensv_path, "rb") as handle:
+                screensv_data = handle.read().replace(b"\n", b"\r\n")
+            print(f"ScreenSaver INI size: {len(screensv_data)} bytes", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: No se pudo leer {screensv_path}: {e}", file=sys.stderr)
+
     skin_dir = script_path("..", "programs", "winmap")
     midhdr_data = load_program(os.path.join(skin_dir, "hdr.gif"), "Midamp HDR")
     midbtn_data = load_program(os.path.join(skin_dir, "buttons.gif"), "Midamp BTN")
@@ -217,13 +287,22 @@ def main():
     processmanager_clusters = (len(processmanager_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
     calendar_cluster = processmanager_cluster + processmanager_clusters
     calendar_clusters = (len(calendar_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
-    midhdr_cluster = calendar_cluster + calendar_clusters
+    screensaverd_cluster = calendar_cluster + calendar_clusters
+    screensaverd_clusters = (len(screensaverd_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
+    ss_logo_cluster = screensaverd_cluster + screensaverd_clusters
+    ss_logo_clusters = (len(ss_logo_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
+    ss_pipes_cluster = ss_logo_cluster + ss_logo_clusters
+    ss_pipes_clusters = (len(ss_pipes_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
+    midhdr_cluster = ss_pipes_cluster + ss_pipes_clusters
     midhdr_clusters = (len(midhdr_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
     midbtn_cluster = midhdr_cluster + midhdr_clusters
     midbtn_clusters = (len(midbtn_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
     midbot_cluster = midbtn_cluster + midbtn_clusters
     midbot_clusters = (len(midbot_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
     next_icon_cluster = midbot_cluster + midbot_clusters
+    # /PROGRAMS puede superar las 16 entradas al sumar varios protectores.
+    programs_extra_cluster = next_icon_cluster
+    next_icon_cluster += 1
     # /ICONS supera las 16 entradas que caben en su cluster fijo (13).
     # Reservar un segundo cluster antes de asignar los datos de los BMP.
     icons_extra_cluster = next_icon_cluster
@@ -231,7 +310,7 @@ def main():
 
     icon_files = []
     for icon_name in (
-        "FILES.BMP", "SHELL.BMP", "EDITOR.BMP", "CALC.BMP",
+        "ICONS.PAK", "FILES.BMP", "SHELL.BMP", "EDITOR.BMP", "CALC.BMP",
         "PROCESOS.BMP", "MIDAMP.BMP", "CDROM.BMP", "ABOUT.BMP",
         "FILE.BMP", "TEXT.BMP", "CONFIG.BMP", "IMAGE.BMP",
         "OBJECT.BMP", "MIDI.BMP",
@@ -251,6 +330,8 @@ def main():
     if associations_data:
         associations_cluster = next_icon_cluster
         next_icon_cluster += (len(associations_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
+    screensv_cluster = next_icon_cluster
+    next_icon_cluster += (len(screensv_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
 
     root_dir = bytearray(ROOT_DIR_SECTORS * SECTOR_SIZE)
     root_entries = [
@@ -277,6 +358,9 @@ def main():
             dir_entry("ASSOC.INI", 0x20, associations_cluster,
                       len(associations_data))
         )
+    root_entries.append(
+        dir_entry("SCREENSV.INI", 0x20, screensv_cluster, len(screensv_data))
+    )
     for index, entry in enumerate(root_entries):
         root_dir[index * 32:(index + 1) * 32] = entry
 
@@ -291,6 +375,11 @@ def main():
     # Agregar shell.o a la lista de programs si existe
     if shell_data:
         programs_entries.append(dir_entry("SHELL.O", 0x20, shell_cluster, len(shell_data)))
+        # RUNBOX.O es un placeholder de programa interno.
+        # Lo intercepta programs/launcher.c; no necesita ocupar clusters.
+        runbox_data = b""
+        runbox_cluster = 0
+        programs_entries.append(dir_entry("RUNBOX.O", 0x20, runbox_cluster, len(runbox_data)))
     if filebrowser_data:
         programs_entries.append(
             dir_entry("FILEBROWSER.O", 0x20, filebrowser_cluster, len(filebrowser_data))
@@ -316,6 +405,19 @@ def main():
         programs_entries.append(
             dir_entry("CALENDAR.O", 0x20, calendar_cluster,
                       len(calendar_data))
+        )
+    if screensaverd_data:
+        programs_entries.append(
+            dir_entry("SCREENSV.O", 0x20, screensaverd_cluster,
+                      len(screensaverd_data))
+        )
+    if ss_logo_data:
+        programs_entries.append(
+            dir_entry("SSLOGO.O", 0x20, ss_logo_cluster, len(ss_logo_data))
+        )
+    if ss_pipes_data:
+        programs_entries.append(
+            dir_entry("SSPIPES.O", 0x20, ss_pipes_cluster, len(ss_pipes_data))
         )
     # GEARS.O is an internal app placeholder.
     # The launcher intercepts this name and calls gears_open_from_desktop().
@@ -344,7 +446,13 @@ def main():
     ]
     icons_dir = build_directory(icons_entries)
 
-    write_cluster(image, 2, programs_dir)
+    if len(programs_dir) > SECTOR_SIZE * 2:
+        raise ValueError("directorio /PROGRAMS supera dos clusters")
+    write_cluster(image, 2, programs_dir[:SECTOR_SIZE])
+    if len(programs_dir) > SECTOR_SIZE:
+        write_cluster(image, programs_extra_cluster, programs_dir[SECTOR_SIZE:])
+        fat12_set(fat, 2, programs_extra_cluster)
+        fat12_set(fat, programs_extra_cluster, END_OF_CHAIN)
     write_cluster(image, 3, docs_dir)
     write_cluster(image, 4, misc_dir)
     if len(icons_dir) > SECTOR_SIZE * 2:
@@ -374,6 +482,12 @@ def main():
                             processmanager_data)
     if calendar_data:
         write_file_clusters(image, fat, calendar_cluster, calendar_data)
+    if screensaverd_data:
+        write_file_clusters(image, fat, screensaverd_cluster, screensaverd_data)
+    if ss_logo_data:
+        write_file_clusters(image, fat, ss_logo_cluster, ss_logo_data)
+    if ss_pipes_data:
+        write_file_clusters(image, fat, ss_pipes_cluster, ss_pipes_data)
     if midhdr_data:
         write_file_clusters(image, fat, midhdr_cluster, midhdr_data)
     if midbtn_data:
@@ -386,8 +500,12 @@ def main():
         write_file_clusters(image, fat, about_gif_cluster, about_gif_data)
     if associations_data:
         write_file_clusters(image, fat, associations_cluster, associations_data)
+    if screensv_data:
+        write_file_clusters(image, fat, screensv_cluster, screensv_data)
     if (shell_data or filebrowser_data or texteditor_data or calculator_data or
-            midamp_data or processmanager_data or calendar_data or midhdr_data or midbtn_data or midbot_data or
+            midamp_data or processmanager_data or calendar_data or
+            screensaverd_data or ss_logo_data or ss_pipes_data or screensv_data or
+            midhdr_data or midbtn_data or midbot_data or
             icon_files or about_gif_data or associations_data):
         # Update both FAT copies
         for copy_index in range(FAT_COUNT):

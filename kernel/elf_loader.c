@@ -7,6 +7,8 @@
 #include "include/sound.h"
 #include "include/vga.h"
 #include "../gui/gui.h"
+#include <TGL/gl.h>
+#include "zbuffer.h"
 #include "stdio.h"
 #include "stdlib.h"
 #include "string.h"
@@ -108,6 +110,11 @@ static uint32_t elf_kernel_symbol(const char *name) {
     EXPORT(errno);
     EXPORT(exit);
     EXPORT(fabs);
+    EXPORT(cos);
+    EXPORT(sin);
+    EXPORT(sqrt);
+    EXPORT(floor);
+    EXPORT(pow);
     EXPORT(fclose);
     EXPORT(fflush);
     EXPORT(fopen);
@@ -151,12 +158,20 @@ static uint32_t elf_kernel_symbol(const char *name) {
     EXPORT(gui_desktop_focus_window);
     EXPORT(gui_desktop_raise_window);
     EXPORT(gui_desktop_remove_window);
+    EXPORT(gui_desktop_register_program);
+    EXPORT(gui_desktop_unregister_program);
 
     /* GUI / Drawing */
+    EXPORT(gui_gfx_clear);
     EXPORT(gui_gfx_fill_rect);
     EXPORT(gui_gfx_draw_rect);
+    EXPORT(gui_gfx_putpixel);
+    EXPORT(gui_gfx_invalidate_front);
     EXPORT(gui_font_draw_string);
     EXPORT(gui_font_draw_string_clipped);
+    EXPORT(gui_font_draw_string_scaled);
+    EXPORT(gui_request_paint);
+    EXPORT(gui_get_desktop);
 
     /* GUI / Window */
     EXPORT(gui_window_content_top);
@@ -172,6 +187,64 @@ static uint32_t elf_kernel_symbol(const char *name) {
     EXPORT(gui_widget_create);
     EXPORT(gui_widget_handle_event);
     EXPORT(gui_widget_paint);
+
+    /* TinyGL / ZBuffer for external screen savers */
+    EXPORT(ZB_open);
+    EXPORT(ZB_close);
+    EXPORT(ZB_copyFrameBuffer);
+
+    EXPORT(glBegin);
+    EXPORT(tglBegin);
+    EXPORT(glClear);
+    EXPORT(tglClear);
+    EXPORT(glClearColor);
+    EXPORT(tglClearColor);
+    EXPORT(glClose);
+    EXPORT(tglClose);
+    EXPORT(glColor3f);
+    EXPORT(tglColor3f);
+    EXPORT(glColor3fv);
+    EXPORT(tglColor3fv);
+    EXPORT(glDepthMask);
+    EXPORT(tglDepthMask);
+    EXPORT(glDisable);
+    EXPORT(tglDisable);
+    EXPORT(glDrawText);
+    EXPORT(tglDrawText);
+    EXPORT(glEnable);
+    EXPORT(tglEnable);
+    EXPORT(glEnd);
+    EXPORT(tglEnd);
+    EXPORT(glFrustum);
+    EXPORT(tglFrustum);
+    EXPORT(glInit);
+    EXPORT(tglInit);
+    EXPORT(glLightModelfv);
+    EXPORT(tglLightModelfv);
+    EXPORT(glLightfv);
+    EXPORT(tglLightfv);
+    EXPORT(glLoadIdentity);
+    EXPORT(tglLoadIdentity);
+    EXPORT(glMaterialfv);
+    EXPORT(tglMaterialfv);
+    EXPORT(glMatrixMode);
+    EXPORT(tglMatrixMode);
+    EXPORT(glNormal3f);
+    EXPORT(tglNormal3f);
+    EXPORT(glRotatef);
+    EXPORT(tglRotatef);
+    EXPORT(glSetEnableSpecular);
+    EXPORT(tglSetEnableSpecular);
+    EXPORT(glShadeModel);
+    EXPORT(tglShadeModel);
+    EXPORT(glTextSize);
+    EXPORT(tglTextSize);
+    EXPORT(glTranslatef);
+    EXPORT(tglTranslatef);
+    EXPORT(glVertex3f);
+    EXPORT(tglVertex3f);
+    EXPORT(glViewport);
+    EXPORT(tglViewport);
 
     /* Keyboard */
     EXPORT(kbd_next_event);

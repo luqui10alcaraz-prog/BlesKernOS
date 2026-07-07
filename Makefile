@@ -162,11 +162,13 @@ KERNEL_SOURCES := \
 	programs/shell.c \
 	programs/deskmanager.c \
 	programs/deskbar.c \
+	programs/runbox.c \
 	programs/filebrowser.c \
 	programs/shelllauncher.c \
 	programs/texteditor.c \
 	programs/calculator.c \
 	programs/calendar.c \
+	programs/screensaverd.c \
 	programs/processmanager.c \
 	programs/midamp.c \
 	programs/imageviewer.c \
@@ -208,7 +210,7 @@ DISK_IMG   := build/bleskernos.img
 ATA_IMG    := build/bleskernos-ata.img
 FLOPPY_TOTAL_SECTORS := 2880
 KERNEL_STAGE2_SECTORS := 1024
-FAT_RESERVED_SECTORS := $(shell expr 5 + $(KERNEL_STAGE2_SECTORS))
+FAT_RESERVED_SECTORS := $(shell expr 9 + $(KERNEL_STAGE2_SECTORS))
 QEMU_AUDIO_ARGS ?= -device sb16
 DOOM_EXTRA_ISO ?= programs/doom/build/doom-extra.iso
 QEMU_DOOM_ARGS := -drive file=$(DOOM_EXTRA_ISO),media=cdrom,if=ide,readonly=on
@@ -222,7 +224,7 @@ endif
 # Layout del floppy FAT12:
 # Sector 0       = Stage 1 + BPB FAT12
 # Sectores 1-4   = Stage 2
-# Sectores 5..(4 + KERNEL_STAGE2_SECTORS) = Kernel crudo reservado para stage2
+# Sectores 9..(8 + KERNEL_STAGE2_SECTORS) = Kernel crudo reservado para stage2
 # Sectores siguientes                    = FAT12 + root dir + data
 #
 # Estructura de carpetas en el disquete (gestionada por build_fat_floppy.py):
@@ -323,6 +325,9 @@ $(PROCESSMANAGER_OBJ): programs/processmanager.c | build
 # calendar.o - compilado como objeto independiente para el disquete
 CALENDAR_OBJ := build/programs/calendar.o
 GEARS_OBJ := build/programs/gears.o
+SCREENSAVERD_OBJ := build/programs/screensaverd.o
+SSLOGO_OBJ := build/programs/ss_logo.o
+SSPIPES_OBJ := build/programs/ss_pipes.o
 
 $(CALENDAR_OBJ): programs/calendar.c | build
 	@mkdir -p $(dir $@)
@@ -335,9 +340,27 @@ $(GEARS_OBJ): programs/gears.c | build
 	@echo "[GCC]  Compilando gears como programa separado..."
 	$(CC) $(CC_FLAGS) $(INCLUDE_FLAGS) -c $< -o $@
 	@echo "[OK]   Gears object: $@"
+$(SCREENSAVERD_OBJ): programs/screensaverd.c | build
+	@mkdir -p $(dir $@)
+	@echo "[GCC]  Compilando screensaverd como programa separado..."
+	$(CC) $(CC_FLAGS) $(INCLUDE_FLAGS) -c $< -o $@
+	@echo "[OK]   ScreenSaver daemon object: $@"
+
+$(SSLOGO_OBJ): programs/ss_logo.c | build
+	@mkdir -p $(dir $@)
+	@echo "[GCC]  Compilando ss_logo como programa separado..."
+	$(CC) $(CC_FLAGS) $(INCLUDE_FLAGS) -c $< -o $@
+	@echo "[OK]   SSLogo object: $@"
+
+$(SSPIPES_OBJ): programs/ss_pipes.c | build
+	@mkdir -p $(dir $@)
+	@echo "[GCC]  Compilando ss_pipes como programa separado..."
+	$(CC) $(CC_FLAGS) $(INCLUDE_FLAGS) -DSS_PIPES_EXTERNAL_ENTRY -c $< -o $@
+	@echo "[OK]   SSPipes object: $@"
+
 
 # ── Imagen de disco ───────────────────────────────────────────────────────────
-$(DISK_IMG): $(BOOT1_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $(SHELL_OBJ) $(FILEBROWSER_OBJ) $(PROCESSMANAGER_OBJ) $(CALENDAR_OBJ) build/programs/texteditor.o build/programs/calculator.o build/programs/midamp.o Desktop.INI Associations.INI tools/build_fat_floppy.py $(wildcard assets/icons/*.BMP) assets/gif/abount.gif
+$(DISK_IMG): $(BOOT1_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $(SHELL_OBJ) $(FILEBROWSER_OBJ) $(PROCESSMANAGER_OBJ) $(CALENDAR_OBJ) $(SCREENSAVERD_OBJ) $(SSLOGO_OBJ) $(SSPIPES_OBJ) build/programs/texteditor.o build/programs/calculator.o build/programs/midamp.o Desktop.INI Associations.INI tools/build_fat_floppy.py $(wildcard assets/icons/*.BMP) assets/gif/abount.gif
 	@echo "[IMG]  Creando imagen de disco..."
 	@KERNEL_BIN_SECTORS=$$(( ($$(wc -c < $(KERNEL_BIN)) + 511) / 512 )); \
 	if [ $$KERNEL_BIN_SECTORS -gt $(KERNEL_STAGE2_SECTORS) ]; then \
@@ -347,8 +370,8 @@ $(DISK_IMG): $(BOOT1_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $(SHELL_OBJ) $(FILEBROWSER_
 	dd if=/dev/zero of=$@ bs=512 count=$(FLOPPY_TOTAL_SECTORS) 2>/dev/null
 	dd if=$(BOOT1_BIN) of=$@ bs=512 seek=0 conv=notrunc 2>/dev/null
 	dd if=$(BOOT2_BIN) of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
-	dd if=$(KERNEL_BIN) of=$@ bs=512 seek=5 conv=notrunc 2>/dev/null
-	$(PYTHON) tools/build_fat_floppy.py $@ $(SHELL_OBJ) $(FILEBROWSER_OBJ) build/programs/texteditor.o build/programs/calculator.o build/programs/midamp.o $(PROCESSMANAGER_OBJ) $(CALENDAR_OBJ) Desktop.INI assets/icons assets/gif/abount.gif Associations.INI $(FAT_RESERVED_SECTORS)
+	dd if=$(KERNEL_BIN) of=$@ bs=512 seek=9 conv=notrunc 2>/dev/null
+	$(PYTHON) tools/build_fat_floppy.py $@ $(SHELL_OBJ) $(FILEBROWSER_OBJ) build/programs/texteditor.o build/programs/calculator.o build/programs/midamp.o $(PROCESSMANAGER_OBJ) $(CALENDAR_OBJ) Desktop.INI assets/icons assets/gif/abount.gif Associations.INI $(FAT_RESERVED_SECTORS) $(SCREENSAVERD_OBJ) $(SSLOGO_OBJ) $(SSPIPES_OBJ)
 	@echo "[OK]   Imagen: $$(wc -c < $@) bytes"
 
 $(ATA_IMG): $(DISK_IMG)

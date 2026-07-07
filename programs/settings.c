@@ -7,13 +7,21 @@
 
 #define SETTINGS_MAX_MODES 8
 
-enum { PAGE_WALLPAPER, PAGE_DISPLAY, PAGE_SOUND };
+enum { PAGE_WALLPAPER, PAGE_DISPLAY, PAGE_SOUND, PAGE_SCREENSAVER, SETTINGS_PAGE_COUNT };
 
 typedef struct {
     gui_desktop_t *desktop;
     gui_window_t *window;
-    uint32_t page_ids[3];
+    uint32_t page_ids[SETTINGS_PAGE_COUNT];
     uint32_t load_bmp_id;
+    uint32_t saver_enable_id;
+    uint32_t saver_disable_id;
+    uint32_t saver_timeout_1_id;
+    uint32_t saver_timeout_5_id;
+    uint32_t saver_timeout_10_id;
+    uint32_t saver_logo_id;
+    uint32_t saver_pipes_id;
+    uint32_t saver_preview_id;
     uint32_t mode_ids[SETTINGS_MAX_MODES];
     gfx_display_mode_t modes[SETTINGS_MAX_MODES];
     uint32_t mode_count;
@@ -116,6 +124,16 @@ static void settings_update_controls(settings_state_t *st) {
                                   i < st->mode_count;
             }
         }
+        if (widget->id == st->saver_enable_id ||
+            widget->id == st->saver_disable_id ||
+            widget->id == st->saver_timeout_1_id ||
+            widget->id == st->saver_timeout_5_id ||
+            widget->id == st->saver_timeout_10_id ||
+            widget->id == st->saver_logo_id ||
+            widget->id == st->saver_pipes_id ||
+            widget->id == st->saver_preview_id) {
+            widget->visible = st->page == PAGE_SCREENSAVER;
+        }
         widget = widget->next;
     }
 }
@@ -124,7 +142,7 @@ static void settings_page(gui_window_t *window, uint32_t id) {
     settings_state_t *st = window
                          ? (settings_state_t *)window->content_context : NULL;
     if (!st) return;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < SETTINGS_PAGE_COUNT; i++) {
         if (st->page_ids[i] == id) st->page = i;
     }
     st->message[0] = '\0';
@@ -171,6 +189,82 @@ static void settings_mode(gui_window_t *window, uint32_t id) {
     }
 }
 
+static void settings_saver_enable(gui_window_t *window, uint32_t id UNUSED) {
+    settings_state_t *st = window
+                         ? (settings_state_t *)window->content_context : NULL;
+    screensaver_set_enabled(true);
+    if (st) kstrcpy(st->message, "Protector activado");
+    if (window) window->dirty = true;
+}
+
+static void settings_saver_disable(gui_window_t *window, uint32_t id UNUSED) {
+    settings_state_t *st = window
+                         ? (settings_state_t *)window->content_context : NULL;
+    screensaver_set_enabled(false);
+    if (st) kstrcpy(st->message, "Protector desactivado");
+    if (window) window->dirty = true;
+}
+
+static void settings_saver_timeout(gui_window_t *window, uint32_t id) {
+    settings_state_t *st = window
+                         ? (settings_state_t *)window->content_context : NULL;
+    uint32_t seconds = 300;
+
+    if (!st) return;
+    if (id == st->saver_timeout_1_id) seconds = 60;
+    else if (id == st->saver_timeout_5_id) seconds = 300;
+    else if (id == st->saver_timeout_10_id) seconds = 600;
+
+    screensaver_set_timeout_seconds(seconds);
+    if (seconds == 60) kstrcpy(st->message, "Guardado: 1 min");
+    else if (seconds == 300) kstrcpy(st->message, "Guardado: 5 min");
+    else if (seconds == 600) kstrcpy(st->message, "Guardado: 10 min");
+    else kstrcpy(st->message, "Guardado");
+    if (window) window->dirty = true;
+}
+
+static bool settings_path_contains(const char *path, const char *needle) {
+    if (!path || !needle) return false;
+    while (*path) {
+        const char *a = path;
+        const char *b = needle;
+        while (*a && *b && *a == *b) {
+            a++;
+            b++;
+        }
+        if (!*b) return true;
+        path++;
+    }
+    return false;
+}
+
+static void settings_saver_logo(gui_window_t *window, uint32_t id UNUSED) {
+    settings_state_t *st = window
+                         ? (settings_state_t *)window->content_context : NULL;
+    screensaver_set_path("/PROGRAMS/SSLOGO.O");
+    if (st) kstrcpy(st->message, "Protector: Logo");
+    if (window) window->dirty = true;
+}
+
+static void settings_saver_pipes(gui_window_t *window, uint32_t id UNUSED) {
+    settings_state_t *st = window
+                         ? (settings_state_t *)window->content_context : NULL;
+    screensaver_set_path("/PROGRAMS/SSPIPES.O");
+    if (st) kstrcpy(st->message, "Protector: Pipes 3D");
+    if (window) window->dirty = true;
+}
+
+static void settings_saver_preview(gui_window_t *window, uint32_t id UNUSED) {
+    settings_state_t *st = window
+                         ? (settings_state_t *)window->content_context : NULL;
+    if (!st) return;
+    if (screensaver_preview(st->desktop))
+        kstrcpy(st->message, "Vista previa iniciada");
+    else
+        kstrcpy(st->message, "No se pudo iniciar el protector");
+    if (window) window->dirty = true;
+}
+
 static uint32_t spectrum_color(int x, int y, int w, int h) {
     int segment = (x * 6) / w;
     int local = (x * 6 * 255 / w) % 255;
@@ -200,11 +294,6 @@ static uint32_t spectrum_color(int x, int y, int w, int h) {
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
-static void draw_generic_icon(gui_surface_t *s, int x, int y, uint32_t color) {
-    gui_gfx_fill_rounded_rect(s, (gui_rect_t){x, y, 22, 22}, 4, color);
-    gui_gfx_draw_rect(s, (gui_rect_t){x + 4, y + 4, 14, 14}, 0x00FFFFFF);
-}
-
 static void settings_draw(gui_window_t *window UNUSED, gui_surface_t *s,
                           void *ctx) {
     settings_state_t *st = (settings_state_t *)ctx;
@@ -213,12 +302,6 @@ static void settings_draw(gui_window_t *window UNUSED, gui_surface_t *s,
     int px = wx + 126;
     int py = wy + 12;
 
-    gui_gfx_fill_rect(s, (gui_rect_t){wx + 2, wy + 2, 112,
-                      st->window->bounds.h - GUI_TITLEBAR_HEIGHT - 4},
-                      0x00D8D8D0);
-    draw_generic_icon(s, wx + 10, wy + 13, 0x003B77B8);
-    draw_generic_icon(s, wx + 10, wy + 53, 0x00505058);
-    draw_generic_icon(s, wx + 10, wy + 93, 0x0068A050);
 
     if (st->page == PAGE_WALLPAPER) {
         gui_font_draw_string(s, px, py, "Fondo de pantalla",
@@ -250,7 +333,7 @@ static void settings_draw(gui_window_t *window UNUSED, gui_surface_t *s,
             0x00303030, 0, false);
         gui_font_draw_string(s, px, py + 68, "Modos detectados:",
                              0x00303030, 0, false);
-    } else {
+    } else if (st->page == PAGE_SOUND) {
         gui_font_draw_string(s, px, py, "Sonido disponible",
                              0x00101010, 0, false);
         gui_font_draw_string(s, px, py + 28, "Salida PCM:",
@@ -263,12 +346,46 @@ static void settings_draw(gui_window_t *window UNUSED, gui_surface_t *s,
             0x00303030, 0, false);
         gui_font_draw_string(s, px, py + 80,
             "Panel informativo por ahora.", 0x00606060, 0, false);
+    } else if (st->page == PAGE_SCREENSAVER) {
+        char timeout_text[32];
+        size_t len = 0;
+        uint32_t seconds = screensaver_get_timeout_seconds();
+
+        timeout_text[0] = '\0';
+        settings_append_uint(timeout_text, sizeof(timeout_text), &len,
+                             seconds / 60);
+        settings_append_char(timeout_text, sizeof(timeout_text), &len, ' ');
+        settings_append_char(timeout_text, sizeof(timeout_text), &len, 'm');
+        settings_append_char(timeout_text, sizeof(timeout_text), &len, 'i');
+        settings_append_char(timeout_text, sizeof(timeout_text), &len, 'n');
+
+        gui_font_draw_string(s, px, py, "Protector de pantalla",
+                             0x00101010, 0, false);
+        gui_font_draw_string(s, px, py + 28, "Estado:",
+                             0x00303030, 0, false);
+        gui_font_draw_string(s, px + 70, py + 28,
+                             screensaver_is_enabled() ? "activado" : "desactivado",
+                             screensaver_is_enabled() ? 0x00106020 : 0x00602020,
+                             0, false);
+        gui_font_draw_string(s, px, py + 52, "Tiempo:",
+                             0x00303030, 0, false);
+        gui_font_draw_string(s, px + 70, py + 52, timeout_text,
+                             0x00106020, 0, false);
+        gui_font_draw_string(s, px, py + 76, "Actual:",
+                             0x00303030, 0, false);
+        gui_font_draw_string(s, px + 70, py + 76,
+                             settings_path_contains(screensaver_get_path(), "SSPIPES")
+                                 ? "Pipes 3D" : "Logo",
+                             0x00106020, 0, false);
     }
 
     if (st->message[0]) {
-        gui_font_draw_string_clipped(s, px, wy + st->window->bounds.h - 58,
+        int msg_y = st->window->bounds.y + st->window->bounds.h - 28;
+        int msg_w = st->window->bounds.w - 142;
+        if (msg_w < 40) msg_w = 40;
+        gui_font_draw_string_clipped(s, px, msg_y,
             st->message, 0x00602020,
-            (gui_rect_t){px, wy + st->window->bounds.h - 62, 300, 20});
+            (gui_rect_t){px, msg_y - 2, msg_w, 18});
     }
 }
 
@@ -301,24 +418,25 @@ static void settings_cleanup(settings_state_t *st) {
 
 static void settings_main(void *arg) {
     settings_state_t *st = (settings_state_t *)arg;
-    static const char *pages[3] = {"Fondo", "Pantalla", "Sonido"};
+    static const char *pages[SETTINGS_PAGE_COUNT] = {"Fondo", "Pantalla", "Sonido", "Protector"};
 
     if (!st) {
         task_exit();
         return;
     }
     settings_load_modes(st);
-    st->window = gui_desktop_create_window(st->desktop, 70, 35, 468, 305,
+    st->window = gui_desktop_create_window(st->desktop, 70, 35, 468, 335,
                                            "Configuracion");
     if (st->window) {
+        gui_window_set_min_size(st->window, 430, 265);
         gui_window_set_content(st->window, settings_draw, st);
         gui_window_set_event_handler(st->window, settings_event, st);
         st->window->owner_pid = task_current_pid();
         task_bind_window(st->window);
 
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < SETTINGS_PAGE_COUNT; i++) {
             gui_widget_t *button = gui_widget_create(st->desktop, st->window,
-                GUI_WIDGET_BUTTON, (gui_rect_t){38, 6 + i * 40, 70, 28},
+                GUI_WIDGET_BUTTON, (gui_rect_t){38, 6 + i * 40, 82, 28},
                 pages[i], settings_page);
             if (button) st->page_ids[i] = button->id;
         }
@@ -343,6 +461,42 @@ static void settings_main(void *arg) {
                 (gui_rect_t){126 + col * 116, 88 + row * 32, 108, 24},
                 label, settings_mode);
             if (button) st->mode_ids[i] = button->id;
+        }
+
+        {
+            gui_widget_t *button;
+            button = gui_widget_create(st->desktop, st->window,
+                GUI_WIDGET_BUTTON, (gui_rect_t){126, 88, 82, 24},
+                "Activar", settings_saver_enable);
+            if (button) st->saver_enable_id = button->id;
+            button = gui_widget_create(st->desktop, st->window,
+                GUI_WIDGET_BUTTON, (gui_rect_t){216, 88, 96, 24},
+                "Desactivar", settings_saver_disable);
+            if (button) st->saver_disable_id = button->id;
+            button = gui_widget_create(st->desktop, st->window,
+                GUI_WIDGET_BUTTON, (gui_rect_t){126, 122, 64, 24},
+                "1 min", settings_saver_timeout);
+            if (button) st->saver_timeout_1_id = button->id;
+            button = gui_widget_create(st->desktop, st->window,
+                GUI_WIDGET_BUTTON, (gui_rect_t){198, 122, 64, 24},
+                "5 min", settings_saver_timeout);
+            if (button) st->saver_timeout_5_id = button->id;
+            button = gui_widget_create(st->desktop, st->window,
+                GUI_WIDGET_BUTTON, (gui_rect_t){270, 122, 70, 24},
+                "10 min", settings_saver_timeout);
+            if (button) st->saver_timeout_10_id = button->id;
+            button = gui_widget_create(st->desktop, st->window,
+                GUI_WIDGET_BUTTON, (gui_rect_t){126, 156, 82, 24},
+                "Logo", settings_saver_logo);
+            if (button) st->saver_logo_id = button->id;
+            button = gui_widget_create(st->desktop, st->window,
+                GUI_WIDGET_BUTTON, (gui_rect_t){216, 156, 96, 24},
+                "Pipes 3D", settings_saver_pipes);
+            if (button) st->saver_pipes_id = button->id;
+            button = gui_widget_create(st->desktop, st->window,
+                GUI_WIDGET_BUTTON, (gui_rect_t){126, 190, 110, 24},
+                "Vista previa", settings_saver_preview);
+            if (button) st->saver_preview_id = button->id;
         }
         settings_update_controls(st);
     }

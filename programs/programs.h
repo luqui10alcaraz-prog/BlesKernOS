@@ -43,6 +43,16 @@ void paint_install(gui_desktop_t *desktop);
 void paint_open_from_desktop(gui_desktop_t *desktop);
 void settings_install(gui_desktop_t *desktop);
 void settings_open_from_desktop(gui_desktop_t *desktop);
+
+void screensaverd_install(gui_desktop_t *desktop);
+bool screensaver_is_enabled(void);
+uint32_t screensaver_get_timeout_seconds(void);
+void screensaver_set_enabled(bool enabled);
+void screensaver_set_timeout_seconds(uint32_t seconds);
+const char *screensaver_get_path(void);
+void screensaver_set_path(const char *path);
+bool screensaver_preview(gui_desktop_t *desktop);
+
 void deskmanager_set_background(uint32_t color);
 uint32_t deskmanager_get_background(void);
 bool deskmanager_set_wallpaper(const char *path);
@@ -68,6 +78,10 @@ bool filebrowser_get_runtime_info(program_runtime_info_t *info);
 bool shelllauncher_get_runtime_info(program_runtime_info_t *info);
 bool texteditor_get_runtime_info(program_runtime_info_t *info);
 bool calculator_get_runtime_info(program_runtime_info_t *info);
+
+void runbox_open_from_desktop(gui_desktop_t *desktop);
+bool runbox_get_runtime_info(program_runtime_info_t *info);
+
 bool calendar_get_runtime_info(program_runtime_info_t *info);
 bool processmanager_get_runtime_info(program_runtime_info_t *info);
 bool midamp_get_runtime_info(program_runtime_info_t *info);
