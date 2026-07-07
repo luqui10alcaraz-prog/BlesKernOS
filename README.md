@@ -1,4 +1,4 @@
-# BlesKernOS
+# BlesKernOS 0.6 (BETA)
 
 BlesKernOS is an 32-bit operating system written from scratch in x86 Assembly and C.
 
