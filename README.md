@@ -1,6 +1,6 @@
 # BlesKernOS 0.6 (BETA)
 
-This is a beta of an alpha, so there may be bugs and unfinished elements; it primarily fixes a critical error when loading the OS from floppy disks.
+This is a beta build of an alpha-stage operating system, so there may be bugs and unfinished elements; it primarily fixes a critical error when loading the OS from floppy disks.
 
 ---
 
