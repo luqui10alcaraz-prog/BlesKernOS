@@ -1,7 +1,4 @@
-# BlesKernOS 0.6 (BETA)
-
-This is a beta build of an alpha-stage operating system, so there may be bugs and unfinished elements; it primarily fixes a critical error when loading the OS from floppy disks.
-
+# BlesKernOS 0.6
 ---
 
 BlesKernOS is an 32-bit operating system written from scratch in x86 Assembly and C.
