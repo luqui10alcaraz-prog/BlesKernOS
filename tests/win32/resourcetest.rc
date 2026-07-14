@@ -1,0 +1,9 @@
+#include "resource_ids.h"
+
+STRINGTABLE
+BEGIN
+    IDS_STAGE7 "PE resources + Unicode OK on BlesKernOS!"
+END
+
+IDI_STAGE7 ICON "build/win32/TESTICON.ICO"
+IDB_STAGE7 BITMAP "build/win32/TESTBITMAP.BMP"

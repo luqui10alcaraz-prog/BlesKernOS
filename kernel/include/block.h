@@ -10,7 +10,8 @@ typedef enum {
     BLOCK_DEVICE_NONE = 0,
     BLOCK_DEVICE_ATA,
     BLOCK_DEVICE_FLOPPY,
-    BLOCK_DEVICE_ATAPI
+    BLOCK_DEVICE_ATAPI,
+    BLOCK_DEVICE_USB
 } block_device_type_t;
 
 typedef struct block_device block_device_t;

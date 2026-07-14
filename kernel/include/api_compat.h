@@ -1,0 +1,183 @@
+#ifndef BK_API_COMPAT_H
+#define BK_API_COMPAT_H
+
+/*
+ * Fachada fuente de la API v3. Estos alias mantienen una unica ruta publica
+ * para codigo de aplicacion mientras el kernel conserva sus nombres internos.
+ * No incluir directamente este archivo; api.h aporta los tipos necesarios.
+ */
+
+/* GUI y compositor. */
+#define bk_gui_change_resolution gui_change_resolution
+#define bk_gui_color_blend gui_color_blend
+#define bk_gui_desktop_create_window gui_desktop_create_window
+#define bk_gui_desktop_cursor_trail_enabled gui_desktop_cursor_trail_enabled
+#define bk_gui_desktop_focus_window gui_desktop_focus_window
+#define bk_gui_desktop_invalidate_all gui_desktop_invalidate_all
+#define bk_gui_desktop_raise_window gui_desktop_raise_window
+#define bk_gui_desktop_register_program gui_desktop_register_program
+#define bk_gui_desktop_remove_window gui_desktop_remove_window
+#define bk_gui_desktop_set_cursor_trail gui_desktop_set_cursor_trail
+#define bk_gui_desktop_unregister_program gui_desktop_unregister_program
+#define bk_gui_event_queue_pop gui_event_queue_pop
+#define bk_gui_event_queue_push gui_event_queue_push
+#define bk_gui_event_queue_reset gui_event_queue_reset
+#define bk_gui_font_draw_char gui_font_draw_char
+#define bk_gui_font_draw_string gui_font_draw_string
+#define bk_gui_font_draw_string_clipped gui_font_draw_string_clipped
+#define bk_gui_font_draw_string_scaled gui_font_draw_string_scaled
+#define bk_gui_font_text_width gui_font_text_width
+#define bk_gui_get_desktop gui_get_desktop
+#define bk_gui_get_last_input_tick gui_get_last_input_tick
+#define bk_gui_gfx_clear gui_gfx_clear
+#define bk_gui_gfx_draw_line gui_gfx_draw_line
+#define bk_gui_gfx_draw_rect gui_gfx_draw_rect
+#define bk_gui_gfx_fill_rect gui_gfx_fill_rect
+#define bk_gui_gfx_fill_rounded_rect gui_gfx_fill_rounded_rect
+#define bk_gui_gfx_invalidate_front gui_gfx_invalidate_front
+#define bk_gui_gfx_point_visible gui_gfx_point_visible
+#define bk_gui_gfx_putpixel gui_gfx_putpixel
+#define bk_gui_gif_animation_free gui_gif_animation_free
+#define bk_gui_gif_load gui_gif_load
+#define bk_gui_gif_load_animation gui_gif_load_animation
+#define bk_gui_gif_load_animation_limited gui_gif_load_animation_limited
+#define bk_gui_image_free gui_image_free
+#define bk_gui_rect_contains gui_rect_contains
+#define bk_gui_scrollbar_handle_event_vertical gui_scrollbar_handle_event_vertical
+#define bk_gui_scrollbar_init_vertical gui_scrollbar_init_vertical
+#define bk_gui_scrollbar_paint_vertical gui_scrollbar_paint_vertical
+#define bk_gui_widget_create gui_widget_create
+#define bk_gui_widget_create_button gui_widget_create_button
+#define bk_gui_widget_create_dropdown gui_widget_create_dropdown
+#define bk_gui_widget_create_selectable_button gui_widget_create_selectable_button
+#define bk_gui_widget_dropdown_add_item gui_widget_dropdown_add_item
+#define bk_gui_widget_dropdown_clear gui_widget_dropdown_clear
+#define bk_gui_widget_dropdown_get_selected gui_widget_dropdown_get_selected
+#define bk_gui_widget_dropdown_get_selected_label gui_widget_dropdown_get_selected_label
+#define bk_gui_widget_dropdown_get_selected_value gui_widget_dropdown_get_selected_value
+#define bk_gui_widget_dropdown_set_selected gui_widget_dropdown_set_selected
+#define bk_gui_widget_dropdown_set_selected_by_value gui_widget_dropdown_set_selected_by_value
+#define bk_gui_widget_screen_bounds gui_widget_screen_bounds
+#define bk_gui_widget_set_enabled gui_widget_set_enabled
+#define bk_gui_widget_set_selected gui_widget_set_selected
+#define bk_gui_window_add_menu gui_window_add_menu
+#define bk_gui_window_add_menu_item gui_window_add_menu_item
+#define bk_gui_window_close gui_window_close
+#define bk_gui_window_contains gui_window_contains
+#define bk_gui_window_content_rect_raw gui_window_content_rect
+#define bk_gui_window_content_top gui_window_content_top
+#define bk_gui_window_context_add_item gui_window_context_add_item
+#define bk_gui_window_context_clear gui_window_context_clear
+#define bk_gui_window_context_open gui_window_context_open
+#define bk_gui_window_destroy_raw gui_window_destroy
+#define bk_gui_window_minimize gui_window_minimize
+#define bk_gui_window_restore gui_window_restore
+#define bk_gui_window_set_borderless gui_window_set_borderless
+#define bk_gui_window_set_content_raw gui_window_set_content
+#define bk_gui_window_set_event_handler_raw gui_window_set_event_handler
+#define bk_gui_window_set_min_size_raw gui_window_set_min_size
+
+/* Imagenes. */
+#define bk_image_gif_animation_free gui_gif_animation_free
+#define bk_image_gif_load gui_gif_load
+#define bk_image_gif_load_animation gui_gif_load_animation
+#define bk_image_gif_load_animation_limited gui_gif_load_animation_limited
+#define bk_image_free gui_image_free
+
+/* Dispositivos y enumeracion de hardware de solo lectura. */
+#define bk_device_block_at block_at
+#define bk_device_block_count block_count
+#define bk_device_block_get block_get
+#define bk_device_block_read block_read
+#define bk_device_block_type_name block_type_name
+#define bk_device_refresh_media ata_refresh_media
+#define bk_device_driver_at driver_at
+#define bk_device_driver_count driver_count
+#define bk_device_driver_last_error driver_last_error
+#define bk_device_driver_load driver_load
+#define bk_device_pci_class_name pci_class_name
+#define bk_device_pci_config_read32 pci_config_read32
+#define bk_device_pci_at pci_device_at
+#define bk_device_pci_count pci_device_count
+#define bk_device_pci_enable_command pci_enable_command
+#define bk_device_pci_find_by_class pci_find_by_class
+#define bk_device_pci_get_bar_info pci_get_bar_info
+#define bk_device_pci_refresh pci_refresh_device
+#define bk_device_fs_info vfs_get_fs_info
+#define bk_device_mount vfs_mount
+#define bk_device_mount_default vfs_mount_default
+#define bk_device_mount_name vfs_get_mount_name
+#define bk_device_has_cdrom vfs_has_cdrom
+
+/* Runtime C/kernel heredado, accesible solo a traves de la fachada. */
+#define bk_runtime_memcpy kmemcpy
+#define bk_runtime_memcmp kmemcmp
+#define bk_runtime_memset kmemset
+#define bk_runtime_strcat kstrcat
+#define bk_runtime_strcmp kstrcmp
+#define bk_runtime_strcpy kstrcpy
+#define bk_runtime_strlen kstrlen
+#define bk_runtime_strncmp kstrncmp
+#define bk_runtime_strncpy kstrncpy
+
+/* Consultas de proceso heredadas; para codigo nuevo preferir bk_proc_info. */
+#define bk_proc_cpu_usage task_cpu_usage
+#define bk_proc_get_legacy task_get
+#define bk_proc_state_name task_state_name
+#define bk_proc_critical_enter task_preempt_disable
+#define bk_proc_critical_leave task_preempt_enable
+
+/* Servicios que antes exigian headers de controladores. */
+#define bk_input_mouse_state mouse_get_state
+#define bk_input_mouse_set_bounds mouse_set_bounds
+#define bk_input_getchar kbd_getchar
+#define bk_media_mount_iso iso9660_mount_default
+#define bk_sound_play_file sound_play_file
+#define bk_system_startup_sound_enabled startup_sound_enabled
+#define bk_system_startup_sound_set_enabled startup_sound_set_enabled
+#define bk_time_date rtc_get_date
+
+/* Modos graficos avanzados. Las primitivas normales son bk_gfx_*. */
+#define bk_gfx_attach_framebuffer gfx_attach_vesa_lfb
+#define bk_gfx_detect_video_type gfx_detect_video_type
+#define bk_gfx_has_framebuffer gfx_has_vesa_lfb
+#define bk_gfx_list_all_modes gfx_list_all_display_modes
+#define bk_gfx_set_palette_color gfx_set_palette_color
+#define bk_gfx_set_text_mode gfx_set_text_mode
+#define bk_gfx_set_mode13h gfx_set_mode13h
+#define bk_gfx_set_mode12h gfx_set_mode12h
+#define bk_gfx_video_type_name gfx_video_type_name
+#define bk_gfx_demo gfx_demo
+
+/* Cargadores. */
+#define bk_app_elf_execute elf_execute_program_ex
+#define bk_app_elf_last_error elf_last_error
+#define bk_app_pe_execute pe_execute_program
+#define bk_app_pe_last_error pe_last_error
+#define bk_app_execute_path program_execute_path
+#define bk_app_execute_path_arg program_execute_path_arg
+#define bk_app_is_object program_is_object
+#define bk_app_is_win32 program_is_win32_executable
+#define bk_app_launch_argument program_launch_arg
+#define bk_app_load_icon program_load_bmp_icon_scaled
+#define bk_app_load_wallpaper program_load_bmp_wallpaper_scaled
+#define bk_app_draw_icon program_draw_icon_pixels
+
+/* Preferencias de escritorio y salvapantallas. */
+#define bk_desktop_get_background deskmanager_get_background
+#define bk_desktop_get_wallpaper deskmanager_get_wallpaper_path
+#define bk_desktop_set_background deskmanager_set_background
+#define bk_desktop_set_wallpaper deskmanager_set_wallpaper
+#define bk_screensaver_get_path screensaver_get_path
+#define bk_screensaver_get_timeout screensaver_get_timeout_seconds
+#define bk_screensaver_is_enabled screensaver_is_enabled
+#define bk_screensaver_preview screensaver_preview
+#define bk_screensaver_set_enabled screensaver_set_enabled
+#define bk_screensaver_set_path screensaver_set_path
+#define bk_screensaver_set_timeout screensaver_set_timeout_seconds
+
+/* Consola y shell embebida. */
+#define bk_console_set_output_sink vga_set_output_sink
+#define bk_shell_execute_line shell_execute_line
+
+#endif

@@ -2,6 +2,7 @@
 #include "../include/ata.h"
 #include "../include/memory.h"
 #include "../include/vga.h"
+#include "../include/driver.h"
 
 #define ISO_SECTOR_SIZE 2048U
 #define ISO_PVD_LBA 16U
@@ -93,6 +94,9 @@ bool iso9660_list(const iso9660_entry_t *directory, iso9660_entry_t *entries,
 
     if (!directory || !directory->is_directory || !entries || !count ||
         !g_iso_device) return false;
+    *count = 0;
+    if (directory->size == 0 || directory->size > 128U * 1024U)
+        return false;
     data = (uint8_t *)kmalloc(directory->size);
     if (!data) return false;
 
@@ -107,6 +111,11 @@ bool iso9660_list(const iso9660_entry_t *directory, iso9660_entry_t *entries,
     while (position < directory->size && found < max_entries) {
         uint8_t length = data[position];
         if (length == 0) {
+            position = ((position / ISO_SECTOR_SIZE) + 1) * ISO_SECTOR_SIZE;
+            continue;
+        }
+        if (length < 34) break;
+        if ((position % ISO_SECTOR_SIZE) + length > ISO_SECTOR_SIZE) {
             position = ((position / ISO_SECTOR_SIZE) + 1) * ISO_SECTOR_SIZE;
             continue;
         }
@@ -205,4 +214,30 @@ bool iso9660_read_at(const iso9660_entry_t *entry, uint32_t offset,
     }
     *bytes_read = total;
     return true;
+}
+
+static bool iso9660_driver_init(void) {
+    static const iso9660_driver_ops_t ops = {
+        iso9660_mount_default,
+        iso9660_is_mounted,
+        iso9660_resolve,
+        iso9660_list,
+        iso9660_read_at
+    };
+
+    if (!iso9660_register_driver(&ops)) return false;
+    (void)iso9660_mount_default();
+    return true;
+}
+
+const bk_driver_module_t *bleskernos_driver_query(void) {
+    static const bk_driver_module_t module = {
+        BK_DRIVER_ABI_VERSION,
+        sizeof(bk_driver_module_t),
+        "iso9660",
+        "Sistema de archivos para CD-ROM ISO9660",
+        iso9660_driver_init,
+        NULL
+    };
+    return &module;
 }

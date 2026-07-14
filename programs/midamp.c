@@ -1,11 +1,4 @@
-#include "programs.h"
-#include "../gui/image.h"
-#include "../kernel/include/keyboard.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/pit.h"
-#include "../kernel/include/sound.h"
-#include "../kernel/include/task.h"
-#include "../kernel/include/vfs.h"
+#include "../kernel/include/api.h"
 
 #define MIDAMP_MAX_PLAYLIST   40
 #define MIDAMP_ACTION_QUEUE   32
@@ -19,8 +12,8 @@
 #define MIDAMP_PROGRESS_H     5
 #define MIDAMP_BOTTOM_BTN_W   25
 #define MIDAMP_BOTTOM_BTN_H   18
-#define MIDAMP_MIN_W          295
-#define MIDAMP_MIN_H          490
+#define MIDAMP_MIN_W          MIDAMP_SKIN_W
+#define MIDAMP_MIN_H          MIDAMP_SKIN_H
 
 typedef enum {
     MIDAMP_ACT_NONE = 0,
@@ -29,7 +22,7 @@ typedef enum {
     MIDAMP_ACT_STOP,
     MIDAMP_ACT_NEXT,
     MIDAMP_ACT_PREV,
-    MIDAMP_ACT_RELOAD,
+    MIDAMP_ACT_BROWSE_WAV,
     MIDAMP_ACT_TOGGLE_SHUFFLE,
     MIDAMP_ACT_TOGGLE_REPEAT,
     MIDAMP_ACT_TOGGLE_MUTE,
@@ -119,12 +112,12 @@ typedef struct {
 static midamp_state_t *g_midamp;
 
 static const midamp_skin_button_t g_midamp_buttons[MIDAMP_BUTTON_COUNT] = {
-    {{ 14, 42, 21, 16}, MIDAMP_ACT_PREV,           0},
-    {{ 37, 42, 21, 16}, MIDAMP_ACT_PLAY_SELECTED,  0},
-    {{ 60, 42, 21, 16}, MIDAMP_ACT_TOGGLE_PAUSE,   0},
-    {{ 83, 42, 21, 16}, MIDAMP_ACT_STOP,           0},
-    {{106, 42, 21, 16}, MIDAMP_ACT_NEXT,           0},
-    {{120, 43, 20, 15}, MIDAMP_ACT_RELOAD,         0},
+    {{  0, 42, 21, 16}, MIDAMP_ACT_PREV,           0},
+    {{ 23, 42, 21, 16}, MIDAMP_ACT_PLAY_SELECTED,  0},
+    {{ 46, 42, 21, 16}, MIDAMP_ACT_TOGGLE_PAUSE,   0},
+    {{ 69, 42, 21, 16}, MIDAMP_ACT_STOP,           0},
+    {{ 92, 42, 21, 16}, MIDAMP_ACT_NEXT,           0},
+    {{120, 43, 20, 15}, MIDAMP_ACT_BROWSE_WAV,     0},
     {{149, 44, 44, 12}, MIDAMP_ACT_TOGGLE_SHUFFLE, 0},
     {{195, 44, 26, 12}, MIDAMP_ACT_TOGGLE_REPEAT,  0},
 };
@@ -133,11 +126,33 @@ static const int g_midamp_bottom_x[5] = {10, 40, 70, 100, 240};
 static const int g_midamp_bottom_frames[5] = {0, 4, 9, 13, 17};
 
 static void midamp_main(void *argument);
+static void midamp_set_status(midamp_state_t *st, const char *text);
+static void midamp_extract_name(const char *path, char *out, size_t out_len);
+static void midamp_stop_playback(midamp_state_t *st, bool stop_sound);
+
+static void midamp_wav_selected(const char *path, void *context) {
+    midamp_state_t *st = (midamp_state_t *)context;
+    if (!st || st != g_midamp || !path || !path[0]) return;
+    midamp_stop_playback(st, true);
+    midamp_extract_name(path, st->title_name, sizeof(st->title_name));
+    if (bk_sound_play_file(path))
+        midamp_set_status(st, "Reproduciendo WAV");
+    else
+        midamp_set_status(st, "No se pudo reproducir el WAV");
+}
+
+static void midamp_browse_wav(midamp_state_t *st) {
+    if (!st || !st->desktop) return;
+    if (!bk_file_dialog_open(st->desktop, "Abrir audio WAV", "/", ".WAV",
+                             BK_FILE_DIALOG_PREVIEW_AUDIO,
+                             midamp_wav_selected, st))
+        midamp_set_status(st, "No se pudo abrir el explorador");
+}
 
 static void midamp_copy_text(char *dst, size_t dst_len, const char *src) {
     if (!dst || !dst_len) return;
     if (!src) src = "";
-    kstrncpy(dst, src, dst_len - 1);
+    bk_runtime_strncpy(dst, src, dst_len - 1);
     dst[dst_len - 1] = '\0';
 }
 
@@ -145,9 +160,9 @@ static void midamp_append_text(char *dst, size_t dst_len, const char *src) {
     size_t len;
 
     if (!dst || !dst_len || !src) return;
-    len = kstrlen(dst);
+    len = bk_runtime_strlen(dst);
     if (len + 1 >= dst_len) return;
-    kstrncpy(dst + len, src, dst_len - len - 1);
+    bk_runtime_strncpy(dst + len, src, dst_len - len - 1);
     dst[dst_len - 1] = '\0';
 }
 
@@ -161,7 +176,7 @@ static void midamp_u32_to_text(char *out, uint32_t value) {
         tmp[--pos] = (char)('0' + (value % 10U));
         value /= 10U;
     }
-    kstrcpy(out, &tmp[pos]);
+    bk_runtime_strcpy(out, &tmp[pos]);
 }
 
 static void midamp_s32_to_text(char *out, int32_t value) {
@@ -178,7 +193,7 @@ static void midamp_s32_to_text(char *out, int32_t value) {
     }
     if (value > 0) tmp[--pos] = '+';
     else if (value < 0) tmp[--pos] = '-';
-    kstrcpy(out, &tmp[pos]);
+    bk_runtime_strcpy(out, &tmp[pos]);
 }
 
 static void midamp_format_time(char *out, uint32_t milliseconds) {
@@ -188,11 +203,11 @@ static void midamp_format_time(char *out, uint32_t milliseconds) {
     uint32_t remain = seconds % 60U;
 
     midamp_u32_to_text(number, minutes);
-    kstrcpy(out, number);
-    kstrcat(out, ":");
-    if (remain < 10U) kstrcat(out, "0");
+    bk_runtime_strcpy(out, number);
+    bk_runtime_strcat(out, ":");
+    if (remain < 10U) bk_runtime_strcat(out, "0");
     midamp_u32_to_text(number, remain);
-    kstrcat(out, number);
+    bk_runtime_strcat(out, number);
 }
 
 static void midamp_set_status(midamp_state_t *st, const char *text) {
@@ -219,8 +234,8 @@ static bool midamp_is_midi_name(const char *name) {
     if (!name) return false;
     while (*dot && *dot != '.') dot++;
     if (!*dot) return false;
-    return kstrcmp(dot, ".MID") == 0 || kstrcmp(dot, ".mid") == 0 ||
-           kstrcmp(dot, ".KAR") == 0 || kstrcmp(dot, ".kar") == 0;
+    return bk_runtime_strcmp(dot, ".MID") == 0 || bk_runtime_strcmp(dot, ".mid") == 0 ||
+           bk_runtime_strcmp(dot, ".KAR") == 0 || bk_runtime_strcmp(dot, ".kar") == 0;
 }
 
 static void midamp_normalize_path(char *path) {
@@ -230,14 +245,14 @@ static void midamp_normalize_path(char *path) {
     for (char *p = path; *p; p++)
         if (*p == '\\') *p = '/';
     if (path[0] == '/') return;
-    len = kstrlen(path);
+    len = bk_runtime_strlen(path);
     if (len + 1 >= VFS_MAX_PATH) return;
     for (int i = (int)len; i >= 0; i--) path[i + 1] = path[i];
     path[0] = '/';
 }
 
 static bool midamp_paths_equal(const char *a, const char *b) {
-    return a && b && kstrcmp(a, b) == 0;
+    return a && b && bk_runtime_strcmp(a, b) == 0;
 }
 
 static void midamp_join_path(char *dst, size_t dst_len,
@@ -249,7 +264,7 @@ static void midamp_join_path(char *dst, size_t dst_len,
     if (!base || !name) return;
 
     midamp_copy_text(dst, dst_len, base);
-    len = kstrlen(dst);
+    len = bk_runtime_strlen(dst);
     if (len == 0) return;
     if (len > 1 && dst[len - 1] != '/' && len + 1 < dst_len) {
         dst[len++] = '/';
@@ -258,7 +273,7 @@ static void midamp_join_path(char *dst, size_t dst_len,
     if (len == 1 && dst[0] == '/') {
         midamp_copy_text(dst + 1, dst_len - 1, name);
     } else {
-        kstrncpy(dst + len, name, dst_len - len - 1);
+        bk_runtime_strncpy(dst + len, name, dst_len - len - 1);
         dst[dst_len - 1] = '\0';
     }
 }
@@ -276,13 +291,13 @@ static bool midamp_decode_gif(gui_image_t *image,
     uint32_t global_colors = 0;
 
     if (!image || !data || length < 13U) return false;
-    if (kmemcmp(data, "GIF87a", 6) != 0 && kmemcmp(data, "GIF89a", 6) != 0)
+    if (bk_runtime_memcmp(data, "GIF87a", 6) != 0 && bk_runtime_memcmp(data, "GIF89a", 6) != 0)
         return false;
 
     canvas_w = midamp_gif_le16(data + 6);
     canvas_h = midamp_gif_le16(data + 8);
     header_packed = data[10];
-    kmemset(palette, 0, sizeof(palette));
+    bk_runtime_memset(palette, 0, sizeof(palette));
 
     if (header_packed & 0x80U) {
         global_colors = 1U << ((header_packed & 0x07U) + 1U);
@@ -387,16 +402,16 @@ static bool midamp_decode_gif(gui_image_t *image,
                                        &compressed, &compressed_len))
                 return false;
 
-            prefix = (uint16_t *)kmalloc(4096U * sizeof(uint16_t));
-            suffix = (uint8_t *)kmalloc(4096U);
-            stack = (uint8_t *)kmalloc(4097U);
-            image->pixels = (uint32_t *)kzalloc((uint32_t)canvas_w * canvas_h *
+            prefix = (uint16_t *)bk_sys_alloc(4096U * sizeof(uint16_t));
+            suffix = (uint8_t *)bk_sys_alloc(4096U);
+            stack = (uint8_t *)bk_sys_alloc(4097U);
+            image->pixels = (uint32_t *)bk_sys_alloc_zero((uint32_t)canvas_w * canvas_h *
                                                 sizeof(uint32_t));
             if (!prefix || !suffix || !stack || !image->pixels) {
-                if (compressed) kfree(compressed);
-                if (prefix) kfree(prefix);
-                if (suffix) kfree(suffix);
-                if (stack) kfree(stack);
+                if (compressed) bk_sys_free(compressed);
+                if (prefix) bk_sys_free(prefix);
+                if (suffix) bk_sys_free(suffix);
+                if (stack) bk_sys_free(stack);
                 midamp_image_free(image);
                 return false;
             }
@@ -510,10 +525,10 @@ static bool midamp_decode_gif(gui_image_t *image,
                 }
             }
 
-            kfree(compressed);
-            kfree(prefix);
-            kfree(suffix);
-            kfree(stack);
+            bk_sys_free(compressed);
+            bk_sys_free(prefix);
+            bk_sys_free(suffix);
+            bk_sys_free(stack);
             return true;
         }
     }
@@ -525,18 +540,18 @@ static bool midamp_decode_gif(gui_image_t *image,
 static bool midamp_load_gif_candidates(gui_image_t *image,
                                        const char *primary,
                                        const char *secondary) {
-    if (gui_gif_load(image, primary)) return true;
+    if (bk_gui_gif_load(image, primary)) return true;
     if (secondary && secondary[0] &&
-        gui_gif_load(image, secondary))
+        bk_gui_gif_load(image, secondary))
         return true;
     return false;
 }
 
 static void midamp_skin_free(midamp_state_t *st) {
     if (!st) return;
-    gui_image_free(&st->skin_header);
-    gui_image_free(&st->skin_buttons);
-    gui_image_free(&st->skin_bottom);
+    bk_gui_image_free(&st->skin_header);
+    bk_gui_image_free(&st->skin_buttons);
+    bk_gui_image_free(&st->skin_bottom);
     st->skin_loaded = false;
 }
 
@@ -547,13 +562,13 @@ static bool midamp_skin_load(midamp_state_t *st) {
     midamp_skin_free(st);
     ok = midamp_load_gif_candidates(&st->skin_header,
                                     "/MIDHDR.GIF",
-                                    "/PROGRAMS/WINMAP/HDR.GIF") &&
+                                    "/SYSTEM/PROGRAMS/WINMAP/HDR.GIF") &&
          midamp_load_gif_candidates(&st->skin_buttons,
                                     "/MIDBTN.GIF",
-                                    "/PROGRAMS/WINMAP/BUTTONS.GIF") &&
+                                    "/SYSTEM/PROGRAMS/WINMAP/BUTTONS.GIF") &&
          midamp_load_gif_candidates(&st->skin_bottom,
                                     "/MIDBOT.GIF",
-                                    "/PROGRAMS/WINMAP/BOTTOM.GIF");
+                                    "/SYSTEM/PROGRAMS/WINMAP/BOTTOM.GIF");
     st->skin_loaded = ok;
     if (!ok) midamp_skin_free(st);
     return ok;
@@ -579,18 +594,19 @@ static void midamp_draw_image_slice(gui_surface_t *surface, int dst_x, int dst_y
             if (sx < 0 || sx >= image->width) continue;
             if (dx < 0 || dy < 0 || dx >= surface->width || dy >= surface->height)
                 continue;
+            if (!bk_gui_gfx_point_visible(surface, dx, dy)) continue;
             pixel = image->pixels[(uint32_t)sy * image->width + (uint32_t)sx];
             alpha = (uint8_t)(pixel >> 24);
             if (alpha == 0) continue;
 
             rgb = pixel & 0x00FFFFFF;
             if (alpha == 0xFF) {
-                gui_gfx_putpixel(surface, dx, dy, rgb);
+                bk_gui_gfx_putpixel(surface, dx, dy, rgb);
                 continue;
             }
 
             dst = &surface->pixels[(uint32_t)dy * surface->pitch + (uint32_t)dx];
-            *dst = gui_color_blend(*dst, rgb, alpha);
+            *dst = bk_gui_color_blend(*dst, rgb, alpha);
         }
     }
 }
@@ -614,7 +630,7 @@ static bool midamp_playlist_add(midamp_state_t *st, const char *path) {
 
 static void midamp_clear_song(midamp_state_t *st) {
     if (!st) return;
-    if (st->sequence) kfree(st->sequence);
+    if (st->sequence) bk_sys_free(st->sequence);
     st->sequence = NULL;
     st->sequence_count = 0;
     st->sequence_capacity = 0;
@@ -626,7 +642,7 @@ static void midamp_clear_song(midamp_state_t *st) {
 
 static void midamp_stop_playback(midamp_state_t *st, bool stop_sound) {
     if (!st) return;
-    if (stop_sound) sound_stop();
+    if (stop_sound) bk_sound_stop();
     st->playing = false;
     st->paused = false;
     st->tone_running = false;
@@ -657,7 +673,7 @@ static bool midamp_scan_dir(midamp_state_t *st, const char *path) {
     bool any = false;
 
     if (!st || !path) return false;
-    if (!vfs_listdir(path, entries, VFS_MAX_DIR_ENTRIES, &count)) return false;
+    if (!bk_file_list_dir(path, entries, VFS_MAX_DIR_ENTRIES, &count)) return false;
 
     for (uint32_t i = 0; i < count; i++) {
         if (entries[i].type != VFS_NODE_FILE) continue;
@@ -683,12 +699,12 @@ static void midamp_load_playlist_from_text(midamp_state_t *st,
         while (end < size && text[end] != '\n' && text[end] != '\r') end++;
         copy_len = end - start;
         if (copy_len >= sizeof(line)) copy_len = sizeof(line) - 1;
-        kmemcpy(line, text + start, copy_len);
+        bk_runtime_memcpy(line, text + start, copy_len);
         line[copy_len] = '\0';
 
         left = 0;
         while (line[left] == ' ' || line[left] == '\t') left++;
-        right = kstrlen(line);
+        right = bk_runtime_strlen(line);
         while (right > left &&
                (line[right - 1] == ' ' || line[right - 1] == '\t'))
             line[--right] = '\0';
@@ -715,17 +731,17 @@ static void midamp_reload_playlist(midamp_state_t *st) {
     midamp_clear_song(st);
     midamp_reset_playlist_state(st);
 
-    if (vfs_read_all("/PLAYLIST.TXT", &playlist_data, &playlist_size) &&
+    if (bk_file_read_all("/PLAYLIST.TXT", &playlist_data, &playlist_size) &&
         playlist_data && playlist_size) {
         midamp_load_playlist_from_text(st, (const char *)playlist_data, playlist_size);
     }
-    if (playlist_data) kfree(playlist_data);
+    if (playlist_data) bk_sys_free(playlist_data);
 
     if (st->playlist_count == 0) {
         (void)midamp_scan_dir(st, "/");
         (void)midamp_scan_dir(st, "/DOCS");
         (void)midamp_scan_dir(st, "/MISC");
-        (void)midamp_scan_dir(st, "/PROGRAMS");
+        (void)midamp_scan_dir(st, "/SYSTEM/PROGRAMS");
     }
 
     if (st->playlist_count > 0) {
@@ -779,7 +795,7 @@ static bool midamp_reserve_notes(midamp_parse_result_t *out, uint32_t needed) {
         }
     }
 
-    new_notes = (midamp_note_t *)krealloc(out->notes,
+    new_notes = (midamp_note_t *)bk_sys_realloc(out->notes,
                                           new_capacity * sizeof(midamp_note_t));
     if (!new_notes) return false;
 
@@ -954,8 +970,8 @@ static bool midamp_parse_track(const uint8_t *data, uint32_t length,
 
 static void midamp_free_parse_result(midamp_parse_result_t *result) {
     if (!result) return;
-    if (result->notes) kfree(result->notes);
-    kmemset(result, 0, sizeof(*result));
+    if (result->notes) bk_sys_free(result->notes);
+    bk_runtime_memset(result, 0, sizeof(*result));
 }
 
 static bool midamp_parse_file(const uint8_t *data, uint32_t size,
@@ -968,9 +984,9 @@ static bool midamp_parse_file(const uint8_t *data, uint32_t size,
     uint8_t track_index = 0;
 
     if (!data || !out || size < 14U) return false;
-    kmemset(out, 0, sizeof(*out));
+    bk_runtime_memset(out, 0, sizeof(*out));
 
-    if (kmemcmp(data, "MThd", 4) != 0) return false;
+    if (bk_runtime_memcmp(data, "MThd", 4) != 0) return false;
     header_size = midamp_be32(data + 4);
     if (header_size < 6U || 8U + header_size > size) return false;
 
@@ -984,7 +1000,7 @@ static bool midamp_parse_file(const uint8_t *data, uint32_t size,
     pos = 8U + header_size;
     while (pos + 8U <= size) {
         uint32_t chunk_size = midamp_be32(data + pos + 4U);
-        bool is_track = kmemcmp(data + pos, "MTrk", 4) == 0;
+        bool is_track = bk_runtime_memcmp(data + pos, "MTrk", 4) == 0;
         pos += 8U;
         if (pos + chunk_size > size) {
             midamp_free_parse_result(out);
@@ -1009,7 +1025,7 @@ static bool midamp_parse_file(const uint8_t *data, uint32_t size,
 }
 
 static uint32_t midamp_ms_to_ticks(uint32_t milliseconds) {
-    uint32_t pit_hz = pit_get_frequency_hz();
+    uint32_t pit_hz = bk_sys_tick_frequency();
     uint32_t whole_seconds = milliseconds / 1000U;
     uint32_t remaining_ms = milliseconds % 1000U;
     uint32_t ticks = 0;
@@ -1025,7 +1041,7 @@ static uint32_t midamp_ms_to_ticks(uint32_t milliseconds) {
 }
 
 static uint32_t midamp_ticks_to_ms(uint32_t ticks) {
-    uint32_t pit_hz = pit_get_frequency_hz();
+    uint32_t pit_hz = bk_sys_tick_frequency();
 
     if (!ticks) return 0;
     if (pit_hz == 0) pit_hz = 100U;
@@ -1109,9 +1125,10 @@ static void midamp_skin_origin(const midamp_state_t *st,
 
     if (!st || !st->window) return;
 
-    x = st->window->bounds.x + GUI_BORDER_SIZE;
-    y = st->window->bounds.y + gui_window_content_top(st->window) + 6;
-    inner_w = st->window->bounds.w - GUI_BORDER_SIZE * 2;
+    x = st->window->bounds.x + (st->window->borderless ? 0 : GUI_BORDER_SIZE);
+    y = st->window->bounds.y + bk_gui_window_content_top(st->window);
+    inner_w = st->window->bounds.w -
+              (st->window->borderless ? 0 : GUI_BORDER_SIZE * 2);
     pad_x = (inner_w - MIDAMP_SKIN_W) / 2;
     if (pad_x < 0) pad_x = 0;
 
@@ -1130,6 +1147,16 @@ static gui_rect_t midamp_progress_rect(const midamp_state_t *st) {
     gui_rect_t skin = midamp_skin_area_rect(st);
     return (gui_rect_t){skin.x + 10, skin.y + 29,
                         MIDAMP_PROGRESS_W, MIDAMP_PROGRESS_H};
+}
+
+static gui_rect_t midamp_skin_minimize_rect(const midamp_state_t *st) {
+    gui_rect_t skin = midamp_skin_area_rect(st);
+    return (gui_rect_t){skin.x + 246, skin.y + 3, 9, 9};
+}
+
+static gui_rect_t midamp_skin_close_rect(const midamp_state_t *st) {
+    gui_rect_t skin = midamp_skin_area_rect(st);
+    return (gui_rect_t){skin.x + 264, skin.y + 3, 9, 9};
 }
 
 static gui_rect_t midamp_playlist_rect(const midamp_state_t *st) {
@@ -1177,7 +1204,7 @@ static int midamp_random_index(const midamp_state_t *st) {
     int index;
 
     if (!st || st->playlist_count <= 0) return -1;
-    index = (int)(pit_get_ticks() % (uint32_t)st->playlist_count);
+    index = (int)(bk_sys_ticks() % (uint32_t)st->playlist_count);
     if (st->playlist_count > 1 && index == st->current_index)
         index = (index + 1) % st->playlist_count;
     return index;
@@ -1213,21 +1240,21 @@ static bool midamp_load_song(midamp_state_t *st, const char *path,
     midamp_parse_result_t parsed;
 
     if (!st || !path) return false;
-    kmemset(&parsed, 0, sizeof(parsed));
+    bk_runtime_memset(&parsed, 0, sizeof(parsed));
 
-    if (!vfs_read_all(path, &data, &size) || !data || size < 14U) {
+    if (!bk_file_read_all(path, &data, &size) || !data || size < 14U) {
         midamp_set_status(st, "No se pudo leer el MIDI");
-        if (data) kfree(data);
+        if (data) bk_sys_free(data);
         return false;
     }
 
     if (!midamp_parse_file((const uint8_t *)data, size,
                            st->selected_track, st->selected_channel, &parsed)) {
         midamp_set_status(st, "MIDI invalido o no soportado");
-        kfree(data);
+        bk_sys_free(data);
         return false;
     }
-    kfree(data);
+    bk_sys_free(data);
 
     midamp_stop_playback(st, true);
     midamp_clear_song(st);
@@ -1296,7 +1323,7 @@ static void midamp_toggle_pause(midamp_state_t *st) {
             st->next_note_index--;
         st->current_note_active = false;
         st->tone_running = false;
-        sound_stop();
+        bk_sound_stop();
         st->paused = true;
         midamp_set_status(st, "Pausa");
     } else {
@@ -1364,7 +1391,7 @@ static void midamp_seek_to_ms(midamp_state_t *st, uint32_t target_ms) {
     if (!st || st->sequence_count == 0U) return;
     if (target_ms >= st->sequence_total_ms) target_ms = st->sequence_total_ms;
 
-    sound_stop();
+    bk_sound_stop();
     st->current_note_active = false;
     st->tone_running = false;
     st->played_ms = 0;
@@ -1390,7 +1417,7 @@ static void midamp_seek_to_ms(midamp_state_t *st, uint32_t target_ms) {
 
 static int midamp_hit_skin_button(const midamp_state_t *st, int x, int y) {
     for (int i = 0; i < MIDAMP_BUTTON_COUNT; i++) {
-        if (gui_rect_contains(midamp_button_rect(st, i), x, y)) return i;
+        if (bk_gui_rect_contains(midamp_button_rect(st, i), x, y)) return i;
     }
     return -1;
 }
@@ -1402,7 +1429,7 @@ static bool midamp_action_push(midamp_state_t *st, uint8_t code, int16_t value) 
 
     if (!st) return false;
     queue = &st->actions;
-    task_preempt_disable();
+    bk_proc_critical_enter();
     next = (uint8_t)((queue->head + 1U) % MIDAMP_ACTION_QUEUE);
     if (next != queue->tail) {
         queue->items[queue->head].code = code;
@@ -1410,7 +1437,7 @@ static bool midamp_action_push(midamp_state_t *st, uint8_t code, int16_t value) 
         queue->head = next;
         pushed = true;
     }
-    task_preempt_enable();
+    bk_proc_critical_leave();
     return pushed;
 }
 
@@ -1420,13 +1447,13 @@ static bool midamp_action_pop(midamp_state_t *st, midamp_action_t *action) {
 
     if (!st || !action) return false;
     queue = &st->actions;
-    task_preempt_disable();
+    bk_proc_critical_enter();
     if (queue->head != queue->tail) {
         *action = queue->items[queue->tail];
         queue->tail = (uint8_t)((queue->tail + 1U) % MIDAMP_ACTION_QUEUE);
         ok = true;
     }
-    task_preempt_enable();
+    bk_proc_critical_leave();
     return ok;
 }
 
@@ -1438,7 +1465,7 @@ static int midamp_hit_row(const midamp_state_t *st, int x, int y) {
 
     if (!st || !st->window) return -1;
     list = midamp_playlist_rect(st);
-    if (!gui_rect_contains(list, x, y)) return -1;
+    if (!bk_gui_rect_contains(list, x, y)) return -1;
 
     row = (y - list.y) / MIDAMP_LIST_ROW_H;
     visible = midamp_visible_rows(st);
@@ -1472,8 +1499,8 @@ static void midamp_process_action(midamp_state_t *st, const midamp_action_t *act
             index = midamp_prev_index(st);
             if (index >= 0) (void)midamp_open_index(st, index, true);
             break;
-        case MIDAMP_ACT_RELOAD:
-            midamp_reload_playlist(st);
+        case MIDAMP_ACT_BROWSE_WAV:
+            midamp_browse_wav(st);
             break;
         case MIDAMP_ACT_TOGGLE_SHUFFLE:
             st->shuffle = !st->shuffle;
@@ -1486,7 +1513,7 @@ static void midamp_process_action(midamp_state_t *st, const midamp_action_t *act
         case MIDAMP_ACT_TOGGLE_MUTE:
             st->mute = !st->mute;
             if (st->mute && st->tone_running) {
-                sound_stop();
+                bk_sound_stop();
                 st->tone_running = false;
             }
             midamp_set_status(st, st->mute ? "Mute ON" : "Mute OFF");
@@ -1547,7 +1574,7 @@ static void midamp_process_key(midamp_state_t *st, uint8_t key) {
         case 'm':
             st->mute = !st->mute;
             if (st->mute && st->tone_running) {
-                sound_stop();
+                bk_sound_stop();
                 st->tone_running = false;
             }
             midamp_set_status(st, st->mute ? "Mute ON" : "Mute OFF");
@@ -1581,7 +1608,7 @@ static void midamp_process_key(midamp_state_t *st, uint8_t key) {
             midamp_reload_playlist(st);
             break;
         case 27:
-            if (st->window) gui_window_close(st->window);
+            if (st->window) bk_gui_close_window(st->window);
             break;
         default:
             break;
@@ -1600,12 +1627,13 @@ static void midamp_process_event(midamp_state_t *st, const gui_event_t *event) {
     }
 
     if (event->type == GUI_EVENT_MOUSE_DOWN) {
+        if (event->button != MOUSE_LEFT_BUTTON) return;
         st->pressed_button = midamp_hit_skin_button(st, event->x, event->y);
         if (st->pressed_button >= 0) {
             if (st->window) st->window->dirty = true;
             return;
         }
-        if (gui_rect_contains(midamp_progress_rect(st), event->x, event->y)) {
+        if (bk_gui_rect_contains(midamp_progress_rect(st), event->x, event->y)) {
             st->pressed_button = MIDAMP_BUTTON_COUNT;
             if (st->window) st->window->dirty = true;
             return;
@@ -1616,6 +1644,24 @@ static void midamp_process_event(midamp_state_t *st, const gui_event_t *event) {
     }
 
     if (event->type != GUI_EVENT_MOUSE_UP) return;
+
+    if (event->button == MOUSE_RIGHT_BUTTON &&
+        bk_gui_rect_contains(midamp_skin_area_rect(st), event->x, event->y)) {
+        bk_about_show(st->desktop, &(bk_about_info_t){
+            "MIDAMP", "Version 1.1", "Reproductor MIDI y WAV de BlesKernOS.",
+            "Bles.INC (C) 2026", "/ICONS/MIDAMP.BMP"});
+        return;
+    }
+    if (event->button != MOUSE_LEFT_BUTTON) return;
+
+    if (bk_gui_rect_contains(midamp_skin_close_rect(st), event->x, event->y)) {
+        if (st->window) bk_gui_close_window(st->window);
+        return;
+    }
+    if (bk_gui_rect_contains(midamp_skin_minimize_rect(st), event->x, event->y)) {
+        if (st->window) bk_gui_window_minimize(st->window);
+        return;
+    }
 
     if (st->pressed_button >= 0) {
         int pressed = st->pressed_button;
@@ -1632,7 +1678,7 @@ static void midamp_process_event(midamp_state_t *st, const gui_event_t *event) {
 
         if (pressed == MIDAMP_BUTTON_COUNT) {
             gui_rect_t bar = midamp_progress_rect(st);
-            if (gui_rect_contains(bar, event->x, event->y) &&
+            if (bk_gui_rect_contains(bar, event->x, event->y) &&
                 st->sequence_total_ms > 0U && bar.w > 1) {
                 int rel_x = event->x - bar.x;
                 if (rel_x < 0) rel_x = 0;
@@ -1650,7 +1696,7 @@ static void midamp_process_event(midamp_state_t *st, const gui_event_t *event) {
     hit = midamp_hit_row(st, event->x, event->y);
     if (hit < 0 || hit != st->selected_index) return;
 
-    now = pit_get_ticks();
+    now = bk_sys_ticks();
     if (st->last_click_index == hit &&
         st->last_click_tick != 0 &&
         now - st->last_click_tick < MIDAMP_DBLCLICK_TICKS) {
@@ -1699,7 +1745,7 @@ static void midamp_start_note(midamp_state_t *st, const midamp_note_t *note,
 
     if (!note->rest && !st->mute) {
         hz = midamp_note_to_hz((int)note->note + (int)st->transpose);
-        if (hz && sound_start_tone(hz, st->current_note_duration_ms))
+        if (hz && bk_sound_tone(hz, st->current_note_duration_ms))
             st->tone_running = true;
     }
 }
@@ -1709,14 +1755,14 @@ static void midamp_playback_tick(midamp_state_t *st) {
 
     if (!st || !st->window || !st->window->listed) return;
     if (!st->playing || st->paused || st->sequence_count == 0U) {
-        task_sleep(1);
+        bk_sys_sleep_ticks(1);
         return;
     }
 
-    now = pit_get_ticks();
+    now = bk_sys_ticks();
     if (st->current_note_active) {
         if ((int32_t)(now - st->current_note_end_tick) < 0) {
-            task_sleep(1);
+            bk_sys_sleep_ticks(1);
             return;
         }
         st->played_ms += st->current_note_duration_ms;
@@ -1741,7 +1787,7 @@ static uint32_t midamp_current_progress_ms(const midamp_state_t *st) {
     progress = st->played_ms;
     if (!st->current_note_active) return progress;
 
-    elapsed_ticks = pit_get_ticks() - st->current_note_started_tick;
+    elapsed_ticks = bk_sys_ticks() - st->current_note_started_tick;
     elapsed_ms = midamp_ticks_to_ms(elapsed_ticks);
     if (elapsed_ms > st->current_note_duration_ms)
         elapsed_ms = st->current_note_duration_ms;
@@ -1771,25 +1817,20 @@ static void midamp_content(gui_window_t *window,
 
     if (!st || !window || !st->window || !st->window->visible) return;
 
-    content = (gui_rect_t){
-        window->bounds.x + GUI_BORDER_SIZE,
-        window->bounds.y + gui_window_content_top(window),
-        window->bounds.w - GUI_BORDER_SIZE * 2,
-        window->bounds.h - gui_window_content_top(window) - GUI_BORDER_SIZE
-    };
+    content = bk_gui_window_content_rect_raw(window);
     skin = midamp_skin_area_rect(st);
     list = midamp_playlist_rect(st);
     bar = midamp_progress_rect(st);
 
     if (content.w > 0 && content.h > 0)
-        gui_gfx_fill_rect(surface, content, 0x0024263C);
+        bk_gui_gfx_fill_rect(surface, content, 0x0024263C);
 
     if (st->skin_loaded && st->skin_header.pixels) {
         midamp_draw_image_slice(surface, skin.x, skin.y,
                                 &st->skin_header, 0, 0,
                                 st->skin_header.width, st->skin_header.height);
     } else {
-        gui_gfx_fill_rect(surface,
+        bk_gui_gfx_fill_rect(surface,
                           (gui_rect_t){skin.x, skin.y, MIDAMP_SKIN_W, MIDAMP_HEADER_H},
                           0x004C4645);
     }
@@ -1814,9 +1855,9 @@ static void midamp_content(gui_window_t *window,
         }
     }
 
-    gui_gfx_fill_rect(surface, list, 0x00000000);
-    gui_gfx_fill_rect(surface, bar, 0x004C4645);
-    gui_gfx_draw_rect(surface,
+    bk_gui_gfx_fill_rect(surface, list, 0x00000000);
+    bk_gui_gfx_fill_rect(surface, bar, 0x004C4645);
+    bk_gui_gfx_draw_rect(surface,
                       (gui_rect_t){bar.x - 1, bar.y - 1,
                                    bar.w + 2, bar.h + 2},
                       0x00605C58);
@@ -1831,7 +1872,7 @@ static void midamp_content(gui_window_t *window,
         if (fill_w < 0) fill_w = 0;
         if (fill_w > MIDAMP_PROGRESS_W) fill_w = MIDAMP_PROGRESS_W;
         if (fill_w > 0) {
-            gui_gfx_fill_rect(surface,
+            bk_gui_gfx_fill_rect(surface,
                               (gui_rect_t){bar.x, bar.y, fill_w, bar.h},
                               0x0084706A);
         }
@@ -1840,7 +1881,7 @@ static void midamp_content(gui_window_t *window,
     clip = (gui_rect_t){skin.x + 12, skin.y + 12, 108, 12};
     midamp_copy_text(line, sizeof(line),
                      st->title_name[0] ? st->title_name : "sin archivo");
-    gui_font_draw_string_clipped(surface, skin.x + 12, skin.y + 15, line,
+    bk_gui_font_draw_string_clipped(surface, skin.x + 12, skin.y + 15, line,
                                  0x00ECCE7C, clip);
 
     line[0] = '\0';
@@ -1854,22 +1895,22 @@ static void midamp_content(gui_window_t *window,
     midamp_u32_to_text(number, (uint32_t)st->selected_track + 1U);
     midamp_append_text(line, sizeof(line), number);
     clip = (gui_rect_t){skin.x + 132, skin.y + 12, 132, 12};
-    gui_font_draw_string_clipped(surface, skin.x + 132, skin.y + 15, line,
+    bk_gui_font_draw_string_clipped(surface, skin.x + 132, skin.y + 15, line,
                                  0x00F0F000, clip);
 
     clip = (gui_rect_t){skin.x + 124, skin.y + 24, 48, 12};
-    gui_font_draw_string_clipped(surface, skin.x + 124, skin.y + 28,
+    bk_gui_font_draw_string_clipped(surface, skin.x + 124, skin.y + 28,
                                  total_time, 0x00F0F000, clip);
     clip = (gui_rect_t){skin.x + 226, skin.y + 12, 40, 12};
-    gui_font_draw_string_clipped(surface, skin.x + 226, skin.y + 15,
+    bk_gui_font_draw_string_clipped(surface, skin.x + 226, skin.y + 15,
                                  current_time, 0x00F0F000, clip);
 
     if (st->shuffle) {
-        gui_gfx_fill_rect(surface, (gui_rect_t){skin.x + 154, skin.y + 48, 3, 2},
+        bk_gui_gfx_fill_rect(surface, (gui_rect_t){skin.x + 154, skin.y + 48, 3, 2},
                           0x0000D600);
     }
     if (st->repeat) {
-        gui_gfx_fill_rect(surface, (gui_rect_t){skin.x + 200, skin.y + 48, 3, 2},
+        bk_gui_gfx_fill_rect(surface, (gui_rect_t){skin.x + 200, skin.y + 48, 3, 2},
                           0x0000D600);
     }
 
@@ -1884,31 +1925,31 @@ static void midamp_content(gui_window_t *window,
         if (index >= st->playlist_count) break;
 
         if (index == st->selected_index) {
-            gui_gfx_fill_rect(surface, row_rect, 0x000000C6);
+            bk_gui_gfx_fill_rect(surface, row_rect, 0x000000C6);
             fg = 0x00FFFFFF;
         } else if (index == st->current_index) {
             fg = 0x00FFFFFF;
         }
 
         midamp_extract_name(st->playlist[index], label, sizeof(label));
-        gui_font_draw_string_clipped(surface, row_rect.x + 3, row_rect.y + 1,
+        bk_gui_font_draw_string_clipped(surface, row_rect.x + 3, row_rect.y + 1,
                                      label, fg, row_rect);
     }
 
     clip = (gui_rect_t){skin.x + 132, skin.y + 434, 102, 10};
-    gui_font_draw_string_clipped(surface, skin.x + 132, skin.y + 436,
+    bk_gui_font_draw_string_clipped(surface, skin.x + 132, skin.y + 436,
                                  st->status, 0x00ECFEFC, clip);
-    gui_font_draw_string_clipped(surface, skin.x + 132, skin.y + 446,
+    bk_gui_font_draw_string_clipped(surface, skin.x + 132, skin.y + 446,
                                  "[] trk  ,. ch  -+ ton  m mute",
                                  0x00A3AEBD,
                                  (gui_rect_t){skin.x + 132, skin.y + 444,
                                               124, 10});
 
     if (st->pressed_button >= 0 && st->pressed_button < MIDAMP_BUTTON_COUNT) {
-        gui_gfx_draw_rect(surface, midamp_button_rect(st, st->pressed_button),
+        bk_gui_gfx_draw_rect(surface, midamp_button_rect(st, st->pressed_button),
                           0x00ECBE64);
     } else if (st->pressed_button == MIDAMP_BUTTON_COUNT) {
-        gui_gfx_draw_rect(surface,
+        bk_gui_gfx_draw_rect(surface,
                           (gui_rect_t){bar.x - 1, bar.y - 1,
                                        bar.w + 2, bar.h + 2},
                           0x00ECBE64);
@@ -1924,21 +1965,21 @@ static bool midamp_window_event(gui_window_t *window UNUSED,
         event->type != GUI_EVENT_MOUSE_DOWN &&
         event->type != GUI_EVENT_MOUSE_UP)
         return false;
-    return gui_event_queue_push(&st->events, event);
+    return bk_gui_event_queue_push(&st->events, event);
 }
 
 static void midamp_cleanup(midamp_state_t *st) {
     if (!st) return;
-    sound_stop();
+    bk_sound_stop();
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
     }
-    if (st->sequence) kfree(st->sequence);
+    if (st->sequence) bk_sys_free(st->sequence);
     midamp_skin_free(st);
     if (g_midamp == st) g_midamp = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 bool midamp_get_runtime_info(program_runtime_info_t *info) {
@@ -1965,13 +2006,13 @@ void midamp_open_from_desktop(gui_desktop_t *desktop) {
     if (!desktop) return;
 
     if (g_midamp && g_midamp->window) {
-        gui_window_restore(g_midamp->window);
-        gui_desktop_raise_window(desktop, g_midamp->window);
-        gui_desktop_focus_window(desktop, g_midamp->window);
+        bk_gui_window_restore(g_midamp->window);
+        bk_gui_desktop_raise_window(desktop, g_midamp->window);
+        bk_gui_focus_window(desktop, g_midamp->window);
         return;
     }
 
-    st = (midamp_state_t *)kzalloc(sizeof(*st));
+    st = (midamp_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
     st->desktop = desktop;
     st->selected_index = -1;
@@ -1981,9 +2022,9 @@ void midamp_open_from_desktop(gui_desktop_t *desktop) {
     midamp_copy_text(st->status, sizeof(st->status), "Inicializando...");
     g_midamp = st;
 
-    if (task_create("midamp", midamp_main, st) < 0) {
+    if (bk_proc_spawn_thread("midamp", midamp_main, st) < 0) {
         g_midamp = NULL;
-        kfree(st);
+        bk_sys_free(st);
     }
 }
 
@@ -1995,29 +2036,30 @@ static void midamp_main(void *argument) {
 
     if (!st || !st->desktop) {
         midamp_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    task_set_memory_hint(sizeof(*st));
-    gui_event_queue_reset(&st->events);
+    bk_proc_set_memory_hint(sizeof(*st));
+    bk_gui_event_queue_reset(&st->events);
 
-    st->window = gui_desktop_create_window(st->desktop, 78, 26,
+    st->window = bk_gui_create_window(st->desktop, 78, 0,
                                            MIDAMP_MIN_W, MIDAMP_MIN_H,
                                            "WinMap MIDAMP");
     if (st->window) {
-        gui_window_set_content(st->window, midamp_content, st);
-        gui_window_set_event_handler(st->window, midamp_window_event, st);
-        gui_window_set_min_size(st->window, MIDAMP_MIN_W, MIDAMP_MIN_H);
-        st->window->owner_pid = task_current_pid();
-        task_bind_window(st->window);
+        bk_gui_window_set_borderless(st->window, true, MIDAMP_HEADER_H);
+        bk_gui_set_window_content(st->window, midamp_content, st);
+        bk_gui_set_window_event_handler(st->window, midamp_window_event, st);
+        bk_gui_set_window_min_size(st->window, MIDAMP_MIN_W, MIDAMP_MIN_H);
+        st->window->owner_pid = bk_sys_getpid();
+        bk_proc_bind_window(st->window);
     } else {
         midamp_cleanup(st);
-        task_exit();
+        bk_proc_exit();
         return;
     }
 
     if (midamp_skin_load(st)) {
-        task_set_memory_hint(sizeof(*st) +
+        bk_proc_set_memory_hint(sizeof(*st) +
                              (uint32_t)st->skin_header.width *
                                  st->skin_header.height * sizeof(uint32_t) +
                              (uint32_t)st->skin_buttons.width *
@@ -2029,8 +2071,8 @@ static void midamp_main(void *argument) {
     }
     midamp_reload_playlist(st);
 
-    while (!task_exit_requested()) {
-        while (gui_event_queue_pop(&st->events, &event))
+    while (!bk_proc_exit_requested()) {
+        while (bk_gui_event_queue_pop(&st->events, &event))
             midamp_process_event(st, &event);
         while (midamp_action_pop(st, &action))
             midamp_process_action(st, &action);
@@ -2038,7 +2080,7 @@ static void midamp_main(void *argument) {
         midamp_playback_tick(st);
 
         if (st->playing || st->paused) {
-            uint32_t now = pit_get_ticks();
+            uint32_t now = bk_sys_ticks();
             if (st->window && now != last_ui_tick) {
                 st->window->dirty = true;
                 last_ui_tick = now;
@@ -2049,7 +2091,11 @@ static void midamp_main(void *argument) {
     }
 
     midamp_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void midamp_install(gui_desktop_t *desktop UNUSED) {}
+
+void bleskernos_program_main(gui_desktop_t *desktop) {
+    midamp_open_from_desktop(desktop);
+}

@@ -13,6 +13,19 @@ typedef struct {
     bool is_directory;
 } iso9660_entry_t;
 
+typedef struct {
+    bool (*mount_default)(void);
+    bool (*is_mounted)(void);
+    bool (*resolve)(const char *path, iso9660_entry_t *entry);
+    bool (*list)(const iso9660_entry_t *directory,
+                 iso9660_entry_t *entries, uint32_t max_entries,
+                 uint32_t *count);
+    bool (*read_at)(const iso9660_entry_t *entry, uint32_t offset,
+                    void *buffer, uint32_t size, uint32_t *bytes_read);
+} iso9660_driver_ops_t;
+
+bool iso9660_register_driver(const iso9660_driver_ops_t *ops);
+
 bool iso9660_mount_default(void);
 bool iso9660_is_mounted(void);
 bool iso9660_resolve(const char *path, iso9660_entry_t *entry);

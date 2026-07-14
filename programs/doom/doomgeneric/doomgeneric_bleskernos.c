@@ -1,8 +1,5 @@
 #include "../../doom/doom_port.h"
-#include "../../../kernel/include/keyboard.h"
-#include "../../../kernel/include/memory.h"
-#include "../../../kernel/include/pit.h"
-#include "../../../kernel/include/task.h"
+#include "../../../kernel/include/api.h"
 
 #include "doomgeneric.h"
 
@@ -54,15 +51,15 @@ void doom_host_attach(gui_window_t *window, uint32_t *framebuffer,
     g_host.framebuffer = framebuffer;
     g_host.width = width;
     g_host.height = height;
-    g_host.start_tick = pit_get_ticks();
+    g_host.start_tick = bk_sys_ticks();
     g_host.next_frame_tick = g_host.start_tick;
 
-    while (kbd_next_event(&event)) {
+    while (bk_input_key_event(&event)) {
     }
 }
 
 void doom_host_detach(void) {
-    kmemset(&g_host, 0, sizeof(g_host));
+    bk_runtime_memset(&g_host, 0, sizeof(g_host));
 }
 
 static uint8_t doom_translate_key(uint8_t key) {
@@ -105,13 +102,13 @@ static void doom_limit_frame_rate(void) {
 
     if (DOOM_TARGET_FPS == 0) return;
 
-    hz = pit_get_frequency_hz();
+    hz = bk_sys_tick_frequency();
     if (hz == 0) hz = 100;
 
     frame_ticks = (hz + DOOM_TARGET_FPS - 1U) / DOOM_TARGET_FPS;
     if (frame_ticks == 0) frame_ticks = 1;
 
-    now = pit_get_ticks();
+    now = bk_sys_ticks();
 
     if (g_host.next_frame_tick == 0) {
         g_host.next_frame_tick = now + frame_ticks;
@@ -120,15 +117,15 @@ static void doom_limit_frame_rate(void) {
 
     /*
      * Hard cap:
-     * Do not trust task_sleep() alone. Some task/scheduler setups may return
+     * Do not trust bk_sys_sleep_ticks() alone. Some task/scheduler setups may return
      * early or use a different unit. This loop waits until the PIT tick really
      * reaches the next frame deadline.
      */
-    while ((int32_t)(pit_get_ticks() - g_host.next_frame_tick) < 0) {
-        task_sleep(1);
+    while ((int32_t)(bk_sys_ticks() - g_host.next_frame_tick) < 0) {
+        bk_sys_sleep_ticks(1);
     }
 
-    now = pit_get_ticks();
+    now = bk_sys_ticks();
 
     if ((int32_t)(now - (g_host.next_frame_tick + frame_ticks * 4U)) > 0) {
         /*
@@ -149,7 +146,7 @@ void DG_DrawFrame() {
     doom_limit_frame_rate();
 
     pixels = (uint32_t)g_host.width * (uint32_t)g_host.height;
-    kmemcpy(g_host.framebuffer, DG_ScreenBuffer, pixels * sizeof(uint32_t));
+    bk_runtime_memcpy(g_host.framebuffer, DG_ScreenBuffer, pixels * sizeof(uint32_t));
     if (g_host.window) g_host.window->dirty = true;
 }
 
@@ -158,16 +155,16 @@ void DG_SleepMs(uint32_t ms) {
     uint32_t ticks;
 
     if (ms == 0) return;
-    hz = pit_get_frequency_hz();
+    hz = bk_sys_tick_frequency();
     if (hz == 0) hz = 100;
     ticks = (ms * hz + 999U) / 1000U;
     if (ticks == 0) ticks = 1;
-    task_sleep(ticks);
+    bk_sys_sleep_ticks(ticks);
 }
 
 uint32_t DG_GetTicksMs() {
-    uint32_t hz = pit_get_frequency_hz();
-    uint32_t now = pit_get_ticks();
+    uint32_t hz = bk_sys_tick_frequency();
+    uint32_t now = bk_sys_ticks();
 
     if (hz == 0) hz = 100;
     return ((now - g_host.start_tick) * 1000U) / hz;
@@ -178,12 +175,12 @@ int DG_GetKey(int *pressed, unsigned char *key) {
 
     if (!pressed || !key) return 0;
     if (!g_host.window || !g_host.window->focused) {
-        while (kbd_next_event(&event)) {
+        while (bk_input_key_event(&event)) {
         }
         return 0;
     }
 
-    while (kbd_next_event(&event)) {
+    while (bk_input_key_event(&event)) {
         *pressed = event.pressed ? 1 : 0;
         *key = doom_translate_key(event.key);
         if (*key != 0) return 1;
@@ -194,7 +191,7 @@ int DG_GetKey(int *pressed, unsigned char *key) {
 
 void DG_SetWindowTitle(const char *title) {
     if (!g_host.window || !title) return;
-    kstrncpy(g_host.window->title, title, sizeof(g_host.window->title) - 1);
+    bk_runtime_strncpy(g_host.window->title, title, sizeof(g_host.window->title) - 1);
     g_host.window->title[sizeof(g_host.window->title) - 1] = '\0';
     g_host.window->dirty = true;
 }

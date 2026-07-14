@@ -1,7 +1,4 @@
-#include "programs.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/task.h"
-#include "../kernel/include/vfs.h"
+#include "../kernel/include/api.h"
 
 #define RUNBOX_W 390
 #define RUNBOX_H 150
@@ -24,16 +21,16 @@ static runbox_state_t *g_runbox;
 static void runbox_copy(char *dst, size_t dst_len, const char *src) {
     if (!dst || !dst_len) return;
     if (!src) src = "";
-    kstrncpy(dst, src, dst_len - 1);
+    bk_runtime_strncpy(dst, src, dst_len - 1);
     dst[dst_len - 1] = '\0';
 }
 
 static void runbox_append(char *dst, size_t dst_len, const char *src) {
     size_t len;
     if (!dst || !dst_len || !src) return;
-    len = kstrlen(dst);
+    len = bk_runtime_strlen(dst);
     if (len >= dst_len) return;
-    kstrncpy(dst + len, src, dst_len - len - 1);
+    bk_runtime_strncpy(dst + len, src, dst_len - len - 1);
     dst[dst_len - 1] = '\0';
 }
 
@@ -51,10 +48,18 @@ static char runbox_upper_char(char c) {
     return c;
 }
 
+static bool runbox_name_is(const char *left, const char *right) {
+    if (!left || !right) return false;
+    while (*left && *right) {
+        if (runbox_upper_char(*left++) != runbox_upper_char(*right++)) return false;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
 static void runbox_append_upper(char *dst, size_t dst_len, const char *src) {
     size_t len;
     if (!dst || !dst_len || !src) return;
-    len = kstrlen(dst);
+    len = bk_runtime_strlen(dst);
     while (*src && len + 1 < dst_len) {
         dst[len++] = runbox_upper_char(*src++);
     }
@@ -72,7 +77,7 @@ static const char *runbox_extension(const char *path) {
 }
 
 static bool runbox_ext_is(const char *ext, const char *a, const char *b) {
-    return kstrcmp(ext, a) == 0 || kstrcmp(ext, b) == 0;
+    return bk_runtime_strcmp(ext, a) == 0 || bk_runtime_strcmp(ext, b) == 0;
 }
 
 static void runbox_make_path(const char *input, char *out, size_t out_len) {
@@ -87,7 +92,38 @@ static void runbox_make_path(const char *input, char *out, size_t out_len) {
         return;
     }
 
-    runbox_copy(out, out_len, "/PROGRAMS/");
+    if (runbox_name_is(input, "control") ||
+        runbox_name_is(input, "control.o")) {
+        runbox_copy(out, out_len, "/SYSTEM/CONTROL/CONTROL.O");
+        return;
+    }
+
+    /* Alias de los nombres 8.3 usados antes de /SYSTEM/PROGRAMS. */
+    if (runbox_name_is(input, "calc") || runbox_name_is(input, "calc.o")) {
+        runbox_copy(out, out_len, "/SYSTEM/PROGRAMS/CALCULATOR.O");
+        return;
+    }
+    if (runbox_name_is(input, "files") || runbox_name_is(input, "files.o")) {
+        runbox_copy(out, out_len, "/SYSTEM/PROGRAMS/FILE.O");
+        return;
+    }
+    if (runbox_name_is(input, "viewer") || runbox_name_is(input, "viewer.o")) {
+        runbox_copy(out, out_len, "/SYSTEM/PROGRAMS/IMAGEVIEWER.O");
+        return;
+    }
+    if (runbox_name_is(input, "textedit") ||
+        runbox_name_is(input, "textedit.o")) {
+        runbox_copy(out, out_len, "/SYSTEM/PROGRAMS/TEXTEDITOR.O");
+        return;
+    }
+
+    if (runbox_ext_is(runbox_extension(input), ".CPL", ".cpl")) {
+        runbox_copy(out, out_len, "/SYSTEM/CONTROL/");
+        runbox_append_upper(out, out_len, input);
+        return;
+    }
+
+    runbox_copy(out, out_len, "/SYSTEM/PROGRAMS/");
     if (runbox_has_char(input, '.')) {
         runbox_append_upper(out, out_len, input);
     } else {
@@ -109,21 +145,21 @@ static bool runbox_path_is_dir(const char *path) {
     vfs_dir_entry_t dummy[1];
     uint32_t count = 0;
     if (!path || !*path) return false;
-    return vfs_listdir(path, dummy, 1, &count);
+    return bk_file_list_dir(path, dummy, 1, &count);
 }
 
 static void runbox_close(runbox_state_t *st) {
     if (!st) return;
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
         st->window = NULL;
     }
     if (g_runbox == st) g_runbox = NULL;
-    kfree(st);
-    gui_request_paint();
-    task_exit();
+    bk_sys_free(st);
+    bk_gui_request_paint();
+    bk_proc_exit();
 }
 
 static void runbox_execute(runbox_state_t *st) {
@@ -141,13 +177,14 @@ static void runbox_execute(runbox_state_t *st) {
     ext = runbox_extension(path);
 
     if (runbox_path_is_dir(path)) {
-        filebrowser_open_path(st->desktop, path);
+        (void)bk_app_execute_path_arg(st->desktop, "/SYSTEM/PROGRAMS/FILE.O",
+                                       path);
         runbox_set_status_path(st, "Abriendo carpeta: ", path);
         return;
     }
 
-    if (program_is_object(path)) {
-        if (program_execute_path(st->desktop, path)) {
+    if (bk_app_is_object(path)) {
+        if (bk_app_execute_path(st->desktop, path)) {
             runbox_set_status_path(st, "Ejecutado: ", path);
             return;
         }
@@ -157,7 +194,8 @@ static void runbox_execute(runbox_state_t *st) {
 
     if (runbox_ext_is(ext, ".BMP", ".bmp") ||
         runbox_ext_is(ext, ".GIF", ".gif")) {
-        imageviewer_open(st->desktop, path);
+        (void)bk_app_execute_path_arg(st->desktop, "/SYSTEM/PROGRAMS/IMAGEVIEWER.O",
+                                       path);
         runbox_set_status_path(st, "Abriendo imagen: ", path);
         return;
     }
@@ -168,19 +206,20 @@ static void runbox_execute(runbox_state_t *st) {
         runbox_ext_is(ext, ".C", ".c") ||
         runbox_ext_is(ext, ".H", ".h") ||
         runbox_ext_is(ext, ".ASM", ".asm")) {
-        texteditor_open(st->desktop, path);
+        (void)bk_app_execute_path_arg(st->desktop, "/SYSTEM/PROGRAMS/TEXTEDITOR.O",
+                                       path);
         runbox_set_status_path(st, "Abriendo texto: ", path);
         return;
     }
 
     /* Ultimo recurso: intentar abrir como texto. Si no existe, el editor deberia avisar. */
-    texteditor_open(st->desktop, path);
+    (void)bk_app_execute_path_arg(st->desktop, "/SYSTEM/PROGRAMS/TEXTEDITOR.O", path);
     runbox_set_status_path(st, "Intentando abrir: ", path);
 }
 
 static gui_rect_t runbox_input_rect(runbox_state_t *st) {
     int x = st->window->bounds.x + 18;
-    int y = st->window->bounds.y + GUI_TITLEBAR_HEIGHT + 44;
+    int y = bk_gui_window_content_rect_raw(st->window).y + 44;
     return (gui_rect_t){x, y, st->window->bounds.w - 36, 22};
 }
 
@@ -198,12 +237,12 @@ static gui_rect_t runbox_cancel_rect(runbox_state_t *st) {
 
 static void runbox_draw_button(gui_surface_t *s, gui_rect_t r,
                                const char *text) {
-    gui_gfx_fill_rect(s, r, 0x00D8D8D0);
-    gui_gfx_fill_rect(s, (gui_rect_t){r.x, r.y, r.w, 1}, 0x00FFFFFF);
-    gui_gfx_fill_rect(s, (gui_rect_t){r.x, r.y, 1, r.h}, 0x00FFFFFF);
-    gui_gfx_fill_rect(s, (gui_rect_t){r.x + r.w - 1, r.y, 1, r.h}, 0x00484840);
-    gui_gfx_fill_rect(s, (gui_rect_t){r.x, r.y + r.h - 1, r.w, 1}, 0x00484840);
-    gui_font_draw_string(s, r.x + 12, r.y + 7, text, 0x00202020, 0, false);
+    bk_gui_gfx_fill_rect(s, r, 0x00D8D8D0);
+    bk_gui_gfx_fill_rect(s, (gui_rect_t){r.x, r.y, r.w, 1}, 0x00FFFFFF);
+    bk_gui_gfx_fill_rect(s, (gui_rect_t){r.x, r.y, 1, r.h}, 0x00FFFFFF);
+    bk_gui_gfx_fill_rect(s, (gui_rect_t){r.x + r.w - 1, r.y, 1, r.h}, 0x00484840);
+    bk_gui_gfx_fill_rect(s, (gui_rect_t){r.x, r.y + r.h - 1, r.w, 1}, 0x00484840);
+    bk_gui_font_draw_string(s, r.x + 12, r.y + 7, text, 0x00202020, 0, false);
 }
 
 static void runbox_content(gui_window_t *window, gui_surface_t *s,
@@ -217,32 +256,32 @@ static void runbox_content(gui_window_t *window, gui_surface_t *s,
     if (!st || !window || !s) return;
 
     x = window->bounds.x;
-    y = window->bounds.y + GUI_TITLEBAR_HEIGHT;
+    y = bk_gui_window_content_rect_raw(window).y;
     clip = (gui_rect_t){x + 8, y + 4, window->bounds.w - 16,
-                        window->bounds.h - GUI_TITLEBAR_HEIGHT - 8};
+                        bk_gui_window_content_rect_raw(window).h - 8};
 
-    gui_gfx_fill_rect(s, clip, 0x00D8D8D0);
-    gui_font_draw_string(s, x + 18, y + 14,
+    bk_gui_gfx_fill_rect(s, clip, 0x00D8D8D0);
+    bk_gui_font_draw_string(s, x + 18, y + 14,
                          "Escribi el nombre de un programa, carpeta o archivo:",
                          0x00202020, 0, false);
 
     input = runbox_input_rect(st);
-    gui_gfx_fill_rect(s, input, 0x00FFFFFF);
-    gui_gfx_draw_rect(s, input, st->focused ? 0x000070C0 : 0x00606060);
-    gui_font_draw_string_clipped(s, input.x + 5, input.y + 7,
+    bk_gui_gfx_fill_rect(s, input, 0x00FFFFFF);
+    bk_gui_gfx_draw_rect(s, input, st->focused ? 0x000070C0 : 0x00606060);
+    bk_gui_font_draw_string_clipped(s, input.x + 5, input.y + 7,
                                  st->input, 0x00101010,
                                  (gui_rect_t){input.x + 4, input.y + 2,
                                               input.w - 8, input.h - 4});
 
     if (st->focused) {
-        int cursor_x = input.x + 6 + (int)gui_font_text_width(st->input);
+        int cursor_x = input.x + 6 + (int)bk_gui_font_text_width(st->input);
         if (cursor_x < input.x + input.w - 5) {
-            gui_gfx_fill_rect(s, (gui_rect_t){cursor_x, input.y + 5, 1, 13},
+            bk_gui_gfx_fill_rect(s, (gui_rect_t){cursor_x, input.y + 5, 1, 13},
                               0x00101010);
         }
     }
 
-    gui_font_draw_string_clipped(s, x + 18, y + 74,
+    bk_gui_font_draw_string_clipped(s, x + 18, y + 74,
                                  st->status, 0x00602020,
                                  (gui_rect_t){x + 18, y + 70,
                                               window->bounds.w - 36, 18});
@@ -259,22 +298,22 @@ static bool runbox_event(gui_window_t *window, const gui_event_t *event,
     if (!st || !window || !event) return false;
 
     if (event->type == GUI_EVENT_MOUSE_DOWN) {
-        if (gui_rect_contains(runbox_input_rect(st), event->x, event->y)) {
+        if (bk_gui_rect_contains(runbox_input_rect(st), event->x, event->y)) {
             st->focused = true;
             window->dirty = true;
             return true;
         }
-        if (gui_rect_contains(runbox_ok_rect(st), event->x, event->y)) {
+        if (bk_gui_rect_contains(runbox_ok_rect(st), event->x, event->y)) {
             runbox_execute(st);
             return true;
         }
-        if (gui_rect_contains(runbox_cancel_rect(st), event->x, event->y)) {
+        if (bk_gui_rect_contains(runbox_cancel_rect(st), event->x, event->y)) {
             runbox_close(st);
             return true;
         }
         st->focused = false;
         window->dirty = true;
-        return gui_window_contains(window, event->x, event->y);
+        return bk_gui_window_contains(window, event->x, event->y);
     }
 
     if (event->type != GUI_EVENT_KEY) return false;
@@ -289,7 +328,7 @@ static bool runbox_event(gui_window_t *window, const gui_event_t *event,
         return true;
     }
 
-    len = kstrlen(st->input);
+    len = bk_runtime_strlen(st->input);
     if (event->key == '\b') {
         if (len) st->input[len - 1] = '\0';
         window->dirty = true;
@@ -311,13 +350,13 @@ static bool runbox_event(gui_window_t *window, const gui_event_t *event,
 static void runbox_cleanup(runbox_state_t *st) {
     if (!st) return;
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
         st->window = NULL;
     }
     if (g_runbox == st) g_runbox = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 static void runbox_main(void *arg) {
@@ -327,7 +366,7 @@ static void runbox_main(void *arg) {
 
     if (!st || !st->desktop) {
         runbox_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
     x = ((int)st->desktop->surface.width - RUNBOX_W) / 2;
@@ -335,34 +374,38 @@ static void runbox_main(void *arg) {
     if (x < 8) x = 8;
     if (y < 8) y = 8;
 
-    st->window = gui_desktop_create_window(st->desktop, x, y,
+    st->window = bk_gui_create_window(st->desktop, x, y,
                                            RUNBOX_W, RUNBOX_H,
                                            "Ejecutar");
     if (!st->window) {
         runbox_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
+
+    (void)bk_about_attach(st->window, st->desktop, &(bk_about_info_t){
+        "Ejecutar", "Version 1.0", "Lanzador de programas y comandos.",
+        "Bles.INC (C) 2026", "/ICONS/OBJECT.BMP"});
 
     st->focused = true;
     runbox_copy(st->status, sizeof(st->status),
-                "Ej: calc, SHELL.O, /README.TXT, /PROGRAMS");
+                "Ej: calculator, control, DISPLAY.CPL, /SYSTEM/PROGRAMS");
 
-    gui_window_set_content(st->window, runbox_content, st);
-    gui_window_set_event_handler(st->window, runbox_event, st);
-    st->window->owner_pid = task_current_pid();
-    task_bind_window(st->window);
+    bk_gui_set_window_content(st->window, runbox_content, st);
+    bk_gui_set_window_event_handler(st->window, runbox_event, st);
+    st->window->owner_pid = bk_sys_getpid();
+    bk_proc_bind_window(st->window);
 
-    gui_desktop_raise_window(st->desktop, st->window);
-    gui_desktop_focus_window(st->desktop, st->window);
+    bk_gui_desktop_raise_window(st->desktop, st->window);
+    bk_gui_focus_window(st->desktop, st->window);
     st->window->dirty = true;
-    gui_request_paint();
+    bk_gui_request_paint();
 
-    while (!task_exit_requested()) {
-        task_sleep(20);
+    while (!bk_proc_exit_requested()) {
+        bk_sys_sleep_ticks(20);
     }
 
     runbox_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void runbox_open_from_desktop(gui_desktop_t *desktop) {
@@ -371,21 +414,21 @@ void runbox_open_from_desktop(gui_desktop_t *desktop) {
     if (!desktop) return;
 
     if (g_runbox && g_runbox->window) {
-        gui_window_restore(g_runbox->window);
-        gui_desktop_raise_window(desktop, g_runbox->window);
-        gui_desktop_focus_window(desktop, g_runbox->window);
+        bk_gui_window_restore(g_runbox->window);
+        bk_gui_desktop_raise_window(desktop, g_runbox->window);
+        bk_gui_focus_window(desktop, g_runbox->window);
         g_runbox->window->dirty = true;
         return;
     }
 
-    st = (runbox_state_t *)kzalloc(sizeof(*st));
+    st = (runbox_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
     st->desktop = desktop;
     g_runbox = st;
 
-    if (task_create("runbox", runbox_main, st) < 0) {
+    if (bk_proc_spawn_thread("runbox", runbox_main, st) < 0) {
         g_runbox = NULL;
-        kfree(st);
+        bk_sys_free(st);
     }
 }
 
@@ -394,4 +437,8 @@ bool runbox_get_runtime_info(program_runtime_info_t *info) {
     info->window = g_runbox->window;
     info->memory_bytes = sizeof(*g_runbox);
     return true;
+}
+
+void bleskernos_program_main(gui_desktop_t *desktop) {
+    runbox_open_from_desktop(desktop);
 }

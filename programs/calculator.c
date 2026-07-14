@@ -1,6 +1,4 @@
-#include "programs.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/task.h"
+#include "../kernel/include/api.h"
 
 #define CALC_BUTTONS 20
 
@@ -39,7 +37,7 @@ static void calc_to_string(char *out, int value) {
         number /= 10;
     }
     if (value < 0) tmp[--pos] = '-';
-    kstrcpy(out, &tmp[pos]);
+    bk_runtime_strcpy(out, &tmp[pos]);
 }
 
 static void calc_clear(calculator_state_t *st) {
@@ -48,7 +46,7 @@ static void calc_clear(calculator_state_t *st) {
     st->operation = 0;
     st->entering = false;
     st->error = false;
-    kstrcpy(st->display, "0");
+    bk_runtime_strcpy(st->display, "0");
 }
 
 static bool calc_apply(calculator_state_t *st, int right) {
@@ -58,7 +56,7 @@ static bool calc_apply(calculator_state_t *st, int right) {
     else if (st->operation == '*') st->accumulator *= right;
     else if (st->operation == '/') {
         if (!right) {
-            kstrcpy(st->display, "Error: division por 0");
+            bk_runtime_strcpy(st->display, "Error: division por 0");
             st->error = true;
             return false;
         }
@@ -69,7 +67,7 @@ static bool calc_apply(calculator_state_t *st, int right) {
 
 static void calc_press(calculator_state_t *st, const char *key) {
     if (!st || !key) return;
-    if (st->error && kstrcmp(key, "C") != 0) calc_clear(st);
+    if (st->error && bk_runtime_strcmp(key, "C") != 0) calc_clear(st);
 
     if (key[0] >= '0' && key[0] <= '9' && key[1] == '\0') {
         int digit = key[0] - '0';
@@ -81,24 +79,24 @@ static void calc_press(calculator_state_t *st, const char *key) {
                           (st->current < 0 ? -digit : digit);
         }
         calc_to_string(st->display, st->current);
-    } else if (kstrcmp(key, "C") == 0) {
+    } else if (bk_runtime_strcmp(key, "C") == 0) {
         calc_clear(st);
-    } else if (kstrcmp(key, "<-") == 0) {
+    } else if (bk_runtime_strcmp(key, "<-") == 0) {
         if (st->entering) st->current /= 10;
         calc_to_string(st->display, st->current);
-    } else if (kstrcmp(key, "+/-") == 0) {
+    } else if (bk_runtime_strcmp(key, "+/-") == 0) {
         st->current = -st->current;
         st->entering = true;
         calc_to_string(st->display, st->current);
-    } else if (kstrcmp(key, "%") == 0) {
+    } else if (bk_runtime_strcmp(key, "%") == 0) {
         st->current /= 100;
         calc_to_string(st->display, st->current);
-    } else if (kstrcmp(key, "x2") == 0) {
+    } else if (bk_runtime_strcmp(key, "x2") == 0) {
         int value = st->entering ? st->current : st->accumulator;
         st->current = value * value;
         st->entering = true;
         calc_to_string(st->display, st->current);
-    } else if (kstrcmp(key, "=") == 0) {
+    } else if (bk_runtime_strcmp(key, "=") == 0) {
         if (calc_apply(st, st->entering ? st->current : st->accumulator))
             calc_to_string(st->display, st->accumulator);
         st->operation = 0;
@@ -129,14 +127,14 @@ static void calculator_content(gui_window_t *window UNUSED,
     calculator_state_t *st = (calculator_state_t *)context;
     if (!st || !st->window || !st->window->visible) return;
     int x = st->window->bounds.x + 10;
-    int y = st->window->bounds.y + GUI_TITLEBAR_HEIGHT + 8;
+    int y = bk_gui_window_content_rect_raw(st->window).y + 8;
     int w = st->window->bounds.w - 20;
-    gui_gfx_fill_rect(surface, (gui_rect_t){x, y, w, 30}, 0x00F8FFF0);
-    gui_gfx_draw_rect(surface, (gui_rect_t){x, y, w, 30}, 0x00405040);
-    int text_w = (int)gui_font_text_width(st->display);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){x, y, w, 30}, 0x00F8FFF0);
+    bk_gui_gfx_draw_rect(surface, (gui_rect_t){x, y, w, 30}, 0x00405040);
+    int text_w = (int)bk_gui_font_text_width(st->display);
     int tx = x + w - text_w - 7;
     if (tx < x + 5) tx = x + 5;
-    gui_font_draw_string_clipped(surface, tx, y + 11, st->display,
+    bk_gui_font_draw_string_clipped(surface, tx, y + 11, st->display,
                                  st->error ? 0x00A02020 : 0x00102020,
                                  (gui_rect_t){x + 4, y + 3, w - 8, 24});
 }
@@ -163,12 +161,12 @@ static bool calculator_event(gui_window_t *window UNUSED,
 static void calculator_cleanup(calculator_state_t *st) {
     if (!st) return;
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
     }
     if (g_calculator == st) g_calculator = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 bool calculator_get_runtime_info(program_runtime_info_t *info) {
@@ -187,12 +185,12 @@ void calculator_open_from_desktop(gui_desktop_t *desktop) {
 
     if (!desktop) return;
 
-    st = (calculator_state_t *)kzalloc(sizeof(*st));
+    st = (calculator_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
     st->desktop = desktop;
     calc_clear(st);
     g_calculator = st;
-    if (task_create("calculator", calculator_main, st) < 0) {
+    if (bk_proc_spawn_thread("calculator", calculator_main, st) < 0) {
         calculator_cleanup(st);
     }
 }
@@ -201,23 +199,26 @@ static void calculator_main(void *argument) {
     calculator_state_t *st = (calculator_state_t *)argument;
     if (!st || !st->desktop) {
         calculator_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    task_set_memory_hint(sizeof(*st) +
+    bk_proc_set_memory_hint(sizeof(*st) +
                          (uint32_t)(CALC_BUTTONS * sizeof(gui_widget_t)));
-    st->window = gui_desktop_create_window(st->desktop, 170, 55, 238, 258,
+    st->window = bk_gui_create_window(st->desktop, 170, 55, 238, 258,
                                            "Calculadora");
     if (st->window) {
-        gui_window_set_content(st->window, calculator_content, st);
-        gui_window_set_event_handler(st->window, calculator_event, st);
-        gui_window_set_min_size(st->window, 238, 258);
-        st->window->owner_pid = task_current_pid();
-        task_bind_window(st->window);
+        (void)bk_about_attach(st->window, st->desktop, &(bk_about_info_t){
+            "Calculadora", "Version 1.0", "Calculadora de BlesKernOS.",
+            "Bles.INC (C) 2026", "/ICONS/CALC.BMP"});
+        bk_gui_set_window_content(st->window, calculator_content, st);
+        bk_gui_set_window_event_handler(st->window, calculator_event, st);
+        bk_gui_set_window_min_size(st->window, 238, 258);
+        st->window->owner_pid = bk_sys_getpid();
+        bk_proc_bind_window(st->window);
         for (int i = 0; i < CALC_BUTTONS; i++) {
             int col = i % 4;
             int row = i / 4;
-            gui_widget_t *button = gui_widget_create(
+            gui_widget_t *button = bk_gui_widget_create(
                 st->desktop, st->window, GUI_WIDGET_BUTTON,
                 (gui_rect_t){8 + col * 55, 43 + row * 37, 49, 30},
                 calc_labels[i], calculator_button);
@@ -225,13 +226,17 @@ static void calculator_main(void *argument) {
         }
     }
 
-    while (!task_exit_requested()) {
+    while (!bk_proc_exit_requested()) {
         if (!st->window || !st->window->listed) break;
-        task_sleep(4);
+        bk_sys_sleep_ticks(4);
     }
 
     calculator_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void calculator_install(gui_desktop_t *desktop UNUSED) {}
+
+void bleskernos_program_main(gui_desktop_t *desktop) {
+    calculator_open_from_desktop(desktop);
+}

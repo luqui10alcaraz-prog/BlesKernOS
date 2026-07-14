@@ -6,7 +6,7 @@
 #include "../include/task.h"
 
 volatile uint32_t kernel_ticks = 0;
-static uint32_t pit_frequency_hz = 250;
+static uint32_t pit_frequency_hz = 300;
 
 static void pit_irq_handler(registers_t *regs UNUSED) {
     kernel_ticks++;

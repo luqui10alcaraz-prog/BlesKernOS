@@ -1,4 +1,4 @@
-#include "../../../kernel/include/sound.h"
+#include "../../../kernel/include/api.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -146,7 +146,7 @@ static boolean DG_BK_LoadSfx(sfxinfo_t *sfxinfo,
     if (!slot) {
         /*
          * Cache full. Still play the sound once; the caller will release it
-         * after sound_play_pcm_u8() copies it into the SB16 DMA buffer.
+         * after bk_sound_play_pcm_u8() copies it into the SB16 DMA buffer.
          */
         *sample_rate_out = (uint16_t)((uint16_t)data[2] |
                                       ((uint16_t)data[3] << 8));
@@ -184,12 +184,12 @@ static boolean I_BK_InitSound(boolean use_sfx_prefix) {
     g_active_handle = -1;
     g_next_handle = 1;
     memset(g_sfx_cache, 0, sizeof(g_sfx_cache));
-    return sound_pcm_available();
+    return bk_sound_pcm_available();
 }
 
 static void I_BK_ShutdownSound(void) {
     g_active_handle = -1;
-    sound_stop();
+    bk_sound_stop();
     DG_BK_ClearSfxCache();
 }
 
@@ -204,7 +204,7 @@ static int I_BK_GetSfxLumpNum(sfxinfo_t *sfxinfo) {
 }
 
 static void I_BK_UpdateSound(void) {
-    if (g_active_handle >= 0 && !sound_pcm_is_busy()) {
+    if (g_active_handle >= 0 && !bk_sound_pcm_busy()) {
         g_active_handle = -1;
     }
 }
@@ -223,11 +223,11 @@ static int I_BK_StartSound(sfxinfo_t *sfxinfo, int channel UNUSED,
     int handle;
     boolean ok;
 
-    if (!sound_pcm_available()) return -1;
+    if (!bk_sound_pcm_available()) return -1;
     if (!DG_BK_LoadSfx(sfxinfo, &samples, &length, &sample_rate_hz, &lumpnum))
         return -1;
 
-    ok = sound_play_pcm_u8(samples, length, sample_rate_hz,
+    ok = bk_sound_play_pcm_u8(samples, length, sample_rate_hz,
                            DG_BK_VolumeToKernel(vol));
     if (lumpnum >= 0) W_ReleaseLumpNum(lumpnum);
     if (!ok) return -1;
@@ -241,13 +241,13 @@ static int I_BK_StartSound(sfxinfo_t *sfxinfo, int channel UNUSED,
 static void I_BK_StopSound(int handle) {
     if (handle != g_active_handle && handle >= 0) return;
     g_active_handle = -1;
-    sound_stop();
+    bk_sound_stop();
 }
 
 static boolean I_BK_SoundIsPlaying(int handle) {
     return handle >= 0 &&
            handle == g_active_handle &&
-           sound_pcm_is_busy();
+           bk_sound_pcm_busy();
 }
 
 static void I_BK_CacheSounds(sfxinfo_t *sounds, int num_sounds) {

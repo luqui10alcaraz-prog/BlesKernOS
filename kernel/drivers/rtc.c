@@ -1,5 +1,6 @@
 #include "../include/rtc.h"
 #include "../include/pic.h"
+#include "../include/driver.h"
 
 static uint8_t cmos_read(uint8_t reg) {
     outb(0x70, reg);
@@ -116,4 +117,25 @@ bool rtc_get_datetime(rtc_datetime_t *datetime) {
     if (!rtc_get_date(&datetime->date)) return false;
     if (!rtc_get_time(&datetime->time)) return false;
     return true;
+}
+
+static bool rtc_driver_init(void) {
+    static const rtc_driver_ops_t ops = {
+        rtc_get_time,
+        rtc_get_date,
+        rtc_get_datetime
+    };
+    return rtc_register_driver(&ops);
+}
+
+const bk_driver_module_t *bleskernos_driver_query(void) {
+    static const bk_driver_module_t module = {
+        BK_DRIVER_ABI_VERSION,
+        sizeof(bk_driver_module_t),
+        "cmos-rtc",
+        "Reloj de tiempo real CMOS",
+        rtc_driver_init,
+        NULL
+    };
+    return &module;
 }

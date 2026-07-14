@@ -163,9 +163,29 @@ bool gfx_list_display_modes(gfx_display_mode_t *modes, uint32_t max_modes,
     return vesa_list_modes(modes, max_modes, count, current_bpp);
 }
 
+bool gfx_list_all_display_modes(gfx_display_mode_t *modes, uint32_t max_modes,
+                                uint32_t *count) {
+    return vesa_list_all_modes(modes, max_modes, count);
+}
+
 bool gfx_set_display_mode(uint16_t width, uint16_t height, uint8_t bpp) {
     if (g_gfx.mode != GFX_MODE_VESA_LFB) return false;
     return vesa_set_mode(&g_gfx, width, height, bpp);
+}
+
+bool gfx_enable_page_flip(void) {
+    return g_gfx.mode == GFX_MODE_VESA_LFB &&
+           vesa_enable_page_flip(&g_gfx);
+}
+
+uint32_t gfx_page_flip_draw_buffer(void) {
+    if (g_gfx.mode != GFX_MODE_VESA_LFB) return 0U;
+    return vesa_page_flip_draw_buffer(&g_gfx);
+}
+
+bool gfx_page_flip_commit(void) {
+    return g_gfx.mode == GFX_MODE_VESA_LFB &&
+           vesa_page_flip_commit(&g_gfx);
 }
 
 void gfx_set_palette_color(uint8_t index, uint8_t r, uint8_t g, uint8_t b) {
@@ -273,6 +293,7 @@ void gfx_draw_string(int x, int y, const char *s, uint8_t fg, uint8_t bg, bool f
         x += 8;
     }
 }
+
 
 void gfx_demo(void) {
     gfx_clear(1);

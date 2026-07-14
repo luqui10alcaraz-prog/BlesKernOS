@@ -1,64 +1,84 @@
-# BlesKernOS 0.6
+# BlesKernOS 0.7
+
+BlesKernOS is a lightweight 32-bit operating system written from scratch in x86 Assembly and C.
+
+
+> BlesKernOS is still under development. Bugs and limited hardware compatibility are expected.
+
 ---
 
-BlesKernOS is an 32-bit operating system written from scratch in x86 Assembly and C.
+## Screenshots
 
-It features a custom bootloader, a protected-mode kernel, a graphical desktop environment, a FAT filesystem, native applications, and an Doom port.
-
+<img width="799" height="599" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/e7134b00-7bca-4d60-8192-2383515afa01" />
+<img width="799" height="598" alt="BlesKernOS applications" src="https://github.com/user-attachments/assets/2a1cd55c-a47a-46b6-bca7-67945d70ed0f" />
+<img width="802" height="600" alt="BlesKernOS Doom port" src="https://github.com/user-attachments/assets/38775fc8-bc0f-4db5-badc-7464a4f49fa9" />
 
 ---
 
-## Screenshot
-<img width="799" height="599" alt="Captura de pantalla 2026-07-02 224002" src="https://github.com/user-attachments/assets/e7134b00-7bca-4d60-8192-2383515afa01" />
-<img width="799" height="598" alt="Captura de pantalla 2026-07-02 224147" src="https://github.com/user-attachments/assets/2a1cd55c-a47a-46b6-bca7-67945d70ed0f" />
-<img width="796" height="602" alt="Captura de pantalla 2026-07-05 032649" src="https://github.com/user-attachments/assets/559f631b-f4c6-4dc3-8289-92f81bbff0f5" />
-<img width="799" height="604" alt="image" src="https://github.com/user-attachments/assets/8fe6fcc9-f26d-4d3d-8e04-677d1d784510" />
-<img width="802" height="602" alt="Captura de pantalla 2026-07-02 224058" src="https://github.com/user-attachments/assets/7512fe19-1ada-4eeb-9eda-c0d91d44f89f" />
-<img width="799" height="600" alt="Captura de pantalla 2026-07-02 224512" src="https://github.com/user-attachments/assets/6f9c2add-6da9-4880-a63b-575e7b3ccf2c" />
-<img width="796" height="603" alt="Captura de pantalla 2026-07-05 031647" src="https://github.com/user-attachments/assets/01e41ead-1915-4838-b1f8-db01a0f76a2e" />
-<img width="802" height="600" alt="Captura de pantalla 2026-07-05 032937" src="https://github.com/user-attachments/assets/38775fc8-bc0f-4db5-badc-7464a4f49fa9" />
+## What's new in 0.7
+
+- Native applications now run as external Ring 3 programs.
+- Public API and SDK for creating BlesKernOS software.
+- External drivers, libraries, services and screensavers.
+- Improved Control Panel and Device Manager.
+- USB UHCI and USB storage support.
+- AC'97, Sound Blaster 16 and ESS Maestro 3 audio drivers.
+- Startup sound and improved multimedia support.
+- Recovery Console.
+- Larger collection of shell commands and system tools.
+- Experimental PE32 and Win32 compatibility.
+
 ---
 
-## Features
+## Main features
 
-### Kernel
-- Custom two-stage bootloader
-- 32-bit protected mode
-- Preemptive multitasking
-- Ring 3 userspace (work in progress)
-- ELF program loader
-- Minimal freestanding C library
+### System
 
-### Drivers
-- ATA / ATAPI
-- Floppy Disk Controller
-- FAT12 / FAT16 / FAT32
-- ISO9660
-- PCI detection
-- PS/2 keyboard & mouse
-- Sound Blaster 16
-- VESA graphics
+- Custom bootloader and 32-bit protected-mode kernel.
+- Preemptive multitasking and Ring 3 userspace.
+- ELF program loader and system calls.
+- ATA, ATAPI, floppy and USB storage.
+- FAT12, FAT16, FAT32 and ISO 9660 filesystems.
+- PCI, PS/2 keyboard and mouse, VESA graphics and VGA fallback.
+- Loadable `.DVR` driver modules.
 
 ### Desktop
-- Window manager
-- Taskbar / deskbar
-- Desktop icons
-- Configurable desktop via INI files
-- BMP/GIF image loading
-- Packed icon loading through ICONS.PAK
-- Screensavers
-  
+
+- Window manager, compositor, desktop icons and taskbar.
+- File associations and configurable desktop.
+- BMP and GIF image support.
+- Control Panel modules for display, appearance, sound, devices, keyboard, mouse, date and system settings.
+- External screensavers, including TinyGL pipes and bouncing balls.
+
 ### Applications
+
 - File Browser
 - Text Editor
 - Calculator
 - Calendar
-- Settings
-- Process Manager
-- MidAmp (MIDI Player)
 - Paint
-- Doom (experimental)
-- Shell
+- Image Viewer
+- Process Manager
+- ScanDisk
+- MidAmp MIDI Player
+- Shell and RunBox
+- TinyGL Gears demo
+- Doom
+
+### Win32 compatibility
+
+BlesKernOS includes an experimental PE32 loader and partial implementations of several Win32 libraries. Small test programs, dialogs, menus, DLLs, threads and simple applications can run, but compatibility is still limited.
+
+---
+
+## SDK
+
+Native applications can use the public BlesKernOS API through the SDK located in `sdk/`.
+
+Documentation:
+
+- [`docs/API.md`](docs/API.md)
+- [`docs/DRIVERS.md`](docs/DRIVERS.md)
 
 ---
 
@@ -67,56 +87,59 @@ It features a custom bootloader, a protected-mode kernel, a graphical desktop en
 Requirements:
 
 - NASM
-- GCC (32-bit)
+- GCC with 32-bit support
 - Python 3
 - QEMU
+- DOS/FAT tools
 
-Build:
+Build the system:
 
 ```bash
 make
 ```
 
-Run:
+Run the ATA image:
 
 ```bash
-qemu-system-i386 \
-    -drive file=build/bleskernos.img,format=raw \
-    -m 128M
+qemu-system-i386 -drive file=build/bleskernos-ata.img,format=raw,if=ide -m 128M -device sb16 -serial stdio
+```
+
+Run the USB image with UHCI:
+
+```bash
+qemu-system-i386 -device piix3-usb-uhci,id=uhci -drive id=usbdisk,file=build/bleskernos-usb.img,format=raw,if=none -device usb-storage,drive=usbdisk,bus=uhci.0,bootindex=1 -m 128M -serial stdio
 ```
 
 ---
 
-## Project Structure
+## Project structure
 
-```
+```text
 boot/       Bootloader
-kernel/     Kernel
-gui/        Window system
+kernel/     Kernel, drivers and Win32 subsystem
+gui/        Desktop and window system
 programs/   Native applications
-assets/     Icons and images
+system/     Commands, settings, services and screensavers
+libs/       External libraries
+sdk/        Public development kit
+assets/     Icons, sounds and wallpapers
 tools/      Build tools
 ```
 
 ---
 
-## Roadmap
+## Current limitations
 
-Current focus for version 0.6:
-
-- Complete Ring 3 migration
-- Improve userspace API
-- More native applications
-- GUI improvements
-- Better filesystem support
+- No paging-based process isolation yet.
+- Hardware support is still limited.
+- USB support currently focuses on UHCI controllers.
+- Win32 compatibility is experimental and incomplete.
 
 ---
 
 ## License
 
 MIT License.
-
----
 
 ## Acknowledgments
 

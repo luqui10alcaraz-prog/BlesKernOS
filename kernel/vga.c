@@ -1,6 +1,7 @@
 #include "include/types.h"
 #include "include/vga.h"
 #include "include/pic.h"
+#include "include/task.h"
 
 #define VGA_ADDRESS  0x000B8000
 #define VGA_WIDTH    80
@@ -13,6 +14,7 @@ static uint8_t cur_color = 0;
 static vga_output_char_t output_sink = NULL;
 static vga_output_clear_t clear_sink = NULL;
 static void *output_context = NULL;
+static uint32_t output_route = 0;
 
 static inline uint8_t make_color(vga_color_t fg, vga_color_t bg) {
     return (uint8_t)((bg << 4) | fg);
@@ -32,6 +34,10 @@ static void update_hw_cursor(void) {
 
 static void serial_putchar(char c) {
     static bool initialized = false;
+    static bool unavailable = false;
+    uint32_t spin;
+
+    if (unavailable) return;
     if (!initialized) {
         outb(0x3F8 + 1, 0x00);
         outb(0x3F8 + 3, 0x80);
@@ -42,7 +48,19 @@ static void serial_putchar(char c) {
         outb(0x3F8 + 4, 0x0B);
         initialized = true;
     }
-    while ((inb(0x3F8 + 5) & 0x20) == 0) {}
+
+    /*
+     * COM1 es solamente un canal de diagnostico. Nunca debe poder detener el
+     * kernel si el UART no existe, queda deshabilitado por BIOS o deja de
+     * responder. En hardware real la espera anterior era infinita.
+     */
+    for (spin = 0; spin < 10000U; spin++) {
+        if ((inb(0x3F8 + 5) & 0x20) != 0) break;
+    }
+    if (spin == 10000U) {
+        unavailable = true;
+        return;
+    }
     outb(0x3F8, (uint8_t)c);
 }
 
@@ -64,7 +82,8 @@ void vga_init(void) {
 }
 
 void vga_clear(void) {
-    if (clear_sink) {
+    if (clear_sink && output_route != 0U &&
+        task_current_console_route() == output_route) {
         clear_sink(output_context);
         return;
     }
@@ -92,7 +111,8 @@ void vga_get_cursor(int *x, int *y) {
 }
 
 void vga_putchar(char c) {
-    if (output_sink) {
+    if (output_sink && output_route != 0U &&
+        task_current_console_route() == output_route) {
         output_sink(c, output_context);
         return;
     }
@@ -131,6 +151,13 @@ void vga_set_output_sink(vga_output_char_t output,
     output_sink = output;
     clear_sink = clear;
     output_context = context;
+    if (output) {
+        output_route = task_current_process_id();
+        task_set_current_console_route(output_route);
+    } else {
+        output_route = 0;
+        task_set_current_console_route(0);
+    }
 }
 
 void vga_puts(const char *s) {

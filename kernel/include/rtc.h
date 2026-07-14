@@ -20,6 +20,14 @@ typedef struct {
     rtc_time_t time;
 } rtc_datetime_t;
 
+typedef struct {
+    bool (*get_time)(rtc_time_t *time);
+    bool (*get_date)(rtc_date_t *date);
+    bool (*get_datetime)(rtc_datetime_t *datetime);
+} rtc_driver_ops_t;
+
+bool rtc_register_driver(const rtc_driver_ops_t *ops);
+
 bool rtc_get_time(rtc_time_t *time);
 bool rtc_get_date(rtc_date_t *date);
 bool rtc_get_datetime(rtc_datetime_t *datetime);

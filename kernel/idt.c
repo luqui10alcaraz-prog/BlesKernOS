@@ -3,6 +3,7 @@
 #include "include/vga.h"
 #include "include/panic.h"
 #include "include/task.h"
+#include "win32/exception.h"
 
 static idt_entry_t idt[256];
 static idt_ptr_t idt_ptr;
@@ -42,6 +43,30 @@ static uint32_t exception_handlers[32] = {
     (uint32_t)isr24, (uint32_t)isr25, (uint32_t)isr26, (uint32_t)isr27,
     (uint32_t)isr28, (uint32_t)isr29, (uint32_t)isr30, (uint32_t)isr31,
 };
+
+
+#define X86_EFLAGS_TF (1U << 8)
+#define X86_DR6_BREAKPOINT_MASK 0x0000000FU
+#define X86_DR6_SINGLE_STEP (1U << 14)
+
+static bool recover_unrequested_kernel_single_step(registers_t *regs) {
+    uint32_t dr6;
+    uint32_t clear = 0U;
+
+    if (!regs || regs->int_no != 1U || (regs->cs & 3U) != 0U) return false;
+    __asm__ volatile ("movl %%dr6, %0" : "=r"(dr6));
+
+    /* Un breakpoint de hardware real debe seguir llegando al panic/debugger. */
+    if (dr6 & X86_DR6_BREAKPOINT_MASK) return false;
+    if ((dr6 & X86_DR6_SINGLE_STEP) == 0U &&
+        (regs->eflags & X86_EFLAGS_TF) == 0U) return false;
+
+    regs->eflags &= ~X86_EFLAGS_TF;
+    __asm__ volatile ("movl %0, %%dr6" : : "r"(clear));
+    kprintf("[EXC] #DB single-step no solicitado en kernel EIP=%x DR6=%x; TF limpiado\n",
+            regs->eip, dr6);
+    return true;
+}
 
 static uint32_t irq_handlers[16] = {
     (uint32_t)irq0, (uint32_t)irq1, (uint32_t)irq2,  (uint32_t)irq3,
@@ -90,9 +115,11 @@ registers_t *isr_handler(registers_t *regs) {
 
     if (regs->int_no < 32) {
         if ((regs->cs & 3U) == 3U) {
-            task_exit_from_interrupt();
+            if (win32_exception_handle_interrupt(regs)) return regs;
+            task_exit_from_interrupt(128 + (int32_t)regs->int_no);
             return task_schedule(regs);
         }
+        if (recover_unrequested_kernel_single_step(regs)) return regs;
         uint32_t names = sizeof(exception_names) / sizeof(exception_names[0]);
         const char *name = regs->int_no < names
             ? exception_names[regs->int_no] : "Reserved exception";

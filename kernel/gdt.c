@@ -28,7 +28,7 @@ typedef struct {
     uint16_t iomap_base;
 } PACKED tss_entry_t;
 
-static gdt_entry_t gdt[6];
+static gdt_entry_t gdt[7];
 static gdt_ptr_t gdt_ptr;
 static tss_entry_t tss;
 
@@ -59,6 +59,10 @@ void gdt_init(void) {
     gdt_set(3, 0, 0xFFFFF, 0xFA, 0xC0);
     gdt_set(4, 0, 0xFFFFF, 0xF2, 0xC0);
     gdt_set(5, tss_base, sizeof(tss) - 1, 0x89, 0x00);
+    /* Shared ring-3 FS descriptor. Its base is rewritten by the scheduler
+     * before returning to each Win32 task, then POP FS reloads the hidden
+     * segment cache with that task's TEB base. */
+    gdt_set(6, 0, 0x0FFF, 0xF2, 0x40);
 
     tss.ss0 = GDT_KERNEL_DATA;
     tss.iomap_base = sizeof(tss);
@@ -68,4 +72,8 @@ void gdt_init(void) {
 
 void tss_set_kernel_stack(uint32_t stack_top) {
     tss.esp0 = stack_top;
+}
+
+void gdt_set_user_fs_base(uint32_t base) {
+    gdt_set(6, base, 0x0FFF, 0xF2, 0x40);
 }

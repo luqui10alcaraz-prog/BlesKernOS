@@ -3,6 +3,7 @@
 #include "../include/memory.h"
 #include "../include/pic.h"
 #include "../include/vga.h"
+#include "../include/bootsplash.h"
 
 /*
  * BlesKernOS floppy driver - DMA based reader.
@@ -42,11 +43,15 @@
 static uint8_t g_floppy_media = 0;
 
 static void tiny_delay(uint32_t loops) {
-    for (uint32_t i = 0; i < loops; i++) io_wait();
+    for (uint32_t i = 0; i < loops; i++) {
+        if ((i & 0x3FFFU) == 0) bootsplash_pulse();
+        io_wait();
+    }
 }
 
 static bool fdc_wait_write(void) {
     for (uint32_t i = 0; i < 1000000; i++) {
+        if ((i & 0x7FFFU) == 0) bootsplash_pulse();
         uint8_t msr = inb(FDC_MSR);
         if ((msr & 0xC0) == 0x80) return true; /* RQM=1, DIO=0 */
     }
@@ -55,6 +60,7 @@ static bool fdc_wait_write(void) {
 
 static bool fdc_wait_read(void) {
     for (uint32_t i = 0; i < 5000000; i++) {
+        if ((i & 0x7FFFU) == 0) bootsplash_pulse();
         uint8_t msr = inb(FDC_MSR);
         if ((msr & 0xC0) == 0xC0) return true; /* RQM=1, DIO=1 */
     }
@@ -134,7 +140,10 @@ static bool floppy_recalibrate(void) {
     if (!fdc_write(FDC_CMD_RECALIBRATE)) return false;
     if (!fdc_write(0)) return false;
 
-    for (uint32_t wait = 0; wait < 200000; wait++) io_wait();
+    for (uint32_t wait = 0; wait < 200000; wait++) {
+        if ((wait & 0x3FFFU) == 0) bootsplash_pulse();
+        io_wait();
+    }
     if (!fdc_sense(&st0, &cyl)) return false;
     return ((st0 & 0xC0) == 0x00) && cyl == 0;
 }
@@ -147,7 +156,10 @@ static bool floppy_seek(uint8_t cyl, uint8_t head) {
     if (!fdc_write((uint8_t)((head << 2) | 0))) return false;
     if (!fdc_write(cyl)) return false;
 
-    for (uint32_t wait = 0; wait < 200000; wait++) io_wait();
+    for (uint32_t wait = 0; wait < 200000; wait++) {
+        if ((wait & 0x3FFFU) == 0) bootsplash_pulse();
+        io_wait();
+    }
     if (!fdc_sense(&st0, &current_cyl)) return false;
     return ((st0 & 0xC0) == 0x00) && current_cyl == cyl;
 }
@@ -253,6 +265,13 @@ static bool floppy_read_block(block_device_t *dev UNUSED, uint32_t lba, uint8_t 
             floppy_motor_off();
             return false;
         }
+
+        /*
+         * Un pulso por sector leído es suficiente.
+         * No animar dentro de fdc_wait_* ni tiny_delay: eso hace que la barra
+         * vaya rapidísimo y puede ralentizar muchísimo el floppy.
+         */
+        bootsplash_pulse();
     }
     floppy_motor_off();
     return true;

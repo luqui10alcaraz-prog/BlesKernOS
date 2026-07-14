@@ -1,6 +1,7 @@
 #include "../include/block.h"
 #include "../include/memory.h"
 #include "../include/task.h"
+#include "../include/bootsplash.h"
 
 static block_device_t g_devices[BLOCK_MAX_DEVICES];
 static uint32_t g_device_count = 0;
@@ -91,9 +92,11 @@ bool block_read(block_device_t *dev, uint32_t lba, uint8_t count, void *buffer) 
     if (!dev || !dev->read || !buffer || count == 0) return false;
     if (dev->sector_count && lba + count > dev->sector_count) return false;
 
+    bootsplash_pulse();
     block_io_lock();
     result = dev->read(dev, dev->base_lba + lba, count, buffer);
     block_io_unlock();
+    bootsplash_pulse();
     return result;
 }
 
@@ -121,6 +124,7 @@ const char *block_type_name(block_device_type_t type) {
         case BLOCK_DEVICE_ATA: return "ata";
         case BLOCK_DEVICE_FLOPPY: return "floppy";
         case BLOCK_DEVICE_ATAPI: return "atapi";
+        case BLOCK_DEVICE_USB: return "usb-storage";
         default: return "none";
     }
 }

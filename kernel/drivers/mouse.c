@@ -4,6 +4,7 @@
 #include "../include/idt.h"
 #include "../include/vga.h"
 #include "../include/gfx.h"
+#include "../include/driver.h"
 
 #define PS2_STATUS_OUTPUT_FULL 0x01
 #define PS2_STATUS_INPUT_FULL  0x02
@@ -37,6 +38,25 @@ static volatile uint8_t g_packet[4];
 static volatile uint8_t g_packet_index = 0;
 static int32_t g_bound_w = 320;
 static int32_t g_bound_h = 200;
+static uint8_t g_sensitivity = 3;
+
+static int32_t mouse_scale_delta(int32_t value) {
+    static const uint8_t scale_percent[5] = {40, 70, 100, 130, 170};
+    uint32_t magnitude;
+    uint32_t scaled;
+    uint8_t percent;
+
+    if (!value) return 0;
+    if (g_sensitivity < 1) g_sensitivity = 1;
+    if (g_sensitivity > 5) g_sensitivity = 5;
+    percent = scale_percent[g_sensitivity - 1];
+    if (percent == 100) return value;
+
+    magnitude = (uint32_t)(value < 0 ? -value : value);
+    scaled = (magnitude * percent + 50U) / 100U;
+    if (scaled == 0U) scaled = 1U;
+    return value < 0 ? -(int32_t)scaled : (int32_t)scaled;
+}
 
 static bool ps2_wait_input_clear(void) {
     for (uint32_t i = 0; i < 100000; i++) {
@@ -130,6 +150,8 @@ static void mouse_handle_packet(void) {
     dy = (int32_t)g_packet[2];
     if (b0 & 0x10) dx |= 0xFFFFFF00;
     if (b0 & 0x20) dy |= 0xFFFFFF00;
+    dx = mouse_scale_delta(dx);
+    dy = mouse_scale_delta(dy);
 
     g_mouse.dx = dx;
     g_mouse.dy = dy;
@@ -181,6 +203,16 @@ void mouse_set_position(int32_t x, int32_t y) {
     mouse_apply_bounds();
 }
 
+void mouse_set_sensitivity(uint8_t sensitivity) {
+    if (sensitivity < 1) sensitivity = 1;
+    if (sensitivity > 5) sensitivity = 5;
+    g_sensitivity = sensitivity;
+}
+
+uint8_t mouse_get_sensitivity(void) {
+    return g_sensitivity;
+}
+
 bool mouse_is_present(void) {
     return g_mouse.present;
 }
@@ -216,6 +248,7 @@ void mouse_init(void) {
     g_mouse.init_step = 0;
     g_mouse.last_error = MOUSE_ERR_NONE;
     g_packet_index = 0;
+    g_sensitivity = 3;
 
     ps2_flush();
     g_mouse.init_step = 1;
@@ -275,4 +308,34 @@ void mouse_init(void) {
     g_mouse.last_error = MOUSE_ERR_NONE;
     g_mouse.init_step = 7;
     kprintf("  [MOUSE] PS/2 id=%u packet=%u\n", g_mouse.device_id, g_mouse.packet_size);
+}
+
+static bool ps2_mouse_driver_init(void) {
+    static const mouse_driver_ops_t ops = {
+        mouse_is_present,
+        mouse_get_state,
+        mouse_set_bounds,
+        mouse_set_position,
+        mouse_set_sensitivity,
+        mouse_get_sensitivity
+    };
+
+    /* El controlador 8042 es compartido con teclado. Evita que IRQ1/IRQ12
+       consuman bytes de respuesta mientras se negocia el dispositivo. */
+    cli();
+    mouse_init();
+    sti();
+    return mouse_register_driver(&ops);
+}
+
+const bk_driver_module_t *bleskernos_driver_query(void) {
+    static const bk_driver_module_t module = {
+        BK_DRIVER_ABI_VERSION,
+        sizeof(bk_driver_module_t),
+        "ps2-mouse",
+        "Mouse PS/2 mediante controlador 8042",
+        ps2_mouse_driver_init,
+        NULL
+    };
+    return &module;
 }

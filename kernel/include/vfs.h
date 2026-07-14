@@ -4,9 +4,10 @@
 #include "types.h"
 #include "fat.h"
 
-#define VFS_MAX_PATH 128
+#define VFS_MAX_PATH 260
+#define VFS_MAX_NAME 256
 #define VFS_MAX_OPEN_FILES 8
-#define VFS_MAX_DIR_ENTRIES 64
+#define VFS_MAX_DIR_ENTRIES FAT_MAX_DIR_ENTRIES
 
 #define VFS_O_RDONLY 0x0001
 #define VFS_O_WRONLY 0x0002
@@ -19,7 +20,7 @@ typedef enum {
 } vfs_node_type_t;
 
 typedef struct {
-    char name[13];
+    char name[VFS_MAX_NAME];
     uint32_t size;
     vfs_node_type_t type;
     uint8_t attributes;
@@ -39,6 +40,9 @@ int vfs_read(int fd, void *buffer, uint32_t size);
 int vfs_write(int fd, const void *buffer, uint32_t size);
 bool vfs_close(int fd);
 bool vfs_mkdir(const char *path);
+bool vfs_remove(const char *path);
+bool vfs_rename(const char *old_path, const char *new_path);
+bool vfs_get_space(uint64_t *total_bytes, uint64_t *free_bytes);
 bool vfs_read_all(const char *path, void **buffer, uint32_t *size);
 bool vfs_write_all(const char *path, const void *buffer, uint32_t size);
 

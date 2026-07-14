@@ -109,6 +109,21 @@ void *kmemset(void *dst, int c, size_t n) {
 void *kmemcpy(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
+
+    /* Superficies, caches de ventanas y bloques del VFS llegan alineados. La
+     * implementación byte a byte multiplicaba por cuatro el trabajo del
+     * compositor en 32 bpp. Mantener el fallback conserva cualquier tamaño o
+     * alineación usados por drivers y cadenas. */
+    if ((((uintptr_t)d | (uintptr_t)s) & 3U) == 0U) {
+        uint32_t *dw = (uint32_t *)(void *)d;
+        const uint32_t *sw = (const uint32_t *)(const void *)s;
+        while (n >= sizeof(uint32_t)) {
+            *dw++ = *sw++;
+            n -= sizeof(uint32_t);
+        }
+        d = (uint8_t *)(void *)dw;
+        s = (const uint8_t *)(const void *)sw;
+    }
     while (n--) *d++ = *s++;
     return dst;
 }
@@ -224,7 +239,9 @@ void kfree(void *ptr) {
 
     heap_block_t *blk = (heap_block_t *)((uint8_t *)ptr - sizeof(heap_block_t));
     if (blk->magic != HEAP_MAGIC) {
-        kprintf("[MM] ERROR: intento de liberar bloque corrupto\n");
+        kprintf("[MM] ERROR: free corrupto ptr=%x magic=%x caller=%x\n",
+                (uint32_t)(uintptr_t)ptr, blk->magic,
+                (uint32_t)(uintptr_t)__builtin_return_address(0));
         task_preempt_enable();
         return;
     }

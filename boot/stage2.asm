@@ -23,10 +23,11 @@ KERNEL_START_LBA equ 9          ; LBA donde empieza el kernel en disco (Stage2 a
 FLOPPY_TRACK_SPAN equ 36
 FLOPPY_SECTORS_PER_TRACK equ 18
 BOOTINFO_ADDR    equ 0x0700     ; Datos de video que stage2 pasa al kernel
+BOOT_PART_LBA_SAVE equ 0x0504   ; BPB_HiddSec guardado por stage1 FAT32
 VBE_MODEINFO     equ 0x0800     ; Buffer temporal VBE mode info
 VBE_INFO         equ 0x0900     ; Buffer temporal VBE controller info (512 bytes)
 VBE_MAX_PRINTED  equ 18         ; Evita scrollear toda la pantalla si la BIOS lista demasiado
-VBE_DEFAULT_MODE equ 0x114      ; 800x600x16, modo VESA estandar
+VBE_DEFAULT_MODE equ 0x103      ; 800x600x8, modo VESA estandar
 
 ; Bootinfo extendido para pedir modos VGA desde el kernel.
 ; Magic 'VGA1' en little endian: bytes 56 47 41 31.
@@ -56,6 +57,8 @@ stage2_start:
     mov sp, 0x7C00
     sti
     mov [boot_drive], dl
+    mov eax, [BOOT_PART_LBA_SAVE]
+    mov [boot_part_lba], eax
 
     mov si, msg_stage2_hello
     call print_string
@@ -94,12 +97,10 @@ stage2_start:
     mov si, msg_kernel_ok
     call print_string
 
-    ; ----- Mostrar modos graficos antes de saltar a VESA -----
-    call select_video_mode
-
     ; ----- PASO 4: Entrar a Modo Protegido -----
     mov si, msg_entering_pm
     call print_string
+
     call setup_vesa
 
     ; Último momento en Real Mode: cargar GDTR
@@ -340,7 +341,9 @@ load_kernel:
     ; Leer en bloques pequenos para no cruzar limites de 64 KiB del BIOS.
     mov cx, KERNEL_SECTORS
     mov bx, KERNEL_LOAD_ADDR >> 4
-    mov dword [kern_dap_lba_lo], KERNEL_START_LBA
+    mov eax, [boot_part_lba]
+    add eax, KERNEL_START_LBA
+    mov dword [kern_dap_lba_lo], eax
     mov dword [kern_dap_lba_hi], 0
 
 .next_chunk:
@@ -478,6 +481,8 @@ select_video_mode:
 
     ; El kernel ya maneja estos bpp en vesa_attach_lfb().
     mov al, [VBE_MODEINFO + 25]
+    cmp al, 8
+    je .store_and_print
     cmp al, 16
     je .store_and_print
     cmp al, 24
@@ -681,6 +686,8 @@ setup_vesa:
     test word [VBE_MODEINFO], 0x0080
     jz .mode_failed
     mov al, [VBE_MODEINFO + 25]
+    cmp al, 8
+    je .set_mode
     cmp al, 16
     je .set_mode
     cmp al, 24
@@ -760,7 +767,15 @@ setup_vesa:
     ret
 
 vbe_mode_candidates:
-    dw VBE_DEFAULT_MODE, 0x115, 0x117, 0x118, 0x111, 0x112, 0
+    dw VBE_DEFAULT_MODE
+    dw 0x101, 0x105, 0x107
+    dw 0x111, 0x112, 0x114, 0x115, 0x117, 0x118
+    dw 0x100, 0x102, 0x104, 0x106
+    dw 0x110, 0x113, 0x116, 0x119
+    dw 0x11A, 0x11B, 0x11C, 0x11D, 0x11E, 0x11F
+    dw 0x120, 0x121, 0x122, 0x123, 0x124, 0x125
+    dw 0x140, 0x141, 0x142, 0x143, 0x144, 0x145
+    dw 0
 
 ; =============================================================================
 ; PRINT_STRING (16-bit, BIOS TTY)
@@ -896,6 +911,7 @@ kern_dap_segment  dw KERNEL_LOAD_ADDR >> 4
 kern_dap_lba_lo   dd KERNEL_START_LBA
 kern_dap_lba_hi   dd 0
 boot_drive        db 0
+boot_part_lba     dd 0
 
 ; Mensajes
 msg_stage2_hello    db 0x0D, 0x0A, '  [Stage 2] BleskernOS cargando...', 0x0D, 0x0A, 0

@@ -1,7 +1,4 @@
-#include "programs.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/rtc.h"
-#include "../kernel/include/task.h"
+#include "../kernel/include/api.h"
 
 #define CALENDAR_BUTTONS 3
 #define CALENDAR_BUTTON_PREV  0
@@ -132,7 +129,7 @@ static void calendar_make_date_text(char *out, int day, int month, int year) {
 static bool calendar_read_today(calendar_state_t *st) {
     rtc_date_t date;
 
-    if (!st || !rtc_get_date(&date)) return false;
+    if (!st || !bk_time_date(&date)) return false;
     if (date.year < 1 || date.month < 1 || date.month > 12 ||
         date.day < 1 || date.day > calendar_days_in_month(date.year, date.month))
         return false;
@@ -207,7 +204,7 @@ static int calendar_centered_text_x(int area_x, int area_w, const char *text) {
     if (!text || area_w <= 0) return area_x;
 
     /*
-     * Avoid gui_font_text_width() here because external .O programs may not
+     * Avoid bk_gui_font_text_width() here because external .O programs may not
      * have that symbol exported by the ELF loader. The current GUI font is
      * fixed-width 8 px, so this approximation is enough for calendar labels.
      */
@@ -222,7 +219,7 @@ static void calendar_draw_centered(gui_surface_t *surface, gui_rect_t rect,
 
     if (!surface || !text || rect.w <= 0 || rect.h <= 0) return;
     tx = calendar_centered_text_x(rect.x, rect.w, text);
-    gui_font_draw_string_clipped(surface, tx, rect.y + 7,
+    bk_gui_font_draw_string_clipped(surface, tx, rect.y + 7,
                                  text, color, rect);
 }
 
@@ -274,19 +271,19 @@ static void calendar_content(gui_window_t *window UNUSED,
     calendar_layout_buttons(st);
 
     x = st->window->bounds.x + margin;
-    y = st->window->bounds.y + GUI_TITLEBAR_HEIGHT + 8;
+    y = bk_gui_window_content_rect_raw(st->window).y + 8;
     w = st->window->bounds.w - (margin * 2);
     if (w <= 0) return;
 
     clip = (gui_rect_t){st->window->bounds.x + 2,
-                        st->window->bounds.y + GUI_TITLEBAR_HEIGHT,
+                        bk_gui_window_content_rect_raw(st->window).y,
                         st->window->bounds.w - 4,
-                        st->window->bounds.h - GUI_TITLEBAR_HEIGHT - 2};
+                        bk_gui_window_content_rect_raw(st->window).h - 2};
 
     /* Keep the month/year below the buttons. This avoids the old overlap
      * where "Julio 2026" could collide with the centered Hoy button. */
     calendar_make_title(text, st->view_month, st->view_year);
-    gui_font_draw_string_clipped(
+    bk_gui_font_draw_string_clipped(
         surface,
         calendar_centered_text_x(x, w, text),
         y + 36,
@@ -306,10 +303,10 @@ static void calendar_content(gui_window_t *window UNUSED,
     if (cell_h > 25) cell_h = 25;
     if (cell_h < 18) return;
 
-    gui_gfx_fill_rect(surface,
+    bk_gui_gfx_fill_rect(surface,
                       (gui_rect_t){x, grid_y - 4, cell_w * 7, 20},
                       0x00D0D0C8);
-    gui_gfx_draw_rect(surface,
+    bk_gui_gfx_draw_rect(surface,
                       (gui_rect_t){x, grid_y - 4, cell_w * 7, 20},
                       0x00808080);
 
@@ -338,8 +335,8 @@ static void calendar_content(gui_window_t *window UNUSED,
                 cell_w,
                 cell_h
             };
-            gui_gfx_fill_rect(surface, cell, 0x00F4F4EE);
-            gui_gfx_draw_rect(surface, cell, 0x00A0A0A0);
+            bk_gui_gfx_fill_rect(surface, cell, 0x00F4F4EE);
+            bk_gui_gfx_draw_rect(surface, cell, 0x00A0A0A0);
         }
     }
 
@@ -355,11 +352,11 @@ static void calendar_content(gui_window_t *window UNUSED,
         };
 
         if (today_visible && day == st->today_day) {
-            gui_gfx_fill_rect(surface,
+            bk_gui_gfx_fill_rect(surface,
                               (gui_rect_t){cell.x + 2, cell.y + 2,
                                            cell.w - 4, cell.h - 4},
                               0x00FFF0A8);
-            gui_gfx_draw_rect(surface,
+            bk_gui_gfx_draw_rect(surface,
                               (gui_rect_t){cell.x + 2, cell.y + 2,
                                            cell.w - 4, cell.h - 4},
                               0x00A07010);
@@ -381,7 +378,7 @@ static void calendar_content(gui_window_t *window UNUSED,
         calendar_strcpy(text, "RTC sin fecha valida");
     }
 
-    gui_font_draw_string_clipped(surface, x,
+    bk_gui_font_draw_string_clipped(surface, x,
                                  st->window->bounds.y + st->window->bounds.h - 18,
                                  text, 0x00304050, clip);
 }
@@ -428,13 +425,13 @@ static bool calendar_event(gui_window_t *window UNUSED,
 static void calendar_cleanup(calendar_state_t *st) {
     if (!st) return;
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
         st->window = NULL;
     }
     if (g_calendar == st) g_calendar = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 bool calendar_get_runtime_info(program_runtime_info_t *info) {
@@ -468,17 +465,17 @@ static void calendar_open_internal(gui_desktop_t *desktop, int x, int y) {
     if (g_calendar) {
         if (g_calendar->window) {
             if (!g_calendar->window->visible)
-                gui_window_restore(g_calendar->window);
+                bk_gui_window_restore(g_calendar->window);
             g_calendar->window->bounds.x = x;
             g_calendar->window->bounds.y = y;
-            gui_desktop_raise_window(desktop, g_calendar->window);
-            gui_desktop_focus_window(desktop, g_calendar->window);
+            bk_gui_desktop_raise_window(desktop, g_calendar->window);
+            bk_gui_focus_window(desktop, g_calendar->window);
             g_calendar->window->dirty = true;
         }
         return;
     }
 
-    st = (calendar_state_t *)kzalloc(sizeof(*st));
+    st = (calendar_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
 
     st->desktop = desktop;
@@ -487,7 +484,7 @@ static void calendar_open_internal(gui_desktop_t *desktop, int x, int y) {
     calendar_set_initial_date(st);
     g_calendar = st;
 
-    if (task_create("calendar", calendar_main, st) < 0) {
+    if (bk_proc_spawn_thread("calendar", calendar_main, st) < 0) {
         calendar_cleanup(st);
     }
 }
@@ -506,22 +503,25 @@ static void calendar_main(void *argument) {
 
     if (!st || !st->desktop) {
         calendar_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    task_set_memory_hint(sizeof(*st) +
+    bk_proc_set_memory_hint(sizeof(*st) +
                          (uint32_t)(CALENDAR_BUTTONS * sizeof(gui_widget_t)));
 
-    st->window = gui_desktop_create_window(st->desktop, st->initial_x, st->initial_y,
+    st->window = bk_gui_create_window(st->desktop, st->initial_x, st->initial_y,
                                            405, 285, "Calendario");
     if (st->window) {
-        gui_window_set_content(st->window, calendar_content, st);
-        gui_window_set_event_handler(st->window, calendar_event, st);
-        gui_window_set_min_size(st->window, 390, 260);
-        st->window->owner_pid = task_current_pid();
-        task_bind_window(st->window);
+        (void)bk_about_attach(st->window, st->desktop, &(bk_about_info_t){
+            "Calendario", "Version 1.0", "Calendario de BlesKernOS.",
+            "Bles.INC (C) 2026", "/ICONS/DATETIME.BMP"});
+        bk_gui_set_window_content(st->window, calendar_content, st);
+        bk_gui_set_window_event_handler(st->window, calendar_event, st);
+        bk_gui_set_window_min_size(st->window, 390, 260);
+        st->window->owner_pid = bk_sys_getpid();
+        bk_proc_bind_window(st->window);
 
-        button = gui_widget_create(st->desktop, st->window, GUI_WIDGET_BUTTON,
+        button = bk_gui_widget_create(st->desktop, st->window, GUI_WIDGET_BUTTON,
                                    (gui_rect_t){10, 8, 42, 24},
                                    "<", calendar_button);
         if (button) {
@@ -529,7 +529,7 @@ static void calendar_main(void *argument) {
             st->buttons[CALENDAR_BUTTON_PREV] = button;
         }
 
-        button = gui_widget_create(st->desktop, st->window, GUI_WIDGET_BUTTON,
+        button = bk_gui_widget_create(st->desktop, st->window, GUI_WIDGET_BUTTON,
                                    (gui_rect_t){156, 8, 76, 24},
                                    "Hoy", calendar_button);
         if (button) {
@@ -537,7 +537,7 @@ static void calendar_main(void *argument) {
             st->buttons[CALENDAR_BUTTON_TODAY] = button;
         }
 
-        button = gui_widget_create(st->desktop, st->window, GUI_WIDGET_BUTTON,
+        button = bk_gui_widget_create(st->desktop, st->window, GUI_WIDGET_BUTTON,
                                    (gui_rect_t){334, 8, 42, 24},
                                    ">", calendar_button);
         if (button) {
@@ -548,7 +548,7 @@ static void calendar_main(void *argument) {
         calendar_layout_buttons(st);
     }
 
-    while (!task_exit_requested()) {
+    while (!bk_proc_exit_requested()) {
         bool had_today = st->has_today;
         int old_y = st->today_year;
         int old_m = st->today_month;
@@ -562,11 +562,11 @@ static void calendar_main(void *argument) {
             st->window->dirty = true;
         }
 
-        task_sleep(16);
+        bk_sys_sleep_ticks(16);
     }
 
     calendar_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void calendar_install(gui_desktop_t *desktop UNUSED) {}

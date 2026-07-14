@@ -26,10 +26,23 @@ typedef struct {
     uint8_t last_error;
 } mouse_state_t;
 
+typedef struct {
+    bool (*is_present)(void);
+    void (*get_state)(mouse_state_t *state);
+    void (*set_bounds)(int32_t width, int32_t height);
+    void (*set_position)(int32_t x, int32_t y);
+    void (*set_sensitivity)(uint8_t sensitivity);
+    uint8_t (*get_sensitivity)(void);
+} mouse_driver_ops_t;
+
+bool mouse_register_driver(const mouse_driver_ops_t *ops);
+
 void mouse_init(void);
 bool mouse_is_present(void);
 void mouse_get_state(mouse_state_t *state);
 void mouse_set_bounds(int32_t width, int32_t height);
 void mouse_set_position(int32_t x, int32_t y);
+void mouse_set_sensitivity(uint8_t sensitivity);
+uint8_t mouse_get_sensitivity(void);
 
 #endif

@@ -2,6 +2,7 @@
 #include "../include/memory.h"
 #include "../include/vga.h"
 #include "../include/iso9660.h"
+#include "../include/bootsplash.h"
 
 typedef enum {
     VFS_FILE_FAT = 0,
@@ -12,6 +13,7 @@ typedef struct {
     bool used;
     uint32_t flags;
     uint32_t offset;
+    char path[VFS_MAX_PATH];
     vfs_file_source_t source;
     union {
         fat_dir_entry_t fat;
@@ -65,9 +67,26 @@ static bool path_append_component(char *out, const char *component) {
     return true;
 }
 
+static bool path_component_equals_ci(const char *a, const char *b) {
+    char ca;
+    char cb;
+
+    if (!a || !b) return false;
+    while (*a && *b) {
+        ca = *a;
+        cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 'a' + 'A');
+        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 'a' + 'A');
+        if (ca != cb) return false;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 static bool vfs_normalize_path(const char *path, char *out) {
     char raw[VFS_MAX_PATH];
-    char component[16];
+    char component[VFS_MAX_NAME];
     uint32_t rpos = 0;
 
     if (!path || !out || !path[0]) return false;
@@ -103,6 +122,8 @@ static bool vfs_normalize_path(const char *path, char *out) {
             path_pop(out);
             continue;
         }
+        if (path_component_equals_ci(component, "WALLPAPERS"))
+            kstrcpy(component, "WALLPAPR");
         if (!path_append_component(out, component)) return false;
     }
 
@@ -112,8 +133,6 @@ static bool vfs_normalize_path(const char *path, char *out) {
 void vfs_init(void) {
     kstrcpy(g_cwd, "/");
     kmemset(g_files, 0, sizeof(g_files));
-    if (iso9660_mount_default())
-        kprintf("[VFS] ISO9660 montado en /CDROM\n");
 }
 
 bool vfs_mount(const char *name) {
@@ -171,7 +190,7 @@ bool vfs_chdir(const char *path) {
 bool vfs_listdir(const char *path, vfs_dir_entry_t *entries, uint32_t max_entries, uint32_t *count) {
     fat_fs_t fs;
     fat_dir_entry_t dir;
-    fat_dir_entry_t fat_entries[VFS_MAX_DIR_ENTRIES];
+    fat_dir_entry_t *fat_entries;
     char full[VFS_MAX_PATH];
     uint32_t found = 0;
     const char *iso_path;
@@ -201,6 +220,7 @@ if (vfs_iso_path(full, &iso_path)) {
         kmemset(&entries[i], 0, sizeof(entries[i]));
         kstrncpy(entries[i].name, iso_entries[i].name,
                  sizeof(entries[i].name) - 1);
+        entries[i].name[sizeof(entries[i].name) - 1] = '\0';
         entries[i].size = iso_entries[i].size;
         entries[i].type = iso_entries[i].is_directory
                         ? VFS_NODE_DIR : VFS_NODE_FILE;
@@ -214,13 +234,19 @@ if (vfs_iso_path(full, &iso_path)) {
 
 if (!fat_get_current(&fs)) return false;
 
+fat_entries = (fat_dir_entry_t *)kmalloc(sizeof(*fat_entries) *
+                                         VFS_MAX_DIR_ENTRIES);
+if (!fat_entries) return false;
+
 if (!fat_resolve_path(&fs, full, &dir)) {
     kprintf("vfs: resolve fallo (%s)\n", full);
+    kfree(fat_entries);
     return false;
 }
 
 if (!dir.is_directory) {
     kprintf("vfs: no es directorio\n");
+    kfree(fat_entries);
     return false;
 }
 
@@ -229,12 +255,18 @@ if (max_entries > VFS_MAX_DIR_ENTRIES)
 
 if (!fat_list_dir(&fs, &dir, fat_entries, max_entries, &found)) {
     kprintf("vfs: fat_list_dir fallo\n");
+    kfree(fat_entries);
     return false;
 }
 
     for (uint32_t i = 0; i < found; i++) {
         kmemset(&entries[i], 0, sizeof(entries[i]));
-        kstrncpy(entries[i].name, fat_entries[i].name, sizeof(entries[i].name) - 1);
+        if (path_component_equals_ci(fat_entries[i].name, "WALLPAPR"))
+            kstrcpy(entries[i].name, "WALLPAPERS");
+        else
+            kstrncpy(entries[i].name, fat_entries[i].name,
+                     sizeof(entries[i].name) - 1);
+        entries[i].name[sizeof(entries[i].name) - 1] = '\0';
         entries[i].size = fat_entries[i].size;
         entries[i].attributes = fat_entries[i].attributes;
         entries[i].type = fat_entries[i].is_directory ? VFS_NODE_DIR : VFS_NODE_FILE;
@@ -248,6 +280,7 @@ if (!fat_list_dir(&fs, &dir, fat_entries, max_entries, &found)) {
         found++;
     }
     *count = found;
+    kfree(fat_entries);
     return true;
 }
 
@@ -258,8 +291,26 @@ int vfs_open(const char *path, uint32_t flags) {
     const char *iso_path;
     iso9660_entry_t iso_entry;
 
-    if (flags & VFS_O_WRONLY) return -1;
     if (!vfs_normalize_path(path, full)) return -1;
+    if (flags & VFS_O_WRONLY) {
+        if (vfs_iso_path(full, &iso_path)) return -1;
+        if (!fat_get_current(&fs)) return -1;
+        if (fat_resolve_path(&fs, full, &entry) && entry.is_directory)
+            return -1;
+        for (int i = 0; i < VFS_MAX_OPEN_FILES; i++) {
+            if (!g_files[i].used) {
+                g_files[i].used = true;
+                g_files[i].flags = flags;
+                g_files[i].offset = 0;
+                g_files[i].source = VFS_FILE_FAT;
+                kstrncpy(g_files[i].path, full, sizeof(g_files[i].path) - 1);
+                if (fat_resolve_path(&fs, full, &entry))
+                    g_files[i].entry.fat = entry;
+                return i;
+            }
+        }
+        return -1;
+    }
     if (vfs_iso_path(full, &iso_path)) {
         if (!iso9660_resolve(iso_path, &iso_entry) ||
             iso_entry.is_directory) return -1;
@@ -270,6 +321,7 @@ int vfs_open(const char *path, uint32_t flags) {
                 g_files[i].offset = 0;
                 g_files[i].source = VFS_FILE_ISO9660;
                 g_files[i].entry.iso = iso_entry;
+                kstrncpy(g_files[i].path, full, sizeof(g_files[i].path) - 1);
                 return i;
             }
         }
@@ -286,6 +338,7 @@ int vfs_open(const char *path, uint32_t flags) {
             g_files[i].offset = 0;
             g_files[i].source = VFS_FILE_FAT;
             g_files[i].entry.fat = entry;
+            kstrncpy(g_files[i].path, full, sizeof(g_files[i].path) - 1);
             return i;
         }
     }
@@ -310,9 +363,47 @@ int vfs_read(int fd, void *buffer, uint32_t size) {
     return (int)bytes_read;
 }
 
-int vfs_write(int fd, const void *buffer UNUSED, uint32_t size UNUSED) {
+int vfs_write(int fd, const void *buffer, uint32_t size) {
+    void *old_data = NULL;
+    uint32_t old_size = 0;
+    uint32_t new_size;
+    uint8_t *new_data;
+    fat_fs_t fs;
+    fat_dir_entry_t entry;
+
     if (fd < 0 || fd >= VFS_MAX_OPEN_FILES || !g_files[fd].used) return -1;
-    return -1;
+    if (!(g_files[fd].flags & VFS_O_WRONLY) || g_files[fd].source != VFS_FILE_FAT)
+        return -1;
+    if (size && !buffer) return -1;
+
+    new_size = g_files[fd].offset + size;
+    if (new_size < g_files[fd].offset) return -1;
+
+    (void)vfs_read_all(g_files[fd].path, &old_data, &old_size);
+    if (old_size > new_size) new_size = old_size;
+
+    new_data = (uint8_t *)kzalloc(new_size ? new_size : 1);
+    if (!new_data) {
+        if (old_data) kfree(old_data);
+        return -1;
+    }
+    if (old_data) {
+        kmemcpy(new_data, old_data, old_size);
+        kfree(old_data);
+    }
+    if (size) kmemcpy(new_data + g_files[fd].offset, buffer, size);
+
+    if (!vfs_write_all(g_files[fd].path, new_data, new_size)) {
+        kfree(new_data);
+        return -1;
+    }
+    kfree(new_data);
+
+    g_files[fd].offset += size;
+    if (fat_get_current(&fs) &&
+        fat_resolve_path(&fs, g_files[fd].path, &entry))
+        g_files[fd].entry.fat = entry;
+    return (int)size;
 }
 
 bool vfs_close(int fd) {
@@ -323,12 +414,42 @@ bool vfs_close(int fd) {
 
 bool vfs_mkdir(const char *path) {
     fat_fs_t fs;
+    fat_dir_entry_t existing;
     char full[VFS_MAX_PATH];
     const char *iso_path;
     if (!path || !fat_get_current(&fs) ||
         !vfs_normalize_path(path, full) ||
         vfs_iso_path(full, &iso_path)) return false;
+    if (fat_resolve_path(&fs, full, &existing))
+        return existing.is_directory;
     return fat_mkdir_path(&fs, full);
+}
+
+bool vfs_remove(const char *path) {
+    fat_fs_t fs;
+    char full[VFS_MAX_PATH];
+    const char *iso_path;
+    if (!path || !fat_get_current(&fs) ||
+        !vfs_normalize_path(path, full) || vfs_iso_path(full, &iso_path))
+        return false;
+    return fat_remove_path(&fs, full);
+}
+
+bool vfs_rename(const char *old_path, const char *new_path) {
+    fat_fs_t fs;
+    char old_full[VFS_MAX_PATH], new_full[VFS_MAX_PATH];
+    const char *iso_path;
+    if (!old_path || !new_path || !fat_get_current(&fs) ||
+        !vfs_normalize_path(old_path, old_full) ||
+        !vfs_normalize_path(new_path, new_full) ||
+        vfs_iso_path(old_full, &iso_path) || vfs_iso_path(new_full, &iso_path))
+        return false;
+    return fat_rename_path(&fs, old_full, new_full);
+}
+
+bool vfs_get_space(uint64_t *total_bytes, uint64_t *free_bytes) {
+    fat_fs_t fs;
+    return fat_get_current(&fs) && fat_get_space(&fs, total_bytes, free_bytes);
 }
 
 bool vfs_write_all(const char *path, const void *buffer, uint32_t size) {
@@ -381,7 +502,9 @@ bool vfs_read_all(const char *path, void **buffer, uint32_t *size) {
         kfree(data);
         return false;
     }
+    bootsplash_pulse();
     got = vfs_read(fd, data, file_size);
+    bootsplash_pulse();
     vfs_close(fd);
     if (got < 0 || (uint32_t)got != file_size) {
         kfree(data);

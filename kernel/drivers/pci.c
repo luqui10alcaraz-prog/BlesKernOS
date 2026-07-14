@@ -40,21 +40,17 @@ void pci_config_write32(uint8_t bus, uint8_t slot, uint8_t function, uint8_t off
 }
 
 void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t function, uint8_t offset, uint16_t value) {
-    uint32_t aligned = offset & 0xFC;
-    uint32_t shift = (uint32_t)(offset & 2) * 8;
-    uint32_t current = pci_config_read32(bus, slot, function, (uint8_t)aligned);
-    current &= ~(0xFFFFU << shift);
-    current |= ((uint32_t)value << shift);
-    pci_config_write32(bus, slot, function, (uint8_t)aligned, current);
+    uint16_t data_port = (uint16_t)(PCI_CONFIG_DATA + (offset & 2U));
+    outl(PCI_CONFIG_ADDRESS,
+         pci_make_address(bus, slot, function, offset));
+    /* A direct word write avoids replaying adjacent W1C status bits. */
+    __asm__ volatile ("outw %0, %1" : : "a"(value), "Nd"(data_port));
 }
 
 void pci_config_write8(uint8_t bus, uint8_t slot, uint8_t function, uint8_t offset, uint8_t value) {
-    uint32_t aligned = offset & 0xFC;
-    uint32_t shift = (uint32_t)(offset & 3) * 8;
-    uint32_t current = pci_config_read32(bus, slot, function, (uint8_t)aligned);
-    current &= ~(0xFFU << shift);
-    current |= ((uint32_t)value << shift);
-    pci_config_write32(bus, slot, function, (uint8_t)aligned, current);
+    outl(PCI_CONFIG_ADDRESS,
+         pci_make_address(bus, slot, function, offset));
+    outb((uint16_t)(PCI_CONFIG_DATA + (offset & 3U)), value);
 }
 
 static void pci_add_device(uint8_t bus, uint8_t slot, uint8_t function) {

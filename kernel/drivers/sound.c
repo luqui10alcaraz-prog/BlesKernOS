@@ -4,6 +4,7 @@
 #include "../include/pic.h"
 #include "../include/memory.h"
 #include "../include/vga.h"
+#include "../include/driver.h"
 
 #define PIT_BASE_FREQUENCY   1193182U
 #define U32_MAX_VALUE        0xFFFFFFFFU
@@ -42,7 +43,12 @@ typedef struct {
 typedef struct {
     const uint8_t *samples;
     uint32_t length;
-    uint32_t position_fp;
+    /*
+     * Posicion de fuente en formato 16.16. Debe ser de 64 bits: con 32 bits
+     * la parte entera se desborda al llegar a 65536 muestras y un WAV largo
+     * vuelve a reproducirse desde el principio.
+     */
+    uint64_t position_fp;
     uint32_t step_fp;
     uint8_t volume;
     volatile bool active;
@@ -604,4 +610,37 @@ bool sound_pcm_is_busy(void) {
 
 const char *sound_pcm_name(void) {
     return g_sb16.present ? "sb16" : "pc-speaker-only";
+}
+
+static bool sound_driver_init(void) {
+    static const sound_driver_ops_t ops = {
+        sound_poll,
+        sound_play,
+        sound_stop,
+        sound_beep,
+        sound_start_tone,
+        sound_play_pcm_u8,
+        sound_pcm_available,
+        sound_pcm_is_busy,
+        sound_has_sb16,
+        sound_sb16_play_tone,
+        sound_sb16_is_busy,
+        sound_pcm_name,
+        100U
+    };
+
+    sound_init();
+    return sound_register_driver(&ops);
+}
+
+const bk_driver_module_t *bleskernos_driver_query(void) {
+    static const bk_driver_module_t module = {
+        BK_DRIVER_ABI_VERSION,
+        sizeof(bk_driver_module_t),
+        "sb16",
+        "PC speaker y Sound Blaster 16",
+        sound_driver_init,
+        sound_stop
+    };
+    return &module;
 }

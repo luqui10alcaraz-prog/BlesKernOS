@@ -1,10 +1,5 @@
-#include "programs.h"
-#include "../kernel/include/keyboard.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/mouse.h"
-#include "../kernel/include/task.h"
-#include "../kernel/include/vfs.h"
-#include "../kernel/string.h"
+#include "../kernel/include/api.h"
+#include <string.h>
 
 #define EDIT_CAPACITY      4096
 #define EDIT_LINE_HEIGHT     10
@@ -14,6 +9,7 @@
 
 typedef struct {
     gui_rect_t text_rect;
+    gui_rect_t scroll_rect;
     gui_rect_t status_rect;
     int text_x;
     int text_y;
@@ -29,6 +25,8 @@ typedef struct {
     uint32_t length;
     uint32_t cursor;
     uint32_t selection_anchor;
+    int scroll_row;
+    gui_scrollbar_drag_t scrollbar_drag;
     bool mouse_selecting;
     char status[48];
 } editor_state_t;
@@ -36,10 +34,12 @@ typedef struct {
 static editor_state_t *g_editor;
 static char g_editor_clipboard[EDIT_CAPACITY];
 static void editor_main(void *argument);
+static void editor_row_col_for_index(const editor_state_t *st, uint32_t index,
+                                     int *row_out, uint32_t *col_out);
 
 static void editor_status(editor_state_t *st, const char *text) {
     if (!st) return;
-    kstrncpy(st->status, text ? text : "", sizeof(st->status) - 1);
+    bk_runtime_strncpy(st->status, text ? text : "", sizeof(st->status) - 1);
     st->status[sizeof(st->status) - 1] = '\0';
 }
 
@@ -48,8 +48,8 @@ static void editor_title(editor_state_t *st) {
 
     if (!st || !st->window) return;
     for (const char *p = st->path; *p; p++) if (*p == '/') name = p + 1;
-    kstrcpy(st->window->title, "Editor: ");
-    kstrncpy(st->window->title + 8, name, sizeof(st->window->title) - 9);
+    bk_runtime_strcpy(st->window->title, "Editor: ");
+    bk_runtime_strncpy(st->window->title + 8, name, sizeof(st->window->title) - 9);
     st->window->title[sizeof(st->window->title) - 1] = '\0';
 }
 
@@ -65,18 +65,20 @@ static void editor_build_layout(const editor_state_t *st,
     if (!st || !st->window || !layout) return;
 
     x = st->window->bounds.x + 7;
-    y = st->window->bounds.y + gui_window_content_top(st->window) + 6;
+    y = st->window->bounds.y + bk_gui_window_content_top(st->window) + 6;
     w = st->window->bounds.w - 14;
     bottom = st->window->bounds.y + st->window->bounds.h - GUI_BORDER_SIZE;
     h = bottom - y - status_h;
     if (h < 16) h = 16;
 
-    layout->text_rect = (gui_rect_t){x, y, w, h};
+    layout->text_rect = (gui_rect_t){x, y, w - GUI_SCROLLBAR_SIZE, h};
+    layout->scroll_rect = (gui_rect_t){x + w - GUI_SCROLLBAR_SIZE, y,
+                                       GUI_SCROLLBAR_SIZE, h};
     layout->status_rect = (gui_rect_t){x, y + h, w, status_h};
     layout->text_x = x + EDIT_TEXT_PAD_X;
     layout->text_y = y + EDIT_TEXT_PAD_Y;
     layout->visible_rows = (h - EDIT_TEXT_PAD_Y * 2) / EDIT_LINE_HEIGHT;
-    layout->visible_cols = (w - EDIT_TEXT_PAD_X * 2) / EDIT_CHAR_ADVANCE;
+    layout->visible_cols = (layout->text_rect.w - EDIT_TEXT_PAD_X * 2) / EDIT_CHAR_ADVANCE;
     if (layout->visible_rows < 1) layout->visible_rows = 1;
     if (layout->visible_cols < 1) layout->visible_cols = 1;
 }
@@ -147,6 +149,42 @@ static bool editor_line_span(const editor_state_t *st, int target_row,
     return false;
 }
 
+static int editor_line_count(const editor_state_t *st) {
+    int rows = 1;
+
+    if (!st) return 1;
+    for (uint32_t i = 0; i < st->length; i++) {
+        if (st->text[i] == '\n') rows++;
+    }
+    return rows < 1 ? 1 : rows;
+}
+
+static void editor_clamp_scroll(editor_state_t *st,
+                                const editor_layout_t *layout) {
+    int max_scroll;
+
+    if (!st || !layout) return;
+    max_scroll = editor_line_count(st) > layout->visible_rows
+        ? editor_line_count(st) - layout->visible_rows
+        : 0;
+    if (st->scroll_row > max_scroll) st->scroll_row = max_scroll;
+    if (st->scroll_row < 0) st->scroll_row = 0;
+}
+
+static void editor_ensure_cursor_visible(editor_state_t *st) {
+    editor_layout_t layout;
+    int row;
+    uint32_t col;
+
+    if (!st || !st->window) return;
+    editor_build_layout(st, &layout);
+    editor_row_col_for_index(st, st->cursor, &row, &col);
+    if (row < st->scroll_row) st->scroll_row = row;
+    if (row >= st->scroll_row + layout.visible_rows)
+        st->scroll_row = row - layout.visible_rows + 1;
+    editor_clamp_scroll(st, &layout);
+}
+
 static void editor_row_col_for_index(const editor_state_t *st, uint32_t index,
                                      int *row_out, uint32_t *col_out) {
     uint32_t pos = 0;
@@ -206,7 +244,7 @@ static uint32_t editor_hit_test(const editor_state_t *st,
     if (row >= layout->visible_rows) row = layout->visible_rows - 1;
     if (col >= layout->visible_cols) col = layout->visible_cols;
 
-    return editor_index_for_row_col(st, row, (uint32_t)col);
+    return editor_index_for_row_col(st, st->scroll_row + row, (uint32_t)col);
 }
 
 static void editor_delete_range(editor_state_t *st,
@@ -294,7 +332,7 @@ static void editor_paste_clipboard(editor_state_t *st) {
     uint32_t size;
 
     if (!st) return;
-    size = kstrlen(g_editor_clipboard);
+    size = bk_runtime_strlen(g_editor_clipboard);
     if (!size) {
         editor_status(st, "Portapapeles vacio");
         return;
@@ -338,18 +376,20 @@ static void editor_content(gui_window_t *window UNUSED,
     if (!st || !st->window || !st->window->visible) return;
 
     editor_build_layout(st, &layout);
+    editor_clamp_scroll(st, &layout);
     has_selection = editor_has_selection(st);
     if (has_selection) editor_selection_bounds(st, &sel_start, &sel_end);
 
-    gui_gfx_fill_rect(surface, layout.text_rect, 0x00FFFDF4);
-    gui_gfx_draw_rect(surface, layout.text_rect, 0x00808078);
+    bk_gui_gfx_fill_rect(surface, layout.text_rect, 0x00FFFDF4);
+    bk_gui_gfx_draw_rect(surface, layout.text_rect, 0x00808078);
 
     for (int row = 0; row < layout.visible_rows; row++) {
         uint32_t start;
         uint32_t end;
         int line_y = layout.text_y + row * EDIT_LINE_HEIGHT;
+        int doc_row = st->scroll_row + row;
 
-        if (!editor_line_span(st, row, &start, &end, NULL)) break;
+        if (!editor_line_span(st, doc_row, &start, &end, NULL)) break;
 
         for (uint32_t index = start; index < end; index++) {
             int col = (int)(index - start);
@@ -363,13 +403,13 @@ static void editor_content(gui_window_t *window UNUSED,
                        index < sel_end;
 
             if (selected) {
-                gui_gfx_fill_rect(surface,
+                bk_gui_gfx_fill_rect(surface,
                                   (gui_rect_t){cell_x, line_y,
                                                EDIT_CHAR_ADVANCE, 9},
                                   0x002E6FD5);
             }
 
-            gui_font_draw_char(surface, cell_x, line_y, st->text[index],
+            bk_gui_font_draw_char(surface, cell_x, line_y, st->text[index],
                                selected ? 0x00FFFFFF : 0x00202020,
                                0, false);
         }
@@ -380,19 +420,27 @@ static void editor_content(gui_window_t *window UNUSED,
 
             if (caret_col <= layout.visible_cols &&
                 caret_x < layout.text_rect.x + layout.text_rect.w - 1) {
-                gui_gfx_fill_rect(surface,
+                bk_gui_gfx_fill_rect(surface,
                                   (gui_rect_t){caret_x, line_y, 1, 8},
                                   has_selection ? 0x00FFFFFF : 0x00203050);
             }
         }
     }
+    {
+        gui_scrollbar_t scrollbar;
+        bk_gui_scrollbar_init_vertical(&scrollbar, layout.scroll_rect,
+                                    (uint32_t)st->scroll_row,
+                                    (uint32_t)layout.visible_rows,
+                                    (uint32_t)editor_line_count(st));
+        bk_gui_scrollbar_paint_vertical(surface, &scrollbar);
+    }
 
-    gui_gfx_fill_rect(surface, layout.status_rect, 0x00D0D0C8);
-    gui_gfx_fill_rect(surface,
+    bk_gui_gfx_fill_rect(surface, layout.status_rect, 0x00D0D0C8);
+    bk_gui_gfx_fill_rect(surface,
                       (gui_rect_t){layout.status_rect.x, layout.status_rect.y,
                                    layout.status_rect.w, 1},
                       0x00808078);
-    gui_font_draw_string_clipped(surface,
+    bk_gui_font_draw_string_clipped(surface,
                                  layout.status_rect.x + 4,
                                  layout.status_rect.y + 4,
                                  st->status, 0x00506070,
@@ -413,11 +461,11 @@ static void editor_file_menu(gui_window_t *window UNUSED, uint32_t item_id,
         st->selection_anchor = 0;
         st->mouse_selecting = false;
         st->text[0] = '\0';
-        kstrcpy(st->path, "/NEWTEXT.TXT");
+        bk_runtime_strcpy(st->path, "/NEWTEXT.TXT");
         editor_status(st, "Nuevo archivo");
         editor_title(st);
     } else if (item_id == 2) {
-        if (vfs_write_all(st->path, st->text, st->length))
+        if (bk_file_write_all(st->path, st->text, st->length))
             editor_status(st, "Guardado");
         else
             editor_status(st, "Error al guardar");
@@ -437,9 +485,31 @@ static bool editor_event(gui_window_t *window UNUSED,
     editor_build_layout(st, &layout);
     key = (uint8_t)event->key;
 
+    {
+        gui_scrollbar_t scrollbar;
+        uint32_t new_scroll;
+        bk_gui_scrollbar_init_vertical(&scrollbar, layout.scroll_rect,
+                                    (uint32_t)st->scroll_row,
+                                    (uint32_t)layout.visible_rows,
+                                    (uint32_t)editor_line_count(st));
+        if ((st->scrollbar_drag.active ||
+             bk_gui_rect_contains((gui_rect_t){layout.text_rect.x,
+                                             layout.text_rect.y,
+                                             layout.text_rect.w + layout.scroll_rect.w,
+                                             layout.text_rect.h},
+                               event->x, event->y)) &&
+            bk_gui_scrollbar_handle_event_vertical(&scrollbar,
+                &st->scrollbar_drag, event, 3, &new_scroll)) {
+            st->scroll_row = (int)new_scroll;
+            editor_clamp_scroll(st, &layout);
+            st->window->dirty = true;
+            return true;
+        }
+    }
+
     if (event->type == GUI_EVENT_MOUSE_DOWN) {
         if (event->button != MOUSE_LEFT_BUTTON ||
-            !gui_rect_contains(layout.text_rect, event->x, event->y))
+            !bk_gui_rect_contains(layout.text_rect, event->x, event->y))
             return false;
         editor_set_cursor(st, editor_hit_test(st, &layout, event->x, event->y),
                           false);
@@ -486,6 +556,18 @@ static bool editor_event(gui_window_t *window UNUSED,
         editor_move_vertical(st, -1, event->shift);
     } else if (key == KEY_DOWN) {
         editor_move_vertical(st, 1, event->shift);
+    } else if (key == KEY_PGUP) {
+        st->scroll_row -= layout.visible_rows;
+        editor_clamp_scroll(st, &layout);
+        editor_set_cursor(st,
+                          editor_index_for_row_col(st, st->scroll_row, 0),
+                          event->shift);
+    } else if (key == KEY_PGDN) {
+        st->scroll_row += layout.visible_rows;
+        editor_clamp_scroll(st, &layout);
+        editor_set_cursor(st,
+                          editor_index_for_row_col(st, st->scroll_row, 0),
+                          event->shift);
     } else if (key == KEY_BACKSPACE) {
         editor_backspace(st);
     } else if (key == KEY_DELETE) {
@@ -500,6 +582,7 @@ static bool editor_event(gui_window_t *window UNUSED,
         return false;
     }
 
+    editor_ensure_cursor_visible(st);
     if (st->window) st->window->dirty = true;
     return true;
 }
@@ -509,7 +592,7 @@ static bool editor_load_path(editor_state_t *st, const char *path) {
     uint32_t size = 0;
 
     if (!st || !path) return false;
-    if (!vfs_read_all(path, &data, &size)) return false;
+    if (!bk_file_read_all(path, &data, &size)) return false;
     if (size >= EDIT_CAPACITY) size = EDIT_CAPACITY - 1;
     if (size && !data) return false;
     if (size) memcpy(st->text, data, size);
@@ -519,9 +602,9 @@ static bool editor_load_path(editor_state_t *st, const char *path) {
     st->selection_anchor = size;
     st->mouse_selecting = false;
     editor_status(st, "Listo");
-    kstrncpy(st->path, path, sizeof(st->path) - 1);
+    bk_runtime_strncpy(st->path, path, sizeof(st->path) - 1);
     st->path[sizeof(st->path) - 1] = '\0';
-    kfree(data);
+    bk_sys_free(data);
 
     if (st->window) {
         editor_title(st);
@@ -533,13 +616,13 @@ static bool editor_load_path(editor_state_t *st, const char *path) {
 static void editor_cleanup(editor_state_t *st) {
     if (!st) return;
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
     }
-    if (st->text) kfree(st->text);
+    if (st->text) bk_sys_free(st->text);
     if (g_editor == st) g_editor = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 bool texteditor_get_runtime_info(program_runtime_info_t *info) {
@@ -556,25 +639,25 @@ void texteditor_open(gui_desktop_t *desktop, const char *path) {
 
     if (!desktop || !path) return;
 
-    st = (editor_state_t *)kzalloc(sizeof(*st));
+    st = (editor_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
 
     st->desktop = desktop;
-    st->text = (char *)kzalloc(EDIT_CAPACITY);
+    st->text = (char *)bk_sys_alloc_zero(EDIT_CAPACITY);
     if (!st->text) {
-        kfree(st);
+        bk_sys_free(st);
         return;
     }
 
     g_editor = st;
-    kstrcpy(st->path, "/NEWTEXT.TXT");
+    bk_runtime_strcpy(st->path, "/NEWTEXT.TXT");
     editor_status(st, "Listo");
 
     if (!editor_load_path(st, path)) {
         editor_cleanup(st);
         return;
     }
-    if (task_create("texteditor", editor_main, st) < 0) {
+    if (bk_proc_spawn_thread("texteditor", editor_main, st) < 0) {
         editor_cleanup(st);
     }
 }
@@ -588,34 +671,43 @@ static void editor_main(void *argument) {
 
     if (!st || !st->desktop) {
         editor_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    task_set_memory_hint(sizeof(*st) + EDIT_CAPACITY);
-    st->window = gui_desktop_create_window(st->desktop, 110, 45, 460, 250,
+    bk_proc_set_memory_hint(sizeof(*st) + EDIT_CAPACITY);
+    st->window = bk_gui_create_window(st->desktop, 110, 45, 460, 250,
                                            "Editor");
     if (st->window) {
-        int file_menu = gui_window_add_menu(st->window, "File");
-        gui_window_add_menu_item(st->window, file_menu, 1, "Nuevo",
+        int file_menu = bk_gui_add_menu(st->window, "File");
+        bk_gui_add_menu_item(st->window, file_menu, 1, "Nuevo",
                                  editor_file_menu, st);
-        gui_window_add_menu_item(st->window, file_menu, 2, "Guardar",
+        bk_gui_add_menu_item(st->window, file_menu, 2, "Guardar",
                                  editor_file_menu, st);
-        (void)gui_window_add_menu(st->window, "Edit");
-        gui_window_set_content(st->window, editor_content, st);
-        gui_window_set_event_handler(st->window, editor_event, st);
-        gui_window_set_min_size(st->window, 260, 160);
-        st->window->owner_pid = task_current_pid();
-        task_bind_window(st->window);
+        (void)bk_gui_add_menu(st->window, "Edit");
+        (void)bk_about_attach(st->window, st->desktop, &(bk_about_info_t){
+            "Editor", "Version 1.0", "Editor de texto de BlesKernOS.",
+            "Bles.INC (C) 2026", "/ICONS/EDITOR.BMP"});
+        bk_gui_set_window_content(st->window, editor_content, st);
+        bk_gui_set_window_event_handler(st->window, editor_event, st);
+        bk_gui_set_window_min_size(st->window, 260, 160);
+        st->window->owner_pid = bk_sys_getpid();
+        bk_proc_bind_window(st->window);
         editor_title(st);
     }
 
-    while (!task_exit_requested()) {
+    while (!bk_proc_exit_requested()) {
         if (!st->window || !st->window->listed) break;
-        task_sleep(4);
+        bk_sys_sleep_ticks(4);
     }
 
     editor_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void texteditor_install(gui_desktop_t *desktop UNUSED) {}
+
+void bleskernos_program_main(gui_desktop_t *desktop) {
+    const char *path = bk_app_launch_argument();
+
+    texteditor_open(desktop, (path && path[0]) ? path : "/README.TXT");
+}

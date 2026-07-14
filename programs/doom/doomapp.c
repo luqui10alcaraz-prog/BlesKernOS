@@ -1,7 +1,4 @@
-#include "../programs.h"
-#include "../../kernel/include/memory.h"
-#include "../../kernel/include/task.h"
-#include "../../kernel/include/vfs.h"
+#include "../../kernel/include/api.h"
 #include "../../kernel/stdio.h"
 #include "doom_port.h"
 #include "doomgeneric/doomgeneric.h"
@@ -26,7 +23,7 @@ static doom_state_t *g_doom;
 static void doom_copy_text(char *dst, size_t dst_size, const char *src) {
     if (!dst || dst_size == 0) return;
     if (!src) src = "";
-    kstrncpy(dst, src, dst_size - 1);
+    bk_runtime_strncpy(dst, src, dst_size - 1);
     dst[dst_size - 1] = '\0';
 }
 
@@ -52,9 +49,9 @@ static bool doom_find_wad(char *out, size_t out_size) {
     };
 
     for (uint32_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-        int fd = vfs_open(candidates[i], VFS_O_RDONLY);
+        int fd = bk_file_open(candidates[i], VFS_O_RDONLY);
         if (fd >= 0) {
-            vfs_close(fd);
+            bk_file_close(fd);
             doom_copy_text(out, out_size, candidates[i]);
             return true;
         }
@@ -71,17 +68,17 @@ static void doom_cleanup(doom_state_t *st) {
     doom_host_detach();
 
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
         st->window = NULL;
     }
     if (st->framebuffer) {
-        kfree(st->framebuffer);
+        bk_sys_free(st->framebuffer);
         st->framebuffer = NULL;
     }
     if (g_doom == st) g_doom = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 static void doom_exit_handler(int status) {
@@ -99,11 +96,11 @@ static void doom_content(gui_window_t *window, gui_surface_t *surface,
     if (!window || !surface || !st) return;
 
     body.x = window->bounds.x + 2;
-    body.y = window->bounds.y + gui_window_content_top(window);
+    body.y = window->bounds.y + bk_gui_window_content_top(window);
     body.w = window->bounds.w - 4;
-    body.h = window->bounds.h - gui_window_content_top(window) - 2;
+    body.h = window->bounds.h - bk_gui_window_content_top(window) - 2;
 
-    gui_gfx_fill_rect(surface, body, 0x00000000);
+    bk_gui_gfx_fill_rect(surface, body, 0x00000000);
 
     content_x = body.x + (body.w - DOOM_FB_WIDTH) / 2;
     content_y = body.y + (body.h - DOOM_FB_HEIGHT) / 2;
@@ -124,13 +121,13 @@ static void doom_content(gui_window_t *window, gui_surface_t *surface,
         return;
     }
 
-    gui_font_draw_string(surface, body.x + 18, body.y + 18,
+    bk_gui_font_draw_string(surface, body.x + 18, body.y + 18,
                          "DOOM para BlesKernOS", 0x00FFFFFF, 0, false);
-    gui_font_draw_string(surface, body.x + 18, body.y + 40,
+    bk_gui_font_draw_string(surface, body.x + 18, body.y + 40,
                          st->message[0] ? st->message
                                         : "Pon un WAD valido en /DOOM.",
                          0x00E0E0E0, 0, false);
-    gui_font_draw_string(surface, body.x + 18, body.y + 58,
+    bk_gui_font_draw_string(surface, body.x + 18, body.y + 58,
                          st->wad_path[0] ? st->wad_path
                                          : "Ejemplos: DOOM1.WAD o FREEDOOM1.WAD",
                          0x00C0C0C0, 0, false);
@@ -141,25 +138,25 @@ static void doom_main(void *argument) {
 
     if (!st || !st->desktop) {
         doom_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    task_set_memory_hint(sizeof(*st) +
+    bk_proc_set_memory_hint(sizeof(*st) +
                          (DOOM_FB_WIDTH * DOOM_FB_HEIGHT * sizeof(uint32_t)));
-    st->framebuffer = (uint32_t *)kzalloc(DOOM_FB_WIDTH * DOOM_FB_HEIGHT *
+    st->framebuffer = (uint32_t *)bk_sys_alloc_zero(DOOM_FB_WIDTH * DOOM_FB_HEIGHT *
                                           sizeof(uint32_t));
     if (!st->framebuffer) {
         doom_copy_text(st->message, sizeof(st->message), "Sin RAM para el framebuffer de Doom.");
     }
 
-    st->window = gui_desktop_create_window(st->desktop, 14, 18,
+    st->window = bk_gui_create_window(st->desktop, 14, 18,
                                            DOOM_WINDOW_W, DOOM_WINDOW_H,
                                            "Doom");
     if (st->window) {
-        gui_window_set_content(st->window, doom_content, st);
-        gui_window_set_min_size(st->window, DOOM_WINDOW_W, DOOM_WINDOW_H);
-        st->window->owner_pid = task_current_pid();
-        task_bind_window(st->window);
+        bk_gui_set_window_content(st->window, doom_content, st);
+        bk_gui_set_window_min_size(st->window, DOOM_WINDOW_W, DOOM_WINDOW_H);
+        st->window->owner_pid = bk_sys_getpid();
+        bk_proc_bind_window(st->window);
     }
 
     if (st->framebuffer && doom_find_wad(st->wad_path, sizeof(st->wad_path))) {
@@ -186,14 +183,14 @@ static void doom_main(void *argument) {
                        "No encontre un WAD. Copialo a /DOOM y reabre Doom.");
     }
 
-    while (!task_exit_requested()) {
+    while (!bk_proc_exit_requested()) {
         if (!st->window || !st->window->listed) break;
         if (st->running) doomgeneric_Tick();
-        task_sleep(1);
+        bk_sys_sleep_ticks(1);
     }
 
     doom_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void doom_open_from_desktop(gui_desktop_t *desktop) {
@@ -201,15 +198,15 @@ void doom_open_from_desktop(gui_desktop_t *desktop) {
 
     if (!desktop) return;
     if (g_doom && g_doom->window) {
-        gui_desktop_raise_window(desktop, g_doom->window);
-        gui_desktop_focus_window(desktop, g_doom->window);
+        bk_gui_desktop_raise_window(desktop, g_doom->window);
+        bk_gui_focus_window(desktop, g_doom->window);
         return;
     }
-    st = (doom_state_t *)kzalloc(sizeof(*st));
+    st = (doom_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
     st->desktop = desktop;
     g_doom = st;
-    if (task_create("doom", doom_main, st) < 0) {
+    if (bk_proc_spawn_thread("doom", doom_main, st) < 0) {
         doom_cleanup(st);
     }
 }

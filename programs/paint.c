@@ -1,3 +1,4 @@
+#include "../kernel/include/api.h"
 /*
  * BlesPaint - simple bitmap paint program for BlesKernOS
  *
@@ -10,9 +11,6 @@
  *  - fixed bucket fill after v4 border guard regression
  */
 
-#include "programs.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/task.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -360,7 +358,7 @@ static void paint_flood_fill(paint_state_t *st, int x, int y)
         return;
     }
 
-    queue = (paint_point_t *)kzalloc((uint32_t)(sizeof(paint_point_t) * max_points));
+    queue = (paint_point_t *)bk_sys_alloc_zero((uint32_t)(sizeof(paint_point_t) * max_points));
     if (!queue) {
         paint_status(st, "Sin memoria para cubeta");
         return;
@@ -380,7 +378,7 @@ static void paint_flood_fill(paint_state_t *st, int x, int y)
                             (int)p.x, (int)p.y - 1, target, replacement);
     }
 
-    kfree(queue);
+    bk_sys_free(queue);
     paint_status(st, "Relleno aplicado");
     if (st->window) st->window->dirty = true;
 }
@@ -401,7 +399,7 @@ static bool paint_build_bmp(paint_state_t *st, uint8_t **out_data, uint32_t *out
     pixel_bytes = row_stride * PAINT_CANVAS_H;
     file_size = 54 + pixel_bytes;
 
-    bmp = (uint8_t *)kzalloc(file_size);
+    bmp = (uint8_t *)bk_sys_alloc_zero(file_size);
     if (!bmp) return false;
 
     bmp[0] = 'B';
@@ -453,14 +451,14 @@ static bool paint_save_bmp(paint_state_t *st)
 
     file = fopen(path, "wb");
     if (!file) {
-        kfree(bmp);
+        bk_sys_free(bmp);
         paint_status(st, "Guardar fallo: fopen/VFS write no disponible");
         return false;
     }
 
     wrote = fwrite(bmp, 1, bmp_size, file);
     fclose(file);
-    kfree(bmp);
+    bk_sys_free(bmp);
 
     if ((uint32_t)wrote != bmp_size) {
         paint_status(st, "Guardar fallo: escritura incompleta");
@@ -474,7 +472,7 @@ static bool paint_save_bmp(paint_state_t *st)
 
 static gui_rect_t paint_canvas_rect(const gui_window_t *window)
 {
-    int top = gui_window_content_top(window);
+    int top = bk_gui_window_content_top(window);
     return (gui_rect_t){
         window->bounds.x + 12,
         window->bounds.y + top + 64,
@@ -495,7 +493,7 @@ static gui_rect_t paint_name_rect(const gui_window_t *window)
 
 static gui_rect_t paint_button_rect(const gui_window_t *window, int index)
 {
-    int top = gui_window_content_top(window);
+    int top = bk_gui_window_content_top(window);
     return (gui_rect_t){
         window->bounds.x + 12 + index * 60,
         window->bounds.y + top + 8,
@@ -519,7 +517,7 @@ static gui_rect_t paint_palette_rect(const gui_window_t *window, int index)
 
 static gui_rect_t paint_brush_rect(const gui_window_t *window, int index)
 {
-    int top = gui_window_content_top(window);
+    int top = bk_gui_window_content_top(window);
     return (gui_rect_t){
         window->bounds.x + 332 + index * 30,
         window->bounds.y + top + 9,
@@ -534,13 +532,13 @@ static void paint_draw_relief(gui_surface_t *surface, gui_rect_t rect, bool pres
     uint32_t dark = pressed ? 0x00FFFFFF : 0x00606060;
     uint32_t mid = 0x00A0A0A0;
 
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y, rect.w, 1}, light);
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y, 1, rect.h}, light);
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y + rect.h - 1, rect.w, 1}, dark);
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + rect.w - 1, rect.y, 1, rect.h}, dark);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y, rect.w, 1}, light);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y, 1, rect.h}, light);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y + rect.h - 1, rect.w, 1}, dark);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + rect.w - 1, rect.y, 1, rect.h}, dark);
 
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + 1, rect.y + rect.h - 2, rect.w - 2, 1}, mid);
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + rect.w - 2, rect.y + 1, 1, rect.h - 2}, mid);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + 1, rect.y + rect.h - 2, rect.w - 2, 1}, mid);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + rect.w - 2, rect.y + 1, 1, rect.h - 2}, mid);
 }
 
 static void paint_draw_button(gui_surface_t *surface, gui_rect_t rect,
@@ -550,7 +548,7 @@ static void paint_draw_button(gui_surface_t *surface, gui_rect_t rect,
     int text_x = rect.x + 6;
     int text_y = rect.y + 8;
 
-    gui_gfx_fill_rect(surface, rect, fill);
+    bk_gui_gfx_fill_rect(surface, rect, fill);
     paint_draw_relief(surface, rect, active);
 
     if (active) {
@@ -558,7 +556,7 @@ static void paint_draw_button(gui_surface_t *surface, gui_rect_t rect,
         text_y++;
     }
 
-    gui_font_draw_string_clipped(surface, text_x, text_y,
+    bk_gui_font_draw_string_clipped(surface, text_x, text_y,
                                  text, 0x00000000, rect);
 }
 
@@ -567,9 +565,9 @@ static void paint_draw_brush_button(gui_surface_t *surface, gui_rect_t rect,
 {
     uint32_t fill = active ? 0x00BFE7FF : 0x00E8E8E8;
 
-    gui_gfx_fill_rect(surface, rect, fill);
+    bk_gui_gfx_fill_rect(surface, rect, fill);
     paint_draw_relief(surface, rect, active);
-    gui_font_draw_string_clipped(surface, rect.x + 7, rect.y + 7,
+    bk_gui_font_draw_string_clipped(surface, rect.x + 7, rect.y + 7,
                                  text, 0x00000000, rect);
 }
 
@@ -594,8 +592,8 @@ static void paint_draw_preview(paint_state_t *st, gui_surface_t *surface,
     y1 = canvas_rect.y + st->preview_y;
 
     if (st->tool == PAINT_TOOL_LINE) {
-        gui_gfx_draw_line(surface, x0, y0, x1, y1, preview_color);
-        gui_gfx_draw_line(surface, x0 + 1, y0, x1 + 1, y1, preview_color);
+        bk_gui_gfx_draw_line(surface, x0, y0, x1, y1, preview_color);
+        bk_gui_gfx_draw_line(surface, x0 + 1, y0, x1 + 1, y1, preview_color);
     } else {
         int left = x0 < x1 ? x0 : x1;
         int right = x0 < x1 ? x1 : x0;
@@ -603,8 +601,8 @@ static void paint_draw_preview(paint_state_t *st, gui_surface_t *surface,
         int bottom = y0 < y1 ? y1 : y0;
 
         r = (gui_rect_t){left, top, right - left + 1, bottom - top + 1};
-        gui_gfx_draw_rect(surface, r, preview_color);
-        gui_gfx_draw_rect(surface, (gui_rect_t){r.x + 1, r.y + 1, r.w - 2, r.h - 2},
+        bk_gui_gfx_draw_rect(surface, r, preview_color);
+        bk_gui_gfx_draw_rect(surface, (gui_rect_t){r.x + 1, r.y + 1, r.w - 2, r.h - 2},
                           preview_color);
     }
 }
@@ -632,9 +630,9 @@ static void paint_draw_name_box(paint_state_t *st, gui_window_t *window,
     }
     line[pos] = '\0';
 
-    gui_gfx_fill_rect(surface, box, st->editing_name ? 0x00FFFFFF : 0x00EFEFEF);
-    gui_gfx_draw_rect(surface, box, st->editing_name ? 0x00000000 : 0x00808080);
-    gui_font_draw_string_clipped(surface, box.x + 5, box.y + 5,
+    bk_gui_gfx_fill_rect(surface, box, st->editing_name ? 0x00FFFFFF : 0x00EFEFEF);
+    bk_gui_gfx_draw_rect(surface, box, st->editing_name ? 0x00000000 : 0x00808080);
+    bk_gui_font_draw_string_clipped(surface, box.x + 5, box.y + 5,
                                  line, 0x00000000, box);
 }
 
@@ -651,12 +649,12 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
 
     clip = (gui_rect_t){
         window->bounds.x + GUI_BORDER_SIZE,
-        window->bounds.y + gui_window_content_top(window),
+        window->bounds.y + bk_gui_window_content_top(window),
         window->bounds.w - GUI_BORDER_SIZE * 2,
-        window->bounds.h - gui_window_content_top(window) - GUI_BORDER_SIZE
+        window->bounds.h - bk_gui_window_content_top(window) - GUI_BORDER_SIZE
     };
 
-    gui_gfx_fill_rect(surface, clip, 0x00DCDCDC);
+    bk_gui_gfx_fill_rect(surface, clip, 0x00DCDCDC);
 
     paint_draw_button(surface, paint_button_rect(window, 0), "Pencil",
                       st->tool == PAINT_TOOL_PENCIL);
@@ -668,9 +666,9 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
     paint_draw_button(surface, paint_button_rect(window, 4), "Save", false);
 
     label_rect = (gui_rect_t){window->bounds.x + 332,
-                              window->bounds.y + gui_window_content_top(window) + 36,
+                              window->bounds.y + bk_gui_window_content_top(window) + 36,
                               150, 18};
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  "Brush", 0x00000000, label_rect);
 
     for (int i = 0; i < 5; i++) {
@@ -680,7 +678,7 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
     }
 
     canvas_rect = paint_canvas_rect(window);
-    gui_gfx_fill_rect(surface,
+    bk_gui_gfx_fill_rect(surface,
                       (gui_rect_t){canvas_rect.x - 2, canvas_rect.y - 2,
                                    canvas_rect.w + 4, canvas_rect.h + 4},
                       0x00606060);
@@ -688,13 +686,13 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
     if (st->canvas) {
         for (int y = 0; y < PAINT_CANVAS_H; y++) {
             for (int x = 0; x < PAINT_CANVAS_W; x++) {
-                gui_gfx_putpixel(surface, canvas_rect.x + x, canvas_rect.y + y,
+                bk_gui_gfx_putpixel(surface, canvas_rect.x + x, canvas_rect.y + y,
                                  st->canvas[(uint32_t)y * PAINT_CANVAS_W + (uint32_t)x]);
             }
         }
     } else {
-        gui_gfx_fill_rect(surface, canvas_rect, PAINT_COLOR_WHITE);
-        gui_font_draw_string_clipped(surface, canvas_rect.x + 8, canvas_rect.y + 8,
+        bk_gui_gfx_fill_rect(surface, canvas_rect, PAINT_COLOR_WHITE);
+        bk_gui_font_draw_string_clipped(surface, canvas_rect.x + 8, canvas_rect.y + 8,
                                      "Sin memoria para canvas", 0x00000000,
                                      canvas_rect);
     }
@@ -705,37 +703,37 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
                               canvas_rect.y,
                               150,
                               18};
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  paint_tool_name(st->tool), 0x00000000,
                                  label_rect);
     label_rect.y += 16;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  st->status, 0x00000000,
                                  label_rect);
     label_rect.y += 18;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  "Keys: S save", 0x00000000,
                                  label_rect);
     label_rect.y += 14;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  "C clean", 0x00000000,
                                  label_rect);
     label_rect.y += 14;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  "P/E/F/L/R", 0x00000000,
                                  label_rect);
     label_rect.y += 22;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  "Colors", 0x00000000,
                                  label_rect);
 
     for (int i = 0; i < (int)(sizeof(g_palette) / sizeof(g_palette[0])); i++) {
         r = paint_palette_rect(window, i);
-        gui_gfx_fill_rect(surface, r, g_palette[i]);
-        gui_gfx_draw_rect(surface, r,
+        bk_gui_gfx_fill_rect(surface, r, g_palette[i]);
+        bk_gui_gfx_draw_rect(surface, r,
                           st->color == g_palette[i] ? 0x00FFFFFF : 0x00404040);
         if (st->color == g_palette[i]) {
-            gui_gfx_draw_rect(surface,
+            bk_gui_gfx_draw_rect(surface,
                               (gui_rect_t){r.x - 1, r.y - 1, r.w + 2, r.h + 2},
                               0x00000000);
         }
@@ -1054,19 +1052,19 @@ static void paint_cleanup(paint_state_t *st)
     if (!st) return;
 
     if (st->canvas) {
-        kfree(st->canvas);
+        bk_sys_free(st->canvas);
         st->canvas = NULL;
     }
 
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
         st->window = NULL;
     }
 
     if (g_paint == st) g_paint = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 bool paint_get_runtime_info(program_runtime_info_t *info)
@@ -1084,13 +1082,13 @@ static void paint_main(void *argument)
 
     if (!st || !st->desktop) {
         paint_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    task_set_memory_hint((uint32_t)sizeof(*st) +
+    bk_proc_set_memory_hint((uint32_t)sizeof(*st) +
                          (uint32_t)(PAINT_CANVAS_W * PAINT_CANVAS_H * sizeof(uint32_t)));
 
-    st->canvas = (uint32_t *)kzalloc((uint32_t)(PAINT_CANVAS_W * PAINT_CANVAS_H * sizeof(uint32_t)));
+    st->canvas = (uint32_t *)bk_sys_alloc_zero((uint32_t)(PAINT_CANVAS_W * PAINT_CANVAS_H * sizeof(uint32_t)));
     if (st->canvas) {
         paint_canvas_clear(st, PAINT_COLOR_WHITE);
     }
@@ -1103,61 +1101,64 @@ static void paint_main(void *argument)
     st->preview_y = 0;
     paint_status(st, "Click abajo para nombrar BMP");
 
-    st->window = gui_desktop_create_window(st->desktop, 85, 45,
+    st->window = bk_gui_create_window(st->desktop, 85, 45,
                                            PAINT_WINDOW_W, PAINT_WINDOW_H,
                                            "Paint");
     if (!st->window) {
         paint_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    gui_window_set_min_size(st->window, PAINT_WINDOW_W, PAINT_WINDOW_H);
-    gui_window_set_content(st->window, paint_content, st);
-    gui_window_set_event_handler(st->window, paint_event, st);
+    bk_gui_set_window_min_size(st->window, PAINT_WINDOW_W, PAINT_WINDOW_H);
+    bk_gui_set_window_content(st->window, paint_content, st);
+    bk_gui_set_window_event_handler(st->window, paint_event, st);
 
     if (!st->window->menu_count) {
-        int file_menu = gui_window_add_menu(st->window, "File");
-        gui_window_add_menu_item(st->window, file_menu, 1, "Nuevo",
+        int file_menu = bk_gui_add_menu(st->window, "File");
+        bk_gui_add_menu_item(st->window, file_menu, 1, "Nuevo",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, file_menu, 2, "Guardar BMP",
-                                 paint_menu, st);
-
-        int tool_menu = gui_window_add_menu(st->window, "Tool");
-        gui_window_add_menu_item(st->window, tool_menu, 3, "Lapiz",
-                                 paint_menu, st);
-        gui_window_add_menu_item(st->window, tool_menu, 4, "Goma",
-                                 paint_menu, st);
-        gui_window_add_menu_item(st->window, tool_menu, 5, "Cubeta",
-                                 paint_menu, st);
-        gui_window_add_menu_item(st->window, tool_menu, 6, "Linea",
-                                 paint_menu, st);
-        gui_window_add_menu_item(st->window, tool_menu, 7, "Rectangulo",
+        bk_gui_add_menu_item(st->window, file_menu, 2, "Guardar BMP",
                                  paint_menu, st);
 
-        int brush_menu = gui_window_add_menu(st->window, "Brush");
-        gui_window_add_menu_item(st->window, brush_menu, 10, "1 px",
+        int tool_menu = bk_gui_add_menu(st->window, "Tool");
+        bk_gui_add_menu_item(st->window, tool_menu, 3, "Lapiz",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, brush_menu, 11, "2 px",
+        bk_gui_add_menu_item(st->window, tool_menu, 4, "Goma",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, brush_menu, 12, "4 px",
+        bk_gui_add_menu_item(st->window, tool_menu, 5, "Cubeta",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, brush_menu, 13, "8 px",
+        bk_gui_add_menu_item(st->window, tool_menu, 6, "Linea",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, brush_menu, 14, "12 px",
+        bk_gui_add_menu_item(st->window, tool_menu, 7, "Rectangulo",
+                                 paint_menu, st);
+
+        int brush_menu = bk_gui_add_menu(st->window, "Brush");
+        bk_gui_add_menu_item(st->window, brush_menu, 10, "1 px",
+                                 paint_menu, st);
+        bk_gui_add_menu_item(st->window, brush_menu, 11, "2 px",
+                                 paint_menu, st);
+        bk_gui_add_menu_item(st->window, brush_menu, 12, "4 px",
+                                 paint_menu, st);
+        bk_gui_add_menu_item(st->window, brush_menu, 13, "8 px",
+                                 paint_menu, st);
+        bk_gui_add_menu_item(st->window, brush_menu, 14, "12 px",
                                  paint_menu, st);
     }
+    (void)bk_about_attach(st->window, st->desktop, &(bk_about_info_t){
+        "Paint", "Version 1.0", "Editor de imagenes BMP de BlesKernOS.",
+        "Bles.INC (C) 2026", "/ICONS/IMAGE.BMP"});
 
-    st->window->owner_pid = task_current_pid();
-    task_bind_window(st->window);
+    st->window->owner_pid = bk_sys_getpid();
+    bk_proc_bind_window(st->window);
     st->window->dirty = true;
 
-    while (!task_exit_requested()) {
+    while (!bk_proc_exit_requested()) {
         if (!st->window || !st->window->listed) break;
-        task_sleep(5);
+        bk_sys_sleep_ticks(5);
     }
 
     paint_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void paint_open_from_desktop(gui_desktop_t *desktop)
@@ -1167,19 +1168,19 @@ void paint_open_from_desktop(gui_desktop_t *desktop)
     if (!desktop) return;
 
     if (g_paint && g_paint->window) {
-        gui_window_restore(g_paint->window);
-        gui_desktop_raise_window(desktop, g_paint->window);
-        gui_desktop_focus_window(desktop, g_paint->window);
+        bk_gui_window_restore(g_paint->window);
+        bk_gui_desktop_raise_window(desktop, g_paint->window);
+        bk_gui_focus_window(desktop, g_paint->window);
         return;
     }
 
-    st = (paint_state_t *)kzalloc(sizeof(*st));
+    st = (paint_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
 
     st->desktop = desktop;
     g_paint = st;
 
-    if (task_create("paint", paint_main, st) < 0) {
+    if (bk_proc_spawn_thread("paint", paint_main, st) < 0) {
         paint_cleanup(st);
     }
 }
@@ -1187,4 +1188,8 @@ void paint_open_from_desktop(gui_desktop_t *desktop)
 void paint_install(gui_desktop_t *desktop)
 {
     (void)desktop;
+}
+
+void bleskernos_program_main(gui_desktop_t *desktop) {
+    paint_open_from_desktop(desktop);
 }

@@ -1,0 +1,11 @@
+#include "resource_ids.h"
+
+IDM_STAGE7 MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&Open", IDM_OPEN
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit", IDM_EXIT
+    END
+END

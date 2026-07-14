@@ -43,7 +43,12 @@ bool gfx_has_vesa_lfb(void);
 bool gfx_can_change_mode(void);
 bool gfx_list_display_modes(gfx_display_mode_t *modes, uint32_t max_modes,
                             uint32_t *count);
+bool gfx_list_all_display_modes(gfx_display_mode_t *modes, uint32_t max_modes,
+                                uint32_t *count);
 bool gfx_set_display_mode(uint16_t width, uint16_t height, uint8_t bpp);
+bool gfx_enable_page_flip(void);
+uint32_t gfx_page_flip_draw_buffer(void);
+bool gfx_page_flip_commit(void);
 void gfx_set_palette_color(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
 void gfx_set_default_palette(void);
 void gfx_clear(uint8_t color);

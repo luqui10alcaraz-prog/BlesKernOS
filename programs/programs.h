@@ -41,9 +41,6 @@ void gears_install(gui_desktop_t *desktop);
 void gears_open_from_desktop(gui_desktop_t *desktop);
 void paint_install(gui_desktop_t *desktop);
 void paint_open_from_desktop(gui_desktop_t *desktop);
-void settings_install(gui_desktop_t *desktop);
-void settings_open_from_desktop(gui_desktop_t *desktop);
-
 void screensaverd_install(gui_desktop_t *desktop);
 bool screensaver_is_enabled(void);
 uint32_t screensaver_get_timeout_seconds(void);
@@ -52,14 +49,21 @@ void screensaver_set_timeout_seconds(uint32_t seconds);
 const char *screensaver_get_path(void);
 void screensaver_set_path(const char *path);
 bool screensaver_preview(gui_desktop_t *desktop);
+void bk_input_mouse_set_sensitivity(uint8_t sensitivity);
+uint8_t bk_input_mouse_get_sensitivity(void);
 
 void deskmanager_set_background(uint32_t color);
 uint32_t deskmanager_get_background(void);
+const char *deskmanager_get_wallpaper_path(void);
 bool deskmanager_set_wallpaper(const char *path);
 void deskmanager_refresh_layout(void);
 
 bool program_is_object(const char *path);
+bool program_is_win32_executable(const char *path);
 bool program_execute_path(gui_desktop_t *desktop, const char *path);
+bool program_execute_path_arg(gui_desktop_t *desktop, const char *path,
+                              const char *launch_arg);
+const char *program_launch_arg(void);
 uint32_t *program_load_bmp_icon(const char *path);
 uint32_t *program_load_bmp_icon_scaled(const char *path,
                                        uint16_t output_width,

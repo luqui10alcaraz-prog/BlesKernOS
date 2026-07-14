@@ -8,8 +8,10 @@
 #define GDT_USER_CODE   0x1B
 #define GDT_USER_DATA   0x23
 #define GDT_TSS         0x28
+#define GDT_USER_FS     0x33
 
 void gdt_init(void);
 void tss_set_kernel_stack(uint32_t stack_top);
+void gdt_set_user_fs_base(uint32_t base);
 
 #endif

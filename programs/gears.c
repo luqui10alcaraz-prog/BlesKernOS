@@ -2,13 +2,10 @@
  * BlesGears - TinyGL gears demo for BlesKernOS
  *
  * Based on TinyGL examples/raw/gears.c, adapted to a BlesKernOS GUI window.
- * This first port is intended as an internal app linked into the kernel build.
+ * Built as an external /SYSTEM/PROGRAMS app.
  */
 
-#include "programs.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/pit.h"
-#include "../kernel/include/task.h"
+#include "../kernel/include/api.h"
 #include <math.h>
 #include <stdint.h>
 #include <TGL/gl.h>
@@ -309,7 +306,7 @@ static bool gears_init_gl(gears_state_t *st)
 
     if (!st) return false;
 
-    st->pixels = (PIXEL *)kzalloc((uint32_t)(GEARS_W * GEARS_H * sizeof(PIXEL)));
+    st->pixels = (PIXEL *)bk_sys_alloc_zero((uint32_t)(GEARS_W * GEARS_H * sizeof(PIXEL)));
     if (!st->pixels) return false;
 
     st->framebuffer = ZB_open(GEARS_W, GEARS_H,
@@ -380,7 +377,7 @@ static void gears_content(gui_window_t *window, gui_surface_t *surface,
 
     if (!st || !window || !surface || !window->visible) return;
 
-    content_top = gui_window_content_top(window);
+    content_top = bk_gui_window_content_top(window);
     x0 = window->bounds.x + ((window->bounds.w - GEARS_W) / 2);
     y0 = window->bounds.y + content_top + 8;
     if (x0 < window->bounds.x + GUI_BORDER_SIZE) x0 = window->bounds.x + GUI_BORDER_SIZE;
@@ -391,10 +388,10 @@ static void gears_content(gui_window_t *window, gui_surface_t *surface,
                         window->bounds.w - (GUI_BORDER_SIZE * 2),
                         window->bounds.h - content_top - GUI_BORDER_SIZE};
 
-    gui_gfx_fill_rect(surface, clip, 0x00000000);
+    bk_gui_gfx_fill_rect(surface, clip, 0x00000000);
 
     if (!st->pixels) {
-        gui_font_draw_string_clipped(surface, clip.x + 8, clip.y + 8,
+        bk_gui_font_draw_string_clipped(surface, clip.x + 8, clip.y + 8,
                                      "TinyGL init failed", 0x00FFFFFF, clip);
         return;
     }
@@ -405,7 +402,7 @@ static void gears_content(gui_window_t *window, gui_surface_t *surface,
         for (int x = 0; x < GEARS_W; x++) {
             int sx = x0 + x;
             if (sx < clip.x || sx >= clip.x + clip.w) continue;
-            gui_gfx_putpixel(surface, sx, sy,
+            bk_gui_gfx_putpixel(surface, sx, sy,
                              gears_pixel_to_rgb(st->pixels[y * GEARS_W + x]));
         }
     }
@@ -445,16 +442,16 @@ static void gears_cleanup(gears_state_t *st)
         glClose();
     }
 
-    if (st->pixels) kfree(st->pixels);
+    if (st->pixels) bk_sys_free(st->pixels);
 
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
     }
 
     if (g_gears == st) g_gears = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 bool gears_get_runtime_info(program_runtime_info_t *info)
@@ -473,26 +470,30 @@ static void gears_main(void *argument)
 
     if (!st || !st->desktop) {
         gears_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    task_set_memory_hint((uint32_t)sizeof(*st) +
+    bk_proc_set_memory_hint((uint32_t)sizeof(*st) +
                          (uint32_t)(GEARS_W * GEARS_H * sizeof(PIXEL)) +
                          (uint32_t)(GEARS_W * GEARS_H * sizeof(GLushort)));
 
-    st->window = gui_desktop_create_window(st->desktop, 120, 45,
+    st->window = bk_gui_create_window(st->desktop, 120, 45,
                                            GEARS_WINDOW_W, GEARS_WINDOW_H,
                                            "BlesGears TinyGL");
     if (!st->window) {
         gears_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    gui_window_set_min_size(st->window, GEARS_WINDOW_W, GEARS_WINDOW_H);
-    gui_window_set_content(st->window, gears_content, st);
-    gui_window_set_event_handler(st->window, gears_event, st);
-    st->window->owner_pid = task_current_pid();
-    task_bind_window(st->window);
+    (void)bk_about_attach(st->window, st->desktop, &(bk_about_info_t){
+        "Gears", "Version 1.0", "Demostracion grafica OpenGL.",
+        "Bles.INC (C) 2026", "/ICONS/OBJECT.BMP"});
+
+    bk_gui_set_window_min_size(st->window, GEARS_WINDOW_W, GEARS_WINDOW_H);
+    bk_gui_set_window_content(st->window, gears_content, st);
+    bk_gui_set_window_event_handler(st->window, gears_event, st);
+    st->window->owner_pid = bk_sys_getpid();
+    bk_proc_bind_window(st->window);
 
     if (!gears_init_gl(st)) {
         st->window->dirty = true;
@@ -501,23 +502,23 @@ static void gears_main(void *argument)
         st->window->dirty = true;
     }
 
-    st->last_tick = pit_get_ticks();
+    st->last_tick = bk_sys_ticks();
 
-    while (!task_exit_requested()) {
+    while (!bk_proc_exit_requested()) {
         uint32_t now;
         if (!st->window || !st->window->listed) break;
 
-        now = pit_get_ticks();
+        now = bk_sys_ticks();
         if ((uint32_t)(now - st->last_tick) >= 2U) {
             st->last_tick = now;
             gears_render_frame(st);
             if (st->window) st->window->dirty = true;
         }
-        task_sleep(1);
+        bk_sys_sleep_ticks(1);
     }
 
     gears_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void gears_open_from_desktop(gui_desktop_t *desktop)
@@ -527,19 +528,19 @@ void gears_open_from_desktop(gui_desktop_t *desktop)
     if (!desktop) return;
 
     if (g_gears && g_gears->window) {
-        gui_window_restore(g_gears->window);
-        gui_desktop_raise_window(desktop, g_gears->window);
-        gui_desktop_focus_window(desktop, g_gears->window);
+        bk_gui_window_restore(g_gears->window);
+        bk_gui_desktop_raise_window(desktop, g_gears->window);
+        bk_gui_focus_window(desktop, g_gears->window);
         return;
     }
 
-    st = (gears_state_t *)kzalloc(sizeof(*st));
+    st = (gears_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
 
     st->desktop = desktop;
     g_gears = st;
 
-    if (task_create("gears", gears_main, st) < 0) {
+    if (bk_proc_spawn_thread("gears", gears_main, st) < 0) {
         gears_cleanup(st);
     }
 }
@@ -547,4 +548,8 @@ void gears_open_from_desktop(gui_desktop_t *desktop)
 void gears_install(gui_desktop_t *desktop)
 {
     (void)desktop;
+}
+
+void bleskernos_program_main(gui_desktop_t *desktop) {
+    gears_open_from_desktop(desktop);
 }

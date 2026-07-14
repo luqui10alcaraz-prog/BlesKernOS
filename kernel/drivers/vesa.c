@@ -1,4 +1,5 @@
 #include "../include/vesa.h"
+#include "../include/driver.h"
 
 static bool g_has_vesa = false;
 static bool g_bga_probe_done = false;
@@ -6,6 +7,8 @@ static bool g_bga_available = false;
 static uint16_t g_bga_max_width = 0;
 static uint16_t g_bga_max_height = 0;
 static uint8_t g_bga_max_bpp = 0;
+static bool g_page_flip_enabled = false;
+static uint8_t g_visible_page = 0;
 
 #define VBE_DISPI_IOPORT_INDEX  0x01CE
 #define VBE_DISPI_IOPORT_DATA   0x01CF
@@ -28,6 +31,10 @@ static uint8_t g_bga_max_bpp = 0;
 
 static inline void vesa_outw(uint16_t port, uint16_t value) {
     __asm__ volatile ("outw %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline void vesa_outb(uint16_t port, uint8_t value) {
+    __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
 }
 
 static inline uint16_t vesa_inw(uint16_t port) {
@@ -64,7 +71,7 @@ static void vesa_probe_runtime_bga(void) {
     bga_write(VBE_DISPI_INDEX_ENABLE, saved_enable);
 
     if (g_bga_max_width < 320 || g_bga_max_height < 200 ||
-        g_bga_max_bpp < 16) {
+        g_bga_max_bpp < 8) {
         g_bga_max_width = 0;
         g_bga_max_height = 0;
         g_bga_max_bpp = 0;
@@ -112,10 +119,42 @@ static uint32_t rgb_from_565(uint16_t v) {
     return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 
+static uint8_t rgb_to_332(uint32_t rgb) {
+    uint8_t r = (uint8_t)((rgb >> 16) & 0xE0);
+    uint8_t g = (uint8_t)((rgb >> 8) & 0xE0);
+    uint8_t b = (uint8_t)(rgb & 0xC0);
+    return (uint8_t)(r | (g >> 3) | (b >> 6));
+}
+
+static uint32_t rgb_from_332(uint8_t v) {
+    uint8_t r = (uint8_t)(v & 0xE0);
+    uint8_t g = (uint8_t)((v & 0x1C) << 3);
+    uint8_t b = (uint8_t)((v & 0x03) << 6);
+    r |= (uint8_t)(r >> 3) | (uint8_t)(r >> 6);
+    g |= (uint8_t)(g >> 3) | (uint8_t)(g >> 6);
+    b |= (uint8_t)(b >> 2) | (uint8_t)(b >> 4) | (uint8_t)(b >> 6);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+static void vesa_set_palette_332(void) {
+    vesa_outb(0x3C8, 0);
+    for (uint16_t i = 0; i < 256; i++) {
+        uint8_t r = (uint8_t)(i & 0xE0);
+        uint8_t g = (uint8_t)((i & 0x1C) << 3);
+        uint8_t b = (uint8_t)((i & 0x03) << 6);
+        r |= (uint8_t)(r >> 3) | (uint8_t)(r >> 6);
+        g |= (uint8_t)(g >> 3) | (uint8_t)(g >> 6);
+        b |= (uint8_t)(b >> 2) | (uint8_t)(b >> 4) | (uint8_t)(b >> 6);
+        vesa_outb(0x3C9, (uint8_t)(r >> 2));
+        vesa_outb(0x3C9, (uint8_t)(g >> 2));
+        vesa_outb(0x3C9, (uint8_t)(b >> 2));
+    }
+}
+
 bool vesa_attach_lfb(gfx_info_t *info, uint32_t framebuffer, uint16_t width, uint16_t height, uint16_t pitch, uint8_t bpp) {
     if (!info || !framebuffer || !width || !height || !pitch) return false;
-    if (bpp != 16 && bpp != 24 && bpp != 32) return false;
-    if (pitch < (uint16_t)(width * (bpp / 8))) return false;
+    if (bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32) return false;
+    if (pitch < (uint16_t)(width * ((bpp + 7) / 8))) return false;
 
     info->mode = GFX_MODE_VESA_LFB;
     info->framebuffer = framebuffer;
@@ -124,6 +163,9 @@ bool vesa_attach_lfb(gfx_info_t *info, uint32_t framebuffer, uint16_t width, uin
     info->pitch = pitch;
     info->bpp = bpp;
     g_has_vesa = true;
+    g_page_flip_enabled = false;
+    g_visible_page = 0;
+    if (bpp == 8) vesa_set_palette_332();
     return true;
 }
 
@@ -151,16 +193,28 @@ bool vesa_can_change_mode(void) {
 bool vesa_list_modes(gfx_display_mode_t *modes, uint32_t max_modes,
                      uint32_t *count, uint8_t preferred_bpp) {
     static const gfx_display_mode_t candidates[] = {
+        {320, 200, 0},
+        {320, 240, 0},
+        {400, 300, 0},
+        {512, 384, 0},
         {640, 480, 0},
+        {720, 400, 0},
         {800, 600, 0},
+        {848, 480, 0},
+        {960, 540, 0},
         {1024, 768, 0},
         {1152, 864, 0},
         {1280, 720, 0},
         {1280, 800, 0},
         {1280, 1024, 0},
         {1366, 768, 0},
+        {1400, 1050, 0},
         {1440, 900, 0},
         {1600, 900, 0},
+        {1600, 1200, 0},
+        {1680, 1050, 0},
+        {1920, 1080, 0},
+        {1920, 1200, 0},
     };
     uint32_t written = 0;
 
@@ -168,7 +222,8 @@ bool vesa_list_modes(gfx_display_mode_t *modes, uint32_t max_modes,
     *count = 0;
     vesa_probe_runtime_bga();
     if (!g_bga_available || !modes || max_modes == 0) return false;
-    if (preferred_bpp != 16 && preferred_bpp != 24 && preferred_bpp != 32)
+    if (preferred_bpp != 8 && preferred_bpp != 16 &&
+        preferred_bpp != 24 && preferred_bpp != 32)
         return false;
     if (preferred_bpp > g_bga_max_bpp) return false;
 
@@ -185,6 +240,58 @@ bool vesa_list_modes(gfx_display_mode_t *modes, uint32_t max_modes,
     return written != 0;
 }
 
+bool vesa_list_all_modes(gfx_display_mode_t *modes, uint32_t max_modes,
+                         uint32_t *count) {
+    static const uint8_t bpps[] = {8, 16, 24, 32};
+    static const gfx_display_mode_t candidates[] = {
+        {320, 200, 0},
+        {320, 240, 0},
+        {400, 300, 0},
+        {512, 384, 0},
+        {640, 480, 0},
+        {720, 400, 0},
+        {800, 600, 0},
+        {848, 480, 0},
+        {960, 540, 0},
+        {1024, 768, 0},
+        {1152, 864, 0},
+        {1280, 720, 0},
+        {1280, 800, 0},
+        {1280, 1024, 0},
+        {1366, 768, 0},
+        {1400, 1050, 0},
+        {1440, 900, 0},
+        {1600, 900, 0},
+        {1600, 1200, 0},
+        {1680, 1050, 0},
+        {1920, 1080, 0},
+        {1920, 1200, 0},
+    };
+    uint32_t written = 0;
+
+    if (!count) return false;
+    *count = 0;
+    vesa_probe_runtime_bga();
+    if (!g_bga_available || !modes || max_modes == 0) return false;
+
+    for (uint32_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (candidates[i].width > g_bga_max_width ||
+            candidates[i].height > g_bga_max_height)
+            continue;
+        for (uint32_t bi = 0; bi < sizeof(bpps) / sizeof(bpps[0]); bi++) {
+            if (written >= max_modes) break;
+            if (bpps[bi] > g_bga_max_bpp) continue;
+            modes[written] = candidates[i];
+            modes[written].bpp = bpps[bi];
+            written++;
+        }
+        if (written >= max_modes) break;
+    }
+
+    *count = written;
+    return written != 0;
+}
+
 bool vesa_set_mode(gfx_info_t *info, uint16_t width, uint16_t height,
                    uint8_t bpp) {
     uint16_t actual_width;
@@ -194,7 +301,7 @@ bool vesa_set_mode(gfx_info_t *info, uint16_t width, uint16_t height,
     uint8_t bytes_per_pixel;
 
     if (!info || !info->framebuffer || !width || !height) return false;
-    if (bpp != 16 && bpp != 24 && bpp != 32) return false;
+    if (bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32) return false;
 
     vesa_probe_runtime_bga();
     if (!g_bga_available) return false;
@@ -202,7 +309,7 @@ bool vesa_set_mode(gfx_info_t *info, uint16_t width, uint16_t height,
         bpp > g_bga_max_bpp)
         return false;
 
-    bytes_per_pixel = (uint8_t)(bpp / 8);
+    bytes_per_pixel = (uint8_t)((bpp + 7) / 8);
     if (bytes_per_pixel == 0) return false;
 
     bga_write(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
@@ -228,13 +335,56 @@ bool vesa_set_mode(gfx_info_t *info, uint16_t width, uint16_t height,
     return vesa_attach_lfb(info, info->framebuffer, width, height, pitch, bpp);
 }
 
+bool vesa_enable_page_flip(const gfx_info_t *info) {
+    uint32_t virtual_height;
+
+    if (!info || info->mode != GFX_MODE_VESA_LFB || !info->framebuffer ||
+        info->pitch != (uint16_t)(info->width * ((info->bpp + 7U) / 8U)))
+        return false;
+    vesa_probe_runtime_bga();
+    if (!g_bga_available) return false;
+    virtual_height = (uint32_t)info->height * 2U;
+    if (virtual_height > 0xFFFFU) return false;
+
+    bga_write(VBE_DISPI_INDEX_VIRT_W, info->width);
+    bga_write(VBE_DISPI_INDEX_VIRT_H, (uint16_t)virtual_height);
+    if (bga_read(VBE_DISPI_INDEX_VIRT_H) < virtual_height) return false;
+    bga_write(VBE_DISPI_INDEX_X_OFF, 0);
+    bga_write(VBE_DISPI_INDEX_Y_OFF, 0);
+    g_visible_page = 0;
+    g_page_flip_enabled = true;
+    return true;
+}
+
+uint32_t vesa_page_flip_draw_buffer(const gfx_info_t *info) {
+    uint32_t hidden_page;
+
+    if (!g_page_flip_enabled || !info) return 0U;
+    hidden_page = g_visible_page ? 0U : 1U;
+    return info->framebuffer + hidden_page * (uint32_t)info->pitch *
+           (uint32_t)info->height;
+}
+
+bool vesa_page_flip_commit(const gfx_info_t *info) {
+    uint16_t next_y;
+
+    if (!g_page_flip_enabled || !info) return false;
+    g_visible_page ^= 1U;
+    next_y = g_visible_page ? info->height : 0U;
+    bga_write(VBE_DISPI_INDEX_Y_OFF, next_y);
+    return bga_read(VBE_DISPI_INDEX_Y_OFF) == next_y;
+}
+
 void vesa_putpixel_rgb(const gfx_info_t *info, int x, int y, uint32_t rgb) {
     uint8_t *where;
     if (!info || info->mode != GFX_MODE_VESA_LFB) return;
     if (x < 0 || y < 0 || x >= info->width || y >= info->height) return;
 
-    where = (uint8_t *)(info->framebuffer + (uint32_t)y * info->pitch + ((uint32_t)x * (info->bpp / 8)));
-    if (info->bpp == 16) {
+    where = (uint8_t *)(info->framebuffer + (uint32_t)y * info->pitch +
+                        ((uint32_t)x * ((info->bpp + 7) / 8)));
+    if (info->bpp == 8) {
+        *where = rgb_to_332(rgb);
+    } else if (info->bpp == 16) {
         *((uint16_t *)where) = rgb_to_565(rgb);
     } else {
         where[0] = (uint8_t)(rgb & 0xFF);
@@ -249,7 +399,9 @@ uint32_t vesa_getpixel_rgb(const gfx_info_t *info, int x, int y) {
     if (!info || info->mode != GFX_MODE_VESA_LFB) return 0;
     if (x < 0 || y < 0 || x >= info->width || y >= info->height) return 0;
 
-    where = (uint8_t *)(info->framebuffer + (uint32_t)y * info->pitch + ((uint32_t)x * (info->bpp / 8)));
+    where = (uint8_t *)(info->framebuffer + (uint32_t)y * info->pitch +
+                        ((uint32_t)x * ((info->bpp + 7) / 8)));
+    if (info->bpp == 8) return rgb_from_332(*where);
     if (info->bpp == 16) return rgb_from_565(*((uint16_t *)where));
     return ((uint32_t)where[2] << 16) | ((uint32_t)where[1] << 8) | where[0];
 }
@@ -264,4 +416,36 @@ void vesa_fill_rect_rgb(const gfx_info_t *info, int x, int y, int w, int h, uint
 void vesa_clear_rgb(const gfx_info_t *info, uint32_t rgb) {
     if (!info) return;
     vesa_fill_rect_rgb(info, 0, 0, info->width, info->height, rgb);
+}
+
+static bool vesa_driver_init(void) {
+    static const vesa_driver_ops_t ops = {
+        .init_from_bootinfo = vesa_init_from_bootinfo,
+        .attach_lfb = vesa_attach_lfb,
+        .has_lfb = vesa_has_lfb,
+        .can_change_mode = vesa_can_change_mode,
+        .list_modes = vesa_list_modes,
+        .list_all_modes = vesa_list_all_modes,
+        .set_mode = vesa_set_mode,
+        .enable_page_flip = vesa_enable_page_flip,
+        .page_flip_draw_buffer = vesa_page_flip_draw_buffer,
+        .page_flip_commit = vesa_page_flip_commit,
+        .clear_rgb = vesa_clear_rgb,
+        .putpixel_rgb = vesa_putpixel_rgb,
+        .getpixel_rgb = vesa_getpixel_rgb,
+        .fill_rect_rgb = vesa_fill_rect_rgb
+    };
+    return vesa_register_driver(&ops);
+}
+
+const bk_driver_module_t *bleskernos_driver_query(void) {
+    static const bk_driver_module_t module = {
+        BK_DRIVER_ABI_VERSION,
+        sizeof(bk_driver_module_t),
+        "vesa",
+        "Framebuffer lineal VESA y Bochs VBE",
+        vesa_driver_init,
+        NULL
+    };
+    return &module;
 }
