@@ -25,8 +25,9 @@ bool compat_mode_allow_screensaver(void);
 bool compat_mode_allow_startup_sound(void);
 bool compat_mode_use_compact_language(void);
 bool compat_mode_use_front_shadow(void);
-/* Default de escritorio amplio; sólo se activa por encima de 32 MiB. */
-bool compat_mode_prefer_800x640(void);
+/* Escritorio normal fijo. Los perfiles de memoria reducida conservan sus
+ * modos VGA de emergencia para poder arrancar con 4-15 MiB. */
+bool compat_mode_prefer_800x600(void);
 uint32_t compat_mode_task_limit(void);
 uint32_t compat_mode_stack_size(const char *name, bool user);
 uint32_t compat_mode_gui_target_fps(void);

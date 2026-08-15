@@ -13,12 +13,6 @@ static const gfx_driver_ops_t *g_active_driver;
 static uint32_t g_last_fence;
 static uint32_t g_driver_generation = 1U;
 
-/* VGA is available on the real C600 and does not depend on VBE/BGA. */
-static const gfx_display_mode_t g_vga_modes[] = {
-    {320, 200, 8},
-    {640, 480, 4},
-};
-
 typedef struct {
     uint32_t hw_fill;
     uint32_t sw_fill;
@@ -220,9 +214,9 @@ void gfx_init(void) {
         /* Elegir el escritorio amplio antes de activar el controlador. De
            este modo SVGA/VirtIO crean directamente el scanout definitivo y
            la GUI nunca nace en 640x480 para cambiar en mitad del arranque. */
-        if (compat_mode_prefer_800x640()) {
+        if (compat_mode_prefer_800x600()) {
             preferred_width = 800U;
-            preferred_height = 640U;
+            preferred_height = 600U;
         }
         kprintf("[GFX:TRACE] ACTIVATE call name=%s preferred=%ux%u\n",
                 g_registered_driver->name, (uint32_t)preferred_width,
@@ -304,64 +298,38 @@ bool gfx_is_linear_framebuffer(void) {
     return g_gfx.mode == GFX_MODE_VESA_LFB || g_active_driver != NULL;
 }
 bool gfx_can_change_mode(void) {
-    if (g_active_driver) return true;
-    if (g_gfx.mode == GFX_MODE_VGA_13H || g_gfx.mode == GFX_MODE_VGA_12H)
-        return true;
-    return g_gfx.mode == GFX_MODE_VESA_LFB && vesa_can_change_mode();
+    /* BlesKernOS 0.8 keeps one display geometry for the lifetime of the GUI.
+       Replacing the scanout/backbuffer under live windows was the source of
+       disappearing Deskbar/windows and half-applied resolution changes. */
+    return false;
 }
 
 bool gfx_list_display_modes(gfx_display_mode_t *modes, uint32_t max_modes,
                             uint32_t *count) {
-    uint8_t current_bpp = g_gfx.bpp ? g_gfx.bpp : 16;
-    if (g_active_driver)
-        return g_active_driver->list_modes(modes, max_modes, count);
-    if (g_gfx.mode == GFX_MODE_VGA_13H || g_gfx.mode == GFX_MODE_VGA_12H) {
-        if (!count) return false;
-        *count = 0;
-        if (!modes || !max_modes) return false;
-        for (uint32_t i = 0; i < sizeof(g_vga_modes) / sizeof(g_vga_modes[0]); i++) {
-            if (g_vga_modes[i].bpp == current_bpp) {
-                modes[0] = g_vga_modes[i];
-                *count = 1;
-                return true;
-            }
-        }
-        return false;
-    }
-    return vesa_list_modes(modes, max_modes, count, current_bpp);
+    (void)modes;
+    (void)max_modes;
+    if (count) *count = 0U;
+    return false;
 }
 bool gfx_list_all_display_modes(gfx_display_mode_t *modes, uint32_t max_modes,
                                 uint32_t *count) {
-    if (g_active_driver)
-        return g_active_driver->list_modes(modes, max_modes, count);
-    if (g_gfx.mode == GFX_MODE_VGA_13H || g_gfx.mode == GFX_MODE_VGA_12H) {
-        uint32_t available = sizeof(g_vga_modes) / sizeof(g_vga_modes[0]);
-        if (!count) return false;
-        *count = 0;
-        if (!modes || !max_modes) return false;
-        if (available > max_modes) available = max_modes;
-        for (uint32_t i = 0; i < available; i++) modes[(*count)++] = g_vga_modes[i];
-        return true;
-    }
-    return vesa_list_all_modes(modes, max_modes, count);
+    (void)modes;
+    (void)max_modes;
+    if (count) *count = 0U;
+    return false;
 }
 bool gfx_set_display_mode(uint16_t width, uint16_t height, uint8_t bpp) {
-    if (g_active_driver) {
-        bool ok;
-        gfx3d_reset();
-        ok = g_active_driver->set_mode(&g_gfx, width, height, bpp);
-        if (ok) {
-            g_last_fence = 0U;
-            gfx_advance_driver_generation();
-        }
-        return ok;
-    }
-    if (width == 320U && height == 200U && bpp == 8U)
-        return gfx_set_mode13h();
-    if (width == 640U && height == 480U && bpp == 4U)
-        return gfx_set_mode12h();
-    if (g_gfx.mode != GFX_MODE_VESA_LFB) return false;
-    return vesa_set_mode(&g_gfx, width, height, bpp);
+    /* Public/runtime mode changes are intentionally disabled.  A request for
+       the already-active mode is a harmless no-op so old software that merely
+       reasserts the current mode keeps working. */
+    if (width == g_gfx.width && height == g_gfx.height &&
+        (!bpp || bpp == g_gfx.bpp))
+        return true;
+    kprintf("[GFX:MODE] cambio en caliente bloqueado: %ux%ux%u; activo=%ux%ux%u\n",
+            (uint32_t)width, (uint32_t)height, (uint32_t)bpp,
+            (uint32_t)g_gfx.width, (uint32_t)g_gfx.height,
+            (uint32_t)g_gfx.bpp);
+    return false;
 }
 
 bool gfx_enable_page_flip(void) {

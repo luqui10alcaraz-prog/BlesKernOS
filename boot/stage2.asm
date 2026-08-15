@@ -797,39 +797,30 @@ setup_vesa:
     jnz .done
 
 .auto_generic:
-    ; Preferencia historica y compatible: 640x480 con 256 colores.
-    ; Se prueba antes que cualquier modo de mayor resolucion/profundidad para
-    ; que el arranque automatico sea estable tambien con poca RAM y solo CPU.
-    mov word [vbe_search_width], 640
-    mov word [vbe_search_height], 480
+    ; 0.8 usa una geometria unica desde Stage2: 800x600. Probar varias
+    ; profundidades, pero no arrancar primero a 640x480/1024x768 para que el
+    ; kernel cambie el tamano de pantalla cuando la GUI ya esta naciendo.
+    mov word [vbe_search_width], 800
+    mov word [vbe_search_height], 600
     mov byte [vbe_search_bpp], 8
     call find_vbe_mode_exact
     test ax, ax
     jnz .auto_found
 
-    ; Si no existe ese modo, conservar candidatos de mejor calidad.
-    mov word [vbe_search_width], 1024
-    mov word [vbe_search_height], 768
+    mov byte [vbe_search_bpp], 16
+    call find_vbe_mode_exact
+    test ax, ax
+    jnz .auto_found
+
     mov byte [vbe_search_bpp], 32
     call find_vbe_mode_exact
     test ax, ax
     jnz .auto_found
 
-    mov word [vbe_search_width], 800
-    mov word [vbe_search_height], 600
-    call find_vbe_mode_exact
-    test ax, ax
-    jnz .auto_found
-
+    ; Fallback de seguridad para BIOS VBE realmente antiguas. Los perfiles de
+    ; RAM reducida tambien pueden seleccionar VGA mas tarde deliberadamente.
     mov word [vbe_search_width], 640
     mov word [vbe_search_height], 480
-    call find_vbe_mode_exact
-    test ax, ax
-    jnz .auto_found
-
-    ; Ultimo recurso: un modo SVGA de 800x600 con 256 colores.
-    mov word [vbe_search_width], 800
-    mov word [vbe_search_height], 600
     mov byte [vbe_search_bpp], 8
     call find_vbe_mode_exact
     test ax, ax

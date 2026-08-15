@@ -70,6 +70,7 @@ typedef struct {
     uint32_t worker_body_length;
     int32_t worker_viewport;
     volatile uint8_t loading_progress;
+    volatile bool progress_dirty;
     volatile bool worker_complete;
     volatile bool worker_success;
     bool loading;
@@ -247,11 +248,13 @@ static void netsurf_progress(void *context, uint8_t percent,
                              const char *phase) {
     netsurf_state_t *state = (netsurf_state_t *)context;
     if (!state) return;
+    (void)phase;
+    /* The fetch thread owns document mutation until worker_complete.  It must
+       not call into GUI code or rewrite strings that the compositor reads.
+       Publish only tiny scalar progress state; the main GUI loop consumes it. */
     state->loading_progress = percent > 100U ? 100U : percent;
-    if (phase && phase[0]) set_status(state, phase);
-    /* The fetch runs in a worker thread. Do not enter the compositor from
-       that thread: wake the GUI loop and yield so the desktop stays fluid. */
-    if (state->window) bk_gui_window_invalidate(state->window);
+    __sync_synchronize();
+    state->progress_dirty = true;
     bk_sys_yield();
 }
 
@@ -463,6 +466,9 @@ static void netsurf_fetch_worker(void *argument) {
                     state->request_timeout_ms,
                     state->worker_viewport);
         state->worker_success = success;
+        /* On SMP, never let the GUI observe completion before every DOM,
+           layout and resource write performed by this worker is visible. */
+        __sync_synchronize();
         state->worker_complete = true;
     }
 }
@@ -555,6 +561,7 @@ static void load_request(netsurf_state_t *state, const char *url,
     state->cancel_requested = false;
     state->worker_complete = false;
     state->worker_success = false;
+    state->progress_dirty = false;
     state->scrollbar_drag.active = false;
     state->scrollbar_drag.grab_offset = 0;
     state->progress_failed = false;
@@ -631,7 +638,7 @@ static bk_gui_rect_t page_frame_rect(bk_gui_rect_t content) {
 static bk_gui_rect_t page_rect(netsurf_state_t *state,
                                bk_gui_rect_t content) {
     bk_gui_rect_t page = page_frame_rect(content);
-    if (state && state->document.title[0]) {
+    if (state && !state->loading && state->document.title[0]) {
         page.y += 19;
         page.h -= 19;
     }
@@ -1461,7 +1468,7 @@ static void netsurf_paint(bk_gui_window_t *window UNUSED,
     layout_toolbar_widgets(state, content.w);
     page_frame = page_frame_rect(content);
     page = page_rect(state, content);
-    page_scrollbar(state, content, &scrollbar);
+    if (!state->loading) page_scrollbar(state, content, &scrollbar);
     status = (bk_gui_rect_t){content.x, content.y + content.h - NSBK_STATUS_H,
                              content.w, NSBK_STATUS_H};
 
@@ -1469,7 +1476,7 @@ static void netsurf_paint(bk_gui_window_t *window UNUSED,
 
     bk_gui_surface_fill_rect(surface, page_frame, 0x00FFFFFFU);
     bk_gui_surface_draw_rect(surface, page_frame, 0x00808080U);
-    if (state->document.title[0]) {
+    if (!state->loading && state->document.title[0]) {
         bk_gui_rect_t title = (bk_gui_rect_t){page_frame.x + 1, page_frame.y + 1,
                                              page_frame.w - 2, 18};
         bk_gui_surface_fill_rect(surface, title, 0x00E8E8E8U);
@@ -1477,8 +1484,16 @@ static void netsurf_paint(bk_gui_window_t *window UNUSED,
                                  state->document.title, 0x00000080U,
                                  0x00E8E8E8U, false);
     }
-    draw_document(state, surface, page);
-    local_scrollbar_paint(surface, &scrollbar);
+    /* nsbk_document_fetch_request() clears/frees and rebuilds the document on
+       netsurf-fetch. Never traverse its DOM/layout/images concurrently. */
+    if (state->loading) {
+        bk_gui_surface_draw_text(surface, page.x + 12, page.y + 12,
+                                 "Cargando pagina...", 0x00202020U,
+                                 0x00FFFFFFU, false);
+    } else {
+        draw_document(state, surface, page);
+        local_scrollbar_paint(surface, &scrollbar);
+    }
 
     bk_gui_surface_fill_rect(surface, status, 0x00D4D0C8U);
     bk_gui_surface_draw_rect(surface, status, 0x00808080U);
@@ -1672,6 +1687,7 @@ static bool netsurf_event(bk_gui_window_t *window UNUSED,
     }
 
     if (event->type == BK_GUI_EVENT_MOUSE_WHEEL) {
+        if (state->loading) return true;
         if (event->dy < 0) state->scroll_line += NSBK_SCROLL_STEP;
         else if (state->scroll_line >= NSBK_SCROLL_STEP)
             state->scroll_line -= NSBK_SCROLL_STEP;
@@ -1788,6 +1804,7 @@ static void netsurf_menu_callback(bk_gui_window_t *window UNUSED,
         }
         break;
     case NSBK_MENU_VIEW_IMAGES:
+        if (state->loading) break;
         state->allow_images = !state->allow_images;
         nsbk_document_set_preferences(&state->document, state->allow_stylesheets,
                                       state->allow_images, state->allow_cookies);
@@ -1795,6 +1812,7 @@ static void netsurf_menu_callback(bk_gui_window_t *window UNUSED,
                                                "Imagenes desactivadas");
         break;
     case NSBK_MENU_VIEW_CSS:
+        if (state->loading) break;
         state->allow_stylesheets = !state->allow_stylesheets;
         nsbk_document_set_preferences(&state->document, state->allow_stylesheets,
                                       state->allow_images, state->allow_cookies);
@@ -2012,8 +2030,15 @@ void bleskernos_program_main(bk_gui_desktop_t *desktop) {
 
     while (bk_gui_window_is_open(state->window) && !bk_proc_exit_requested()) {
         bk_gui_rect_t content;
-        if (state->loading && state->worker_complete)
+        if (state->progress_dirty) {
+            __sync_synchronize();
+            state->progress_dirty = false;
+            bk_gui_window_invalidate(state->window);
+        }
+        if (state->loading && state->worker_complete) {
+            __sync_synchronize();
             finish_load_request(state);
+        }
         if (state->pending_navigation && !state->loading) {
             state->pending_navigation = false;
             load_request(state, state->pending_url, state->pending_method,
@@ -2042,7 +2067,8 @@ void bleskernos_program_main(bk_gui_desktop_t *desktop) {
                 bk_gui_window_invalidate(state->window);
             }
         }
-        if (state->active_control < state->document.control_count)
+        if (!state->loading &&
+            state->active_control < state->document.control_count)
             position_page_textbox(state);
         bk_sys_sleep_ms(20U);
     }

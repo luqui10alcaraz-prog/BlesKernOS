@@ -166,8 +166,8 @@ bool compat_mode_use_front_shadow(void) {
     return g_profile == BK_MEMORY_PROFILE_NORMAL &&
            g_physical_top > BK_MIB(16);
 }
-bool compat_mode_prefer_800x640(void) {
-    return g_physical_top > BK_MIB(32);
+bool compat_mode_prefer_800x600(void) {
+    return g_profile == BK_MEMORY_PROFILE_NORMAL;
 }
 uint32_t compat_mode_task_limit(void) { return g_task_limit; }
 
