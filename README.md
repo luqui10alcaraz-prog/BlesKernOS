@@ -1,184 +1,600 @@
-# BlesKernOS 0.8
----
+BlesKernOS 0.8
 
-BlesKernOS is an 32-bit operating system written from scratch in x86 Assembly and C.
+BlesKernOS is a lightweight 32-bit x86 operating system written primarily from scratch in C and x86 Assembly.
 
-It features a custom bootloader, a protected-mode kernel, a graphical desktop environment, a FAT filesystem, native applications, and an Doom port.
+It includes its own bootloader and protected-mode kernel, preemptive multitasking, native Ring 3 applications, a graphical desktop, FAT/ISO9660 storage, networking with HTTPS, loadable drivers, multimedia support, an SDK for native software, experimental Win16/Win32 compatibility, and software/hardware-assisted 3D graphics.
 
+BlesKernOS is still under active development. Hardware support and compatibility layers are incomplete, and some features described below remain experimental.
 
----
+Screenshots
 
-## Screenshot
-<img width="799" height="599" alt="Captura de pantalla 2026-07-02 224002" src="https://github.com/user-attachments/assets/e7134b00-7bca-4d60-8192-2383515afa01" />
-<img width="799" height="598" alt="Captura de pantalla 2026-07-02 224147" src="https://github.com/user-attachments/assets/2a1cd55c-a47a-46b6-bca7-67945d70ed0f" />
-<img width="796" height="602" alt="Captura de pantalla 2026-07-05 032649" src="https://github.com/user-attachments/assets/559f631b-f4c6-4dc3-8289-92f81bbff0f5" />
-<img width="799" height="604" alt="image" src="https://github.com/user-attachments/assets/8fe6fcc9-f26d-4d3d-8e04-677d1d784510" />
-<img width="802" height="602" alt="Captura de pantalla 2026-07-02 224058" src="https://github.com/user-attachments/assets/7512fe19-1ada-4eeb-9eda-c0d91d44f89f" />
-<img width="799" height="600" alt="Captura de pantalla 2026-07-02 224512" src="https://github.com/user-attachments/assets/6f9c2add-6da9-4880-a63b-575e7b3ccf2c" />
-<img width="796" height="603" alt="Captura de pantalla 2026-07-05 031647" src="https://github.com/user-attachments/assets/01e41ead-1915-4838-b1f8-db01a0f76a2e" />
-<img width="802" height="600" alt="Captura de pantalla 2026-07-05 032937" src="https://github.com/user-attachments/assets/38775fc8-bc0f-4db5-badc-7464a4f49fa9" />
----
+<img width="799" height="599" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/e7134b00-7bca-4d60-8192-2383515afa01" />
+<img width="799" height="598" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/2a1cd55c-a47a-46b6-bca7-67945d70ed0f" />
+<img width="796" height="602" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/559f631b-f4c6-4dc3-8289-92f81bbff0f5" />
+<img width="799" height="604" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/8fe6fcc9-f26d-4d3d-8e04-677d1d784510" />
+<img width="802" height="602" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/7512fe19-1ada-4eeb-9eda-c0d91d44f89f" />
+<img width="799" height="600" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/6f9c2add-6da9-4880-a63b-575e7b3ccf2c" />
+<img width="796" height="603" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/01e41ead-1915-4838-b1f8-db01a0f76a2e" />
+<img width="802" height="600" alt="BlesKernOS desktop" src="https://github.com/user-attachments/assets/38775fc8-bc0f-4db5-badc-7464a4f49fa9" />
 
-## Features
+What's new in 0.8
 
-### Kernel
-- Custom two-stage bootloader
-- 32-bit protected mode
-- Preemptive multitasking
-- Ring 3 userspace (work in progress)
-- ELF program loader
-- Minimal freestanding C library
+SMP support for up to 16 logical processors, with automatic single-CPU fallback.
 
-### Drivers
-- ATA / ATAPI
-- Floppy Disk Controller
-- FAT12 / FAT16 / FAT32
-- ISO9660
-- PCI detection
-- PS/2 keyboard & mouse
-- Sound Blaster 16
-- VESA graphics
+Per-CPU scheduling infrastructure, Local APIC timers, task affinity and load distribution for native Ring 3 applications.
 
-### Desktop
-- Window manager
-- Taskbar / deskbar
-- Desktop icons
-- Configurable desktop via INI files
-- BMP/GIF image loading
-- Packed icon loading through ICONS.PAK
-- Screensavers
+IA-32 paging enabled at boot, CR0.WP, dynamic RAM-sized heap and stronger user-pointer validation.
 
-### Applications
-- File Browser
-- Text Editor
-- Calculator
-- Calendar
-- Control Panel with `.CPL` applets
-- Process Manager
-- MidAmp (MIDI Player)
-- Paint
-- Doom (experimental)
-- Shell
-- Help Center
-- Find Files
-- Archive Manager
-- Disk Tools
-- Network Status
-- Global text clipboard and Clipboard Viewer
+Automatic low-memory compatibility profiles from 4 MB to 15 MB of RAM.
 
----
+Loadable .DVR driver system with a versioned driver ABI.
 
-## Building
+Expanded graphics stack with VMware SVGA-II, VirtIO GPU, ATI Rage 128 and experimental 3D backends.
 
-Requirements:
+Mesa 3.5/OpenGL 1.2 port alongside TinyGL, with GFX3D acceleration where supported and software fallback.
 
-- NASM
-- GCC (32-bit)
-- Python 3
-- QEMU
+IPv4 networking with DHCP, DNS, ICMP, TCP, HTTP and HTTPS.
 
-Build the normal desktop edition:
+TLS 1.2 using BearSSL with X.509 certificate validation and a CA bundle.
 
-```bash
+NetSurf browser port and network utilities including ping, curl, wget, ipconfig and netstat.
+
+USB UHCI support, USB storage and an external USB class driver for HID, hubs and USB printers.
+
+Expanded audio support including Sound Blaster 16, Intel AC'97 and ESS Maestro3-family hardware.
+
+Print spooler and printer profiles for text, PostScript, PCL 5 and ESC/P-family output over file, LPT and USB printer transports.
+
+Experimental Win16 NE execution and substantially expanded Win32/Windows 95 compatibility APIs.
+
+User and Developer editions, installer media and SDK improvements.
+
+Improved desktop, graphics resources, language catalogs, system utilities and performance monitoring.
+
+Features
+
+Kernel and system
+
+Custom x86 bootloader with FAT32-capable Stage 2.
+
+32-bit protected-mode kernel.
+
+Preemptive multitasking.
+
+Native Ring 3 userspace and system-call ABI.
+
+ELF32 loader for native applications and loadable modules.
+
+SMP for up to 16 logical CPUs.
+
+ACPI MADT and Intel MP-table CPU discovery.
+
+xAPIC startup using INIT/SIPI and Local APIC scheduler timers.
+
+Per-CPU scheduler state, kernel stacks, TSS and x87 state.
+
+Automatic uniprocessor fallback when SMP is unavailable.
+
+IA-32 paging with PSE and write protection enabled.
+
+Dynamic heap sized from the E820 memory map instead of a fixed 64 MB heap.
+
+Per-process allocation tracking and cleanup on process exit.
+
+Process fault containment for faults produced by native applications while crossing API/syscall boundaries.
+
+Recovery Console.
+
+Versioned public userspace API and SDK.
+
+Freestanding C runtime used by native programs.
+
+Paging is active in 0.8, but BlesKernOS still uses a shared identity-mapped address space. Full per-process virtual address-space isolation is not implemented yet.
+
+Low-memory mode
+
+BlesKernOS automatically selects a reduced profile according to detected physical RAM:
+
+4 MB: minimal 320x200x8 desktop, two tasks and no Ring 3 applications.
+
+5 MB: minimal profile with one application at a time.
+
+6-7 MB: minimal profile with up to five tasks.
+
+8-15 MB: reduced desktop profile, lower GUI refresh rate and disabled heavy subsystems.
+
+More than 15 MB: normal feature set.
+
+Low-memory profiles can automatically disable external drivers, network autoconfiguration, USB hotplug, printing, startup audio, screensavers, wallpaper, image icons and Win16/Win32 compatibility to preserve RAM.
+
+Storage and filesystems
+
+ATA / IDE.
+
+ATAPI support.
+
+FAT12 / FAT16 / FAT32.
+
+ISO9660 CD-ROM filesystem.
+
+Virtual filesystem and block-device layer.
+
+USB Mass Storage.
+
+Bootable ATA and USB images.
+
+Text-mode installer capable of installing the system to writable ATA or USB media.
+
+Loadable drivers
+
+BlesKernOS can load resident ELF32 .DVR modules from /SYSTEM/DRIVERS.
+
+Current driver modules include:
+
+Sound Blaster 16.
+
+Intel ICH-family AC'97.
+
+ESS Maestro3 / Allegro-family audio.
+
+CMOS/RTC.
+
+ISO9660.
+
+PS/2 mouse.
+
+USB class support.
+
+VESA.
+
+VMware SVGA-II.
+
+VirtIO GPU.
+
+ATI Rage 128 / Rage Mobility.
+
+Experimental ATI Rage 128 3D backend.
+
+Experimental VMware SVGA3D backend.
+
+Intel GMA9xx graphics support.
+
+3Com EtherLink XL / 3c90x networking.
+
+Realtek RTL8129 / RTL8139 networking.
+
+Modular IPv4 network stack.
+
+TLS 1.2 provider.
+
+The boot-critical ATA, FAT/VFS, UHCI and USB-storage paths remain built into the kernel so the system can load external drivers from disk or USB.
+
+Graphics
+
+VGA fallback modes.
+
+VESA linear framebuffer support.
+
+VMware SVGA-II native 2D backend.
+
+VirtIO GPU 2D backend.
+
+ATI Rage 128 graphics support.
+
+Intel GMA9xx graphics driver.
+
+Dirty-rectangle presentation and accelerated rectangle operations on supported backends.
+
+GPU-aware compositor infrastructure.
+
+Hardware cursor support on selected drivers.
+
+GFX3D backend abstraction for accelerated 3D rendering.
+
+Software fallback when hardware acceleration is unavailable or an operation is unsupported.
+
+3D and OpenGL
+
+BlesKernOS 0.8 includes two 3D paths:
+
+TinyGL, retained as a lightweight software renderer with optional GFX3D acceleration.
+
+Mesa 3.5, ported as a freestanding OpenGL 1.2 implementation using the real Mesa TNL/OSMesa pipeline.
+
+The Mesa integration can accelerate supported fixed-function rendering through GFX3D while retaining SWRAST fallback. The accelerated subset includes triangles, lines, points, depth testing, a single 2D texture unit, common filtering/wrapping modes, alpha blending, scissor, linear fog and polygon offset. Some classic OpenGL operations remain CPU-only.
+
+Experimental GFX3D backends exist for VMware SVGA3D, VirtIO/VirGL and ATI Rage 128. Exact capabilities differ by driver and hardware.
+
+Networking and Internet
+
+3Com 3c90x and Realtek RTL8139 Ethernet drivers.
+
+Ethernet and ARP.
+
+IPv4.
+
+ICMP / ping.
+
+UDP internally.
+
+DHCP client.
+
+DNS resolver.
+
+TCP client sockets for Ring 3 applications.
+
+HTTP/1.1 client support.
+
+HTTPS with TLS 1.2.
+
+BearSSL 0.6 integration.
+
+X.509 certificate-chain and hostname validation.
+
+SNI support.
+
+CA trust bundle.
+
+Network commands including ipconfig, ping, curl, wget and netstat.
+
+NetSurf browser port.
+
+Current networking is intentionally small: IPv4 only, a single active NIC, client-oriented TCP and limited buffering. It is not intended to be a full modern TCP/IP implementation yet.
+
+USB
+
+UHCI USB 1.1 host controller support.
+
+USB Mass Storage.
+
+USB hotplug infrastructure.
+
+USB core ABI for external class drivers.
+
+HID keyboard/mouse class support.
+
+USB hubs.
+
+USB Printer Class exposed as USBPRN1 through USBPRN8.
+
+Audio
+
+Sound Blaster 16.
+
+PC speaker fallback.
+
+Intel ICH-family AC'97 PCM audio.
+
+ESS Maestro3 / Allegro-family support.
+
+MIDI playback through MidAmp.
+
+Startup sound.
+
+Printing
+
+Ring 3 print API.
+
+Persistent print spooler.
+
+BPJ1 intermediate print-job format.
+
+Queue retry, pause and cancellation states.
+
+External .BPD printer profiles.
+
+Text output.
+
+PostScript output.
+
+PCL 5 monochrome output.
+
+ESC/P and basic ESC/P2 monochrome output.
+
+File output for testing.
+
+Parallel LPT transport.
+
+USB Printer Class transport.
+
+Desktop
+
+Graphical desktop environment.
+
+Window manager and compositor.
+
+Deskbar / taskbar.
+
+Desktop icons and shortcuts.
+
+Configurable desktop through INI files.
+
+Runtime resolution and display configuration infrastructure.
+
+BMP, GIF, JPEG and SVG image support in the graphics stack.
+
+Packed shared graphics resources through GRAPHICS.PAK.
+
+Screensavers, including TinyGL-based screensavers.
+
+Global text clipboard and Clipboard Viewer.
+
+File-selection dialogs available to native applications.
+
+Multiple language catalogs, including Spanish, English and Italian resources.
+
+Native applications and utilities
+
+The source tree includes native BlesKernOS applications and system tools such as:
+
+File Browser.
+
+Text Editor.
+
+Calculator.
+
+Calendar.
+
+Paint.
+
+Image Viewer.
+
+Control Panel.
+
+Device Manager.
+
+Process Manager.
+
+Performance Monitor.
+
+MidAmp MIDI Player.
+
+NetSurf browser.
+
+Shell and Run box.
+
+Help Center.
+
+Find Files.
+
+Archive Manager.
+
+Disk Tools and ScanDisk.
+
+Network Status.
+
+Clipboard Viewer.
+
+Setup / installer utilities.
+
+3D/OpenGL test programs such as Gears.
+
+Doom port support in the system resources/build tree.
+
+The command-line environment also contains a larger collection of Unix/DOS-style utilities for files, processes, hardware inspection, networking, checksums, archives and system diagnostics.
+
+Win16 compatibility — experimental
+
+BlesKernOS contains an experimental NE/Win16 compatibility layer influenced by the architecture and API metadata of Wine.
+
+Implemented foundations include:
+
+NE executable loading and relocation.
+
+16-bit GDT code/data selectors.
+
+16:16 Ring 3 task startup.
+
+KERNEL/USER/GDI relay infrastructure.
+
+Basic local/global memory APIs.
+
+Several KERNEL string/task helpers.
+
+Basic MessageBox integration.
+
+This is not a complete Windows 3.x or Wine implementation. Complex applications can still stop on missing USER/GDI, DLL, resource, callback or multimedia APIs.
+
+Win32 / Windows 95 compatibility — experimental
+
+The PE32 compatibility layer includes an expanding set of Windows 95/98-era APIs, including portions of:
+
+KERNEL32.
+
+USER32.
+
+GDI32.
+
+COMCTL32.
+
+Registry APIs.
+
+Process and synchronization APIs.
+
+Virtual memory bookkeeping.
+
+File and file-mapping APIs.
+
+DIB and bitmap graphics.
+
+WinSock / networking-related compatibility work.
+
+Additional compatibility libraries assembled into the project's Wine compatibility library.
+
+The compatibility layer is partial. It does not provide full Windows memory isolation or complete Win32 API coverage.
+
+Building
+
+Requirements
+
+NASM
+
+GCC with 32-bit x86 support
+
+Binutils
+
+Python 3
+
+QEMU for testing
+
+Some Win32 test targets additionally require a MinGW i686 cross-compiler.
+
+Build the normal User edition:
+
 make user
-```
 
-Build the developer edition, or both editions:
+Build the Developer edition:
 
-```bash
 make developer
+
+Build both editions:
+
 make editions
-```
 
 Run the User edition:
 
-```bash
 make EDITION=user run
-```
 
-The ATA images are written to `build/bleskernos-ata-user.img` and
-`build/bleskernos-ata-developer.img`. See
-[`docs/EDITIONS_AND_UTILITIES.md`](docs/EDITIONS_AND_UTILITIES.md).
+The main ATA images are written to:
 
-### Installer CD
+build/bleskernos-ata-user.img
+build/bleskernos-ata-developer.img
 
-The ISO boots a text-mode installer instead of the desktop. It can erase a
-writable ATA or USB device, create the bootable FAT32 layout, install Stage 1,
-Stage 2 and the kernel, and copy the selected User or Developer edition.
+The build system can also create USB and VMware images. See docs/EDITIONS_AND_UTILITIES.md.
 
-```bash
+Installer CD
+
+The installer ISO boots a text-mode installer instead of the desktop. It can prepare a writable ATA or USB device, create the FAT32 system layout, install the boot stages and kernel, and copy the selected edition.
+
 make iso-user
 make EDITION=user run-iso
 make run-installed
-```
 
-### Equipos antiguos (8–15 MB)
+Use make reset-installer-target to recreate the default blank test disk.
 
-El kernel detecta automáticamente un perfil austero para equipos con entre 8 y
-15 MB de RAM, como una configuración mínima del Dell Latitude C600. Conserva
-el escritorio y las aplicaciones bajo demanda, pero usa VGA 640×480×4,
-elimina el buffer frontal duplicado, no precarga wallpaper ni iconos, reduce
-la frecuencia del temporizador a 100 Hz y deja red, USB hotplug, impresión,
-salvapantallas y sonido de inicio desactivados. El sistema sigue arrancando
-con 8 MB; las aplicaciones pesadas como NetSurf, Wine o Doom requieren más
-RAM y conviene abrirlas sólo cuando sean necesarias.
+Graphics test targets
 
-Use `make reset-installer-target` to recreate the default blank 64 MiB test
-disk. A 1.44 MiB floppy can be formatted from Setup, but uses FAT12; FAT32 is
-not valid for that media and the complete operating system does not fit on it.
+The source contains QEMU targets for several graphics backends, including VMware SVGA and VirtIO GPU/VirGL. See the relevant documents under docs/ before testing experimental 3D acceleration.
 
----
+SDK
 
-## Project Structure
+Native software uses the public versioned BlesKernOS userspace API rather than private kernel structures.
 
-```
-boot/       Bootloader
-kernel/     Kernel
-gui/        Window system
-programs/   Native applications
-system/     Desktop components, services, screensavers, libraries and Control Panel
-assets/     Icons and images
-tools/      Build tools
-```
+Important SDK components include:
 
-Runtime layout inside the FAT32 system image:
+sdk/include/                 Public headers
+build/sdk/                   Built SDK libraries
+build/sdk/libblesk_tinygl.a  TinyGL integration
+build/sdk/libblesk_mesa.a    Mesa 3.5 / OpenGL integration
 
-```text
-/SYSTEM/PROGRAMS/   Native applications (.o)
-/SYSTEM/CORE/       Desktop core components
-/SYSTEM/WIN32/      Win32 applications (.exe)
-/SYSTEM/GRAPHICS.PAK Shared React95-compatible graphic resources
-```
+See docs/API.md and sdk/README.md.
 
-Native applications use the versioned public API documented in
-[`docs/API.md`](docs/API.md). Kernel driver headers are not part of the app ABI.
+Kernel driver headers are not part of the native application ABI.
 
----
+Project structure
 
-## Roadmap
+boot/       Bootloader and boot stages
+kernel/     Kernel, compatibility layers and built-in subsystems
+gui/        Window system, compositor and graphics helpers
+programs/   Native applications and ports
+system/     Desktop components, commands, services, drivers, languages and Control Panel
+libs/       TinyGL, Mesa 3.5, BearSSL and system libraries
+sdk/        Public application SDK
+docs/       Architecture and subsystem documentation
+assets/     Icons, wallpapers, sounds and shared graphics resources
+tools/      Image/build/resource generation tools
+tests/      Kernel, userspace, hardware and compatibility tests
 
-Current focus for version 0.6:
+Runtime layout inside the FAT32 system image includes:
 
-- Complete Ring 3 migration
-- Continue expanding the versioned userspace API
-- More native applications
-- GUI improvements
-- Better filesystem support
+/SYSTEM/PROGRAMS/      Native applications
+/SYSTEM/CORE/          Desktop core components
+/SYSTEM/DRIVERS/       Loadable .DVR drivers
+/SYSTEM/LIBS/          Runtime/static libraries
+/SYSTEM/WIN32/         Win32 applications and compatibility files
+/SYSTEM/PRINTERS/      Printer profiles
+/SYSTEM/GRAPHICS.PAK   Shared graphical resources
 
----
+Technical documentation
 
-## License
+The repository contains more detailed documentation for individual subsystems, including:
 
-MIT License.
+docs/API.md — native userspace API.
 
----
+docs/SMP.md — multiprocessor architecture.
 
-## Acknowledgments
+docs/SMP_LOCKING.md — SMP locking model.
 
-- DoomGeneric
-- TinyGL
-- React95 (shared icon catalog; see THIRD_PARTY_LICENSES.md)
-- OSDev Wiki
-- James Molloy's Kernel Tutorial
-- Bochs VBE documentation
-- KolibriOS
+docs/PAGING.md — paging and process memory.
+
+docs/LOW_MEMORY_MODE.md — 4-15 MB compatibility profiles.
+
+docs/DRIVERS.md — loadable driver ABI.
+
+docs/NETWORKING.md — IPv4, sockets, HTTP and TLS.
+
+docs/printing.md — print subsystem.
+
+docs/mesa35.md — Mesa 3.5/GFX3D integration.
+
+docs/tinygl-gfx3d.md — TinyGL hardware acceleration path.
+
+docs/VMWARE_SVGA_II.md — VMware SVGA-II.
+
+docs/virtio_gpu.md — VirtIO GPU and VirGL.
+
+docs/WIN16_PORT.md — experimental Win16 compatibility.
+
+docs/WIN32_PHASE1_COMPAT.md — Win32 compatibility work.
+
+Current limitations and future work
+
+The 0.8 tree is considerably more capable than previous releases, but several architectural areas remain unfinished:
+
+Per-process page tables and true virtual-memory isolation.
+
+IOAPIC-based interrupt routing and more complete SMP IRQ distribution.
+
+Broader hardware validation of experimental GPU drivers.
+
+More complete OpenGL hardware acceleration coverage.
+
+More complete TCP/IP behavior and server-side sockets.
+
+EHCI/class-driver unification in the USB stack.
+
+More complete Win16 and Win32 API compatibility.
+
+Continued GUI, driver, filesystem and performance stabilization.
+
+License
+
+BlesKernOS is distributed under the MIT License unless a source file or third-party component states otherwise.
+
+Third-party components retain their own licenses and notices. See THIRD_PARTY_LICENSES.md and the license files included with individual libraries.
+
+Acknowledgments and third-party components
+
+BlesKernOS uses, ports, adapts or references several external projects and public technical resources. These include:
+
+DoomGeneric
+
+TinyGL
+
+Mesa 3.5
+
+BearSSL
+
+Wine documentation/source architecture for compatibility work where noted
+
+React95 shared graphic resources where documented
+
+OSDev Wiki
+
+James Molloy's Kernel Tutorial
+
+Bochs VBE documentation
+
+KolibriOS and other open operating-system projects used as technical references
+
+See THIRD_PARTY_LICENSES.md for licensing details.
