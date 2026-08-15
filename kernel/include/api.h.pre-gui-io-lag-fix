@@ -1,0 +1,366 @@
+#ifndef BK_API_H
+#define BK_API_H
+
+#include "types.h"
+#include "memory.h"
+#include "vfs.h"
+#include "gfx.h"
+#include "mouse.h"
+#include "keyboard.h"
+#include "rtc.h"
+#include "task.h"
+#include "../../gui/gui.h"
+#include "file_dialog.h"
+#include "block.h"
+#include "ata.h"
+#include "pci.h"
+#include "driver.h"
+#include "iso9660.h"
+#include "elf_loader.h"
+#include "pe_loader.h"
+#include "about_dialog.h"
+#include "startup_sound.h"
+#include "sound.h"
+#include "user_config.h"
+#include "datetime_prefs.h"
+#include "language.h"
+#include "network.h"
+#include "clipboard.h"
+#include "graphics_resources.h"
+#include "shell.h"
+#include "vga.h"
+#include "lpt.h"
+#include "bkl_progress.h"
+#include "../stdio.h"
+#include "../../gui/image.h"
+#include "../../programs/programs.h"
+
+#define BK_API_VERSION 25
+
+/*
+ * API publica y estable para aplicaciones. Los controladores del kernel no
+ * forman parte de esta ABI: una aplicacion debe incluir este archivo y usar
+ * exclusivamente simbolos bk_*.
+ */
+#define BK_API_CAP_SYSTEM   0x00000001U
+#define BK_API_CAP_FILES    0x00000002U
+#define BK_API_CAP_GUI      0x00000004U
+#define BK_API_CAP_GRAPHICS 0x00000008U
+#define BK_API_CAP_INPUT    0x00000010U
+#define BK_API_CAP_SOUND    0x00000020U
+#define BK_API_CAP_TIME     0x00000040U
+#define BK_API_CAP_PROCESS  0x00000080U
+#define BK_API_CAP_APP      0x00000100U
+#define BK_API_CAP_NETWORK  0x00000200U
+#define BK_API_CAP_LANGUAGE 0x00000400U
+#define BK_API_CAP_PRINT    0x00000800U
+#define BK_API_CAP_ALL      0x00000FFFU
+
+#define BK_FILE_READ_ONLY   VFS_O_RDONLY
+#define BK_FILE_WRITE_ONLY  VFS_O_WRONLY
+#define BK_FILE_READ_WRITE  VFS_O_RDWR
+#define BK_FILE_MAX_PATH    VFS_MAX_PATH
+#define BK_FILE_MAX_NAME    VFS_MAX_NAME
+
+typedef vfs_dir_entry_t bk_file_entry_t;
+typedef gfx_info_t bk_gfx_info_t;
+typedef gfx_display_mode_t bk_gfx_mode_t;
+typedef mouse_state_t bk_mouse_state_t;
+typedef kbd_key_event_t bk_key_event_t;
+typedef kbd_modifiers_t bk_key_modifiers_t;
+typedef rtc_datetime_t bk_datetime_t;
+
+typedef struct {
+    uint16_t base;
+    uint8_t raw_status;
+    bool present;
+    bool busy;
+    bool selected;
+    bool paper_out;
+    bool error;
+    bool acknowledged;
+} bk_print_lpt_info_t;
+
+/* ABI extendida: conserva bk_print_lpt_info_t para binarios 0.8 existentes. */
+typedef struct {
+    uint32_t struct_size;
+    char name[16];
+    uint16_t base;
+    uint8_t raw_status;
+    bool present;
+    bool busy;
+    bool selected;
+    bool paper_out;
+    bool error;
+    bool acknowledged;
+    bool virtual_port;
+} bk_print_port_info_t;
+typedef gui_image_t bk_gui_image_t;
+typedef net_info_t bk_net_info_t;
+
+typedef enum {
+    BK_PROC_UNUSED = 0,
+    BK_PROC_READY,
+    BK_PROC_RUNNING,
+    BK_PROC_SLEEPING,
+    BK_PROC_ZOMBIE
+} bk_proc_state_t;
+
+typedef struct {
+    uint32_t pid;
+    uint32_t process_id;
+    char name[24];
+    bk_proc_state_t state;
+    uint32_t cpu_ticks;
+    uint32_t memory_bytes;
+    bool system;
+    bool user;
+    bool exit_requested;
+} bk_proc_info_t;
+
+typedef void (*bk_thread_entry_t)(void *argument);
+
+/* 10 system APIs */
+uint32_t bk_sys_api_version(void);
+uint32_t bk_sys_capabilities(void);
+void bk_sys_log(const char *message);
+void bk_console_putchar(char character);
+void bk_console_write(const char *text);
+uint32_t bk_sys_getpid(void);
+void bk_sys_yield(void);
+void bk_sys_sleep_ticks(uint32_t ticks);
+void bk_sys_sleep_ms(uint32_t milliseconds);
+uint32_t bk_sys_ticks(void);
+uint32_t bk_sys_tick_frequency(void);
+uint32_t bk_sys_uptime_ms(void);
+void bk_sys_reboot(void);
+void bk_sys_shutdown(void);
+void *bk_sys_alloc(size_t size);
+void *bk_sys_alloc_zero(size_t size);
+void *bk_sys_realloc(void *ptr, size_t size);
+void bk_sys_free(void *ptr);
+bool bk_sys_memory_info(system_memory_info_t *info);
+
+/* 10 file APIs */
+int bk_file_open(const char *path, uint32_t flags);
+int bk_file_read(int fd, void *buffer, uint32_t size);
+int bk_file_write(int fd, const void *buffer, uint32_t size);
+bool bk_file_close(int fd);
+bool bk_file_read_all(const char *path, void **buffer, uint32_t *size);
+bool bk_file_write_all(const char *path, const void *buffer, uint32_t size);
+bool bk_file_list_dir(const char *path, vfs_dir_entry_t *entries,
+                      uint32_t max_entries, uint32_t *count);
+bool bk_file_chdir(const char *path);
+const char *bk_file_getcwd(void);
+bool bk_file_mkdir(const char *path);
+bool bk_file_remove(const char *path);
+bool bk_file_rename(const char *old_path, const char *new_path);
+bool bk_setup_extract_package(const char *path);
+bool bk_setup_get_progress(bkl_setup_progress_t *progress);
+bool bk_file_space(uint64_t *total_bytes, uint64_t *free_bytes);
+bool bk_device_format_fat(const char *device_name, const char *volume_label);
+
+/* Transporte de impresion. El lenguaje/rasterizado permanece en Ring 3. */
+uint32_t bk_print_lpt_count(void);
+bool bk_print_lpt_info(uint32_t index, bk_print_lpt_info_t *info);
+bool bk_print_port_info(uint32_t index, bk_print_port_info_t *info);
+int32_t bk_print_lpt_write(uint32_t index, const void *data, uint32_t length,
+                           uint32_t idle_timeout_ms);
+
+
+/* Idioma global y catalogos de /SYSTEM/LENG. */
+const char *bk_lang_get(const char *key);
+const char *bk_lang_translate(const char *source);
+const char *bk_lang_current(void);
+uint32_t bk_lang_generation(void);
+uint32_t bk_lang_count(void);
+bool bk_lang_info(uint32_t index, bk_language_info_t *info);
+bool bk_lang_set(const char *code);
+
+/* Red publica para aplicaciones. */
+#define BK_NET_SOCKET_TCP 1U
+bool bk_net_get_info(bk_net_info_t *info);
+bool bk_net_dhcp(uint32_t timeout_ms);
+bool bk_net_ping(const uint8_t address[4], uint32_t timeout_ms,
+                 uint32_t *round_trip_ms);
+bool bk_net_resolve(const char *hostname, uint8_t address[4],
+                    uint32_t timeout_ms);
+int bk_net_socket_open(uint8_t type);
+bool bk_net_socket_connect(int socket, const uint8_t address[4],
+                           uint16_t port, uint32_t timeout_ms);
+int32_t bk_net_socket_send(int socket, const void *data, uint32_t length,
+                           uint32_t timeout_ms);
+int32_t bk_net_socket_receive(int socket, void *data, uint32_t capacity,
+                              uint32_t timeout_ms);
+void bk_net_socket_close(int socket);
+int32_t bk_net_http_get(const char *url, void *data, uint32_t capacity,
+                        uint32_t timeout_ms);
+int32_t bk_net_http_exchange(const char *url, const void *request,
+                             uint32_t request_length, void *data,
+                             uint32_t capacity, uint32_t timeout_ms);
+int32_t bk_net_tls_last_error(void);
+
+/* Portapapeles de texto global compartido por aplicaciones nativas. */
+bool bk_clipboard_set_text(const char *text);
+uint32_t bk_clipboard_get_text(char *buffer, uint32_t capacity);
+void bk_clipboard_clear(void);
+uint32_t bk_clipboard_generation(void);
+
+/* Descompresion segura para recursos web y archivos. */
+int32_t bk_data_inflate_zlib(const void *input, uint32_t input_length,
+                             void *output, uint32_t output_capacity);
+int32_t bk_data_inflate_gzip(const void *input, uint32_t input_length,
+                             void *output, uint32_t output_capacity);
+
+/* GUI y widgets publicos */
+gui_desktop_t *bk_gui_desktop(void);
+void bk_gui_request_paint(void);
+gui_window_t *bk_gui_create_window(gui_desktop_t *desktop, int x, int y,
+                                   int w, int h, const char *title);
+void bk_gui_close_window(gui_window_t *window);
+void bk_gui_focus_window(gui_desktop_t *desktop, gui_window_t *window);
+void bk_gui_set_window_content(gui_window_t *window,
+                               gui_window_content_paint_t paint,
+                               void *context);
+void bk_gui_set_window_event_handler(gui_window_t *window,
+                                     gui_window_event_t handler,
+                                     void *context);
+void bk_gui_set_window_min_size(gui_window_t *window, int min_w, int min_h);
+int bk_gui_add_menu(gui_window_t *window, const char *label);
+bool bk_gui_add_menu_item(gui_window_t *window, int menu, uint32_t id,
+                          const char *label, gui_menu_callback_t callback,
+                          void *context);
+void bk_gui_destroy_window(gui_desktop_t *desktop, gui_window_t *window);
+bool bk_gui_window_is_open(const gui_window_t *window);
+void bk_gui_window_set_owner(gui_window_t *window, uint32_t pid);
+void bk_gui_window_invalidate(gui_window_t *window);
+void bk_gui_window_set_text_context(
+    gui_window_t *window, gui_rect_t bounds, bool has_selection,
+    bool editable, gui_menu_callback_t callback, void *context);
+void bk_gui_window_clear_text_context(gui_window_t *window);
+/* Presentacion sincrona para tareas Ring 3 que realizan una operacion
+ * bloqueante dentro de un callback. La aplicacion dibuja en la superficie
+ * devuelta y finaliza con bk_gui_window_end_immediate_paint(). */
+bool bk_gui_window_begin_immediate_paint(gui_window_t *window,
+                                         gui_surface_t **surface);
+void bk_gui_window_end_immediate_paint(gui_window_t *window,
+                                       gui_surface_t *surface);
+bool bk_gui_window_bounds(const gui_window_t *window, gui_rect_t *bounds);
+bool bk_gui_window_content_rect(const gui_window_t *window, gui_rect_t *rect);
+void bk_gui_surface_clear(gui_surface_t *surface, uint32_t color);
+void bk_gui_surface_putpixel(gui_surface_t *surface, int x, int y,
+                             uint32_t color);
+void bk_gui_surface_fill_rect(gui_surface_t *surface, gui_rect_t rect,
+                              uint32_t color);
+void bk_gui_surface_draw_rect(gui_surface_t *surface, gui_rect_t rect,
+                              uint32_t color);
+void bk_gui_surface_draw_line(gui_surface_t *surface, int x0, int y0,
+                              int x1, int y1, uint32_t color);
+void bk_gui_surface_draw_text(gui_surface_t *surface, int x, int y,
+                              const char *text, uint32_t fg, uint32_t bg,
+                              bool fill_bg);
+uint16_t bk_gui_text_width_px(const char *text, uint32_t length,
+                              uint16_t pixel_height, bool monospace, bool bold);
+void bk_gui_surface_draw_text_px(gui_surface_t *surface, int x, int y,
+                                 const char *text, uint32_t length,
+                                 uint32_t foreground, uint16_t pixel_height,
+                                 bool bold, bool italic, bool monospace,
+                                 gui_rect_t clip);
+bool bk_gui_image_decode_bmp(gui_image_t *image, const void *data,
+                             uint32_t length);
+bool bk_gui_image_decode_png(gui_image_t *image, const void *data,
+                             uint32_t length);
+bool bk_gui_image_decode_gif(gui_image_t *image, const void *data,
+                             uint32_t length);
+bool bk_gui_image_decode_jpeg(gui_image_t *image, const void *data,
+                              uint32_t length);
+bool bk_gui_image_decode_svg(gui_image_t *image, const void *data,
+                             uint32_t length);
+void bk_gui_image_free(gui_image_t *image);
+bool bk_gui_cursor_set_resource(const char *resource_name,
+                                int hotspot_x, int hotspot_y);
+void bk_gui_cursor_reset(void);
+void bk_gui_surface_draw_image(gui_surface_t *surface, gui_rect_t destination,
+                               gui_rect_t clip, const gui_image_t *image);
+uint16_t bk_gui_text_width(const char *text);
+gui_widget_t *bk_gui_create_button(gui_desktop_t *desktop,
+                                   gui_window_t *window, gui_rect_t bounds,
+                                   const char *text,
+                                   gui_widget_callback_t callback);
+gui_widget_t *bk_gui_create_textbox(gui_desktop_t *desktop,
+                                    gui_window_t *window, gui_rect_t bounds,
+                                    const char *text, uint16_t max_length,
+                                    gui_widget_callback_t callback);
+uint32_t bk_gui_widget_id(const gui_widget_t *widget);
+void bk_gui_widget_set_bounds(gui_window_t *window, gui_widget_t *widget,
+                              gui_rect_t bounds);
+void bk_gui_widget_set_text(gui_widget_t *widget, const char *text);
+bool bk_gui_widget_set_icon(gui_widget_t *widget, const char *resource_name);
+bool bk_gui_widget_get_text(const gui_widget_t *widget, char *buffer,
+                            uint32_t capacity);
+void bk_gui_widget_set_enabled(gui_widget_t *widget, bool enabled);
+void bk_gui_widget_set_visible(gui_window_t *window, gui_widget_t *widget,
+                               bool visible);
+void bk_gui_widget_set_focus(gui_window_t *window, gui_widget_t *widget,
+                             bool focused);
+bool bk_gui_widget_is_focused(const gui_window_t *window,
+                              const gui_widget_t *widget);
+void bk_gui_scrollbar_init_vertical(gui_scrollbar_t *bar,
+                                     gui_rect_t bounds, uint32_t value,
+                                     uint32_t visible, uint32_t total);
+void bk_gui_scrollbar_paint_vertical(gui_surface_t *surface,
+                                      const gui_scrollbar_t *bar);
+bool bk_gui_scrollbar_handle_event_vertical(
+    const gui_scrollbar_t *bar, gui_scrollbar_drag_t *drag,
+    const gui_event_t *event, uint32_t wheel_step, uint32_t *new_value);
+
+/* 10 graphics/input APIs */
+bool bk_gfx_info(gfx_info_t *info);
+bool bk_gfx_set_mode(uint16_t width, uint16_t height, uint8_t bpp);
+void bk_gfx_clear(uint32_t rgb);
+void bk_gfx_putpixel(int x, int y, uint32_t rgb);
+uint32_t bk_gfx_getpixel(int x, int y);
+void bk_gfx_fill_rect(int x, int y, int w, int h, uint32_t rgb);
+bool bk_gfx_present_rect(int x, int y, int w, int h);
+bool bk_gfx_flush(void);
+bool bk_gfx_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
+void bk_gfx_draw_line(int x0, int y0, int x1, int y1, uint32_t rgb);
+void bk_gfx_draw_text(int x, int y, const char *text, uint8_t fg,
+                      uint8_t bg, bool fill_bg);
+bool bk_input_mouse(mouse_state_t *state);
+bool bk_input_key_event(kbd_key_event_t *event);
+bool bk_input_key_modifiers(kbd_modifiers_t *modifiers);
+void bk_input_mouse_set_position(int32_t x, int32_t y);
+void bk_input_mouse_set_sensitivity(uint8_t sensitivity);
+uint8_t bk_input_mouse_get_sensitivity(void);
+
+/* 10 sound/time/process APIs */
+bool bk_sound_has_sb16(void);
+bool bk_sound_pcm_available(void);
+bool bk_sound_pcm_busy(void);
+const char *bk_sound_pcm_name(void);
+bool bk_sound_play_pcm_u8(const uint8_t *samples, uint32_t length,
+                          uint16_t sample_rate_hz, uint8_t volume);
+bool bk_sound_tone(uint32_t frequency_hz, uint32_t duration_ms);
+void bk_sound_stop(void);
+bool bk_time_datetime(rtc_datetime_t *datetime);
+uint32_t bk_proc_count(void);
+const task_t *bk_proc_get(uint32_t index);
+bool bk_proc_info(uint32_t index, bk_proc_info_t *info);
+bool bk_proc_request_exit(uint32_t pid);
+bool bk_proc_exit_requested(void);
+void bk_proc_set_memory_hint(uint32_t bytes);
+void bk_proc_bind_window(gui_window_t *window);
+const char *bk_proc_launch_arg(void);
+int bk_proc_spawn_thread(const char *name, bk_thread_entry_t entry,
+                         void *argument);
+void bk_proc_exit(void) NORETURN;
+
+bool bk_app_launch(const char *path, const char *argument);
+bool bk_shell_take_exit_request(void);
+
+#ifndef BK_API_IMPLEMENTATION
+#include "api_compat.h"
+#endif
+
+#endif

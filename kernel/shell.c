@@ -10,7 +10,9 @@
 #include "include/vfs.h"
 #include "include/pci.h"
 #include "include/gfx.h"
+#include "include/gfx3d.h"
 #include "include/mouse.h"
+#include "include/network.h"
 
 static char history[SHELL_HISTORY_LEN][SHELL_MAX_CMD];
 static int history_count = 0;
@@ -114,7 +116,7 @@ static int cmd_help(int argc UNUSED, char **argv UNUSED) {
     kprintf("Comandos disponibles:\n");
     kprintf("  help clear echo mem reboot halt color cpuid history\n");
     kprintf("  version uptime ticks panic cpu disks fatinfo mount\n");
-    kprintf("  pwd cd ls cat open read close mkdir pci video gfx vesa mouse\n");
+    kprintf("  pwd cd ls cat open read close mkdir pci video gfx vesa mouse net\n");
     kprintf("  lsmem lsirq gdt idt heap tasks (proximamente)\n");
     return 0;
 }
@@ -602,6 +604,27 @@ static int cmd_pci(int argc, char **argv) {
     return 1;
 }
 
+static void print_gfx_capabilities(uint32_t caps) {
+    kprintf("Driver grafico: %s\n", gfx_driver_name());
+    kprintf("Capacidades activas (0x%x):", caps);
+    if (!caps) {
+        kprintf(" ninguna\n");
+        return;
+    }
+    if (caps & GFX_CAP_PRESENT_BUFFER) kprintf(" backbuffer");
+    if (caps & GFX_CAP_DIRTY_RECTS) kprintf(" dirty-rects");
+    if (caps & GFX_CAP_HW_CURSOR) kprintf(" cursor-hw");
+    if (caps & GFX_CAP_FENCE) kprintf(" fences");
+    if (caps & GFX_CAP_OFFSCREEN_VRAM) kprintf(" surfaces-vram");
+    if (caps & GFX_CAP_GMR) kprintf(" gmr2");
+    if (caps & GFX_CAP_BITBLT) kprintf(" bitblt");
+    if (caps & GFX_CAP_FILL) kprintf(" fill");
+    if (caps & GFX_CAP_BITBLT_COPY_HW) kprintf(" copy-hw");
+    if (caps & GFX_CAP_BITBLT_ROP_HW) kprintf(" rop-hw");
+    if (caps & GFX_CAP_SURFACE_BLIT_HW) kprintf(" surface-blit-hw");
+    kprintf("\n");
+}
+
 static int cmd_video(int argc, char **argv) {
     const gfx_info_t *info = gfx_get_info();
     video_type_t type = gfx_detect_video_type();
@@ -618,6 +641,10 @@ static int cmd_video(int argc, char **argv) {
     else if (info->mode == GFX_MODE_VGA_13H) mode = "vga13h";
     else if (info->mode == GFX_MODE_VGA_12H) mode = "vga12h";
     else if (info->mode == GFX_MODE_VESA_LFB) mode = "vesa-lfb";
+    else if (info->mode == GFX_MODE_VMWARE_SVGA) mode = "vmware-svga2";
+    else if (info->mode == GFX_MODE_VIRTIO_GPU) mode = "virtio-gpu";
+    else if (info->mode == GFX_MODE_ATI_RAGE128) mode = "ati-rage128";
+    else if (info->mode == GFX_MODE_INTEL_GMA9XX) mode = "intel-gma9xx";
 
     kprintf("Video BDA: %s (0x%x)\n", gfx_video_type_name(type), type);
     kprintf("Modo: %s fb=0x%x %ux%u pitch=%u bpp=%u\n",
@@ -627,13 +654,83 @@ static int cmd_video(int argc, char **argv) {
             info->height,
             info->pitch,
             info->bpp);
+    print_gfx_capabilities(gfx_driver_capabilities());
+    {
+        gfx3d_info_t info3d;
+        if (gfx3d_get_info(&info3d)) {
+            kprintf("Driver 3D: %s sobre %s caps=%x host=%x guest=%x\n",
+                    info3d.driver_name, info3d.transport_name,
+                    info3d.capabilities, info3d.host_hw_version,
+                    info3d.guest_hw_version);
+        } else {
+            kprintf("Driver 3D: %s (backend 3D de hardware no disponible)\n",
+                    gfx3d_driver_name());
+        }
+    }
     kprintf("Uso: video [info|text]\n");
     return 0;
 }
 
+static void print_gfx3d_capabilities(uint32_t caps) {
+    kprintf("Capacidades 3D (0x%x):", caps);
+    if (!caps) {
+        kprintf(" ninguna\n");
+        return;
+    }
+    if (caps & GFX3D_CAP_FIXED_FUNCTION) kprintf(" fixed-function");
+    if (caps & GFX3D_CAP_RENDER_TARGETS) kprintf(" render-targets");
+    if (caps & GFX3D_CAP_VERTEX_BUFFERS) kprintf(" vertex-buffers");
+    if (caps & GFX3D_CAP_SURFACE_DMA) kprintf(" surface-dma");
+    if (caps & GFX3D_CAP_PRESENT) kprintf(" present");
+    if (caps & GFX3D_CAP_ALPHA_BLEND) kprintf(" alpha-blend");
+    if (caps & GFX3D_CAP_TEXTURES) kprintf(" textures");
+    if (caps & GFX3D_CAP_SCALE) kprintf(" scale");
+    if (caps & GFX3D_CAP_TRANSFORM) kprintf(" transform");
+    if (caps & GFX3D_CAP_WINDOW_SURFACES) kprintf(" window-surfaces");
+    if (caps & GFX3D_CAP_GLYPH_ATLAS) kprintf(" glyph-atlas");
+    if (caps & GFX3D_CAP_TINYGL) kprintf(" tinygl");
+    if (caps & GFX3D_CAP_DEPTH_BUFFER) kprintf(" depth-buffer");
+    kprintf("\n");
+}
+
+static int cmd_gfx3d(int argc, char **argv) {
+    gfx3d_info_t info;
+    if (argc < 2 || kstrcmp(argv[1], "info") == 0) {
+        if (!gfx3d_get_info(&info)) {
+            kprintf("GFX3D no disponible. Driver=%s.\n",
+                    gfx3d_driver_name());
+            kprintf("ATI requiere ATIR128 activo en 32 bpp; VMware requiere SVGA_CAP_3D.\n");
+            return 1;
+        }
+        kprintf("GFX3D activo: driver=%s transporte=%s\n",
+                info.driver_name, info.transport_name);
+        kprintf("HW version host=%x guest=%x generacion=%u\n",
+                info.host_hw_version, info.guest_hw_version,
+                info.transport_generation);
+        print_gfx3d_capabilities(info.capabilities);
+        return 0;
+    }
+    if (kstrcmp(argv[1], "test") == 0) {
+        uint32_t fence = 0U;
+        if (!gfx3d_selftest(&fence)) {
+            kprintf("Prueba GFX3D fallo o el backend no ofrece una ruta 3D estable.\n");
+            return 1;
+        }
+        kprintf("Prueba GFX3D completada correctamente; fence=%u.\n", fence);
+        return 0;
+    }
+    if (kstrcmp(argv[1], "reset") == 0) {
+        gfx3d_reset();
+        kprintf("Estado GFX3D reiniciado; se negociara al proximo uso.\n");
+        return 0;
+    }
+    kprintf("Uso: gfx3d [info|test|reset]\n");
+    return 1;
+}
+
 static int cmd_gfx(int argc, char **argv) {
     if (argc < 2) {
-        kprintf("Uso: gfx <mode13|demo|clear|pixel|rect|line|text|palette>\n");
+        kprintf("Uso: gfx <mode13|demo|clear|pixel|rect|copy|rop|fence|surface|line|text|palette>\n");
         return 1;
     }
 
@@ -670,6 +767,7 @@ static int cmd_gfx(int argc, char **argv) {
         color = parse_number(argv[4]);
         if (x < 0 || y < 0 || color < 0 || color > 255) return 1;
         gfx_putpixel(x, y, (uint8_t)color);
+        (void)gfx_flush();
         return 0;
     }
     if (kstrcmp(argv[1], "rect") == 0) {
@@ -685,6 +783,88 @@ static int cmd_gfx(int argc, char **argv) {
         color = parse_number(argv[6]);
         if (color < 0 || color > 255) return 1;
         gfx_fill_rect(x, y, w, h, (uint8_t)color);
+        return 0;
+    }
+    if (kstrcmp(argv[1], "copy") == 0) {
+        int sx, sy, dx, dy, w, h;
+        if (argc < 8) {
+            kprintf("Uso: gfx copy <sx> <sy> <dx> <dy> <w> <h>\n");
+            return 1;
+        }
+        sx = parse_number(argv[2]);
+        sy = parse_number(argv[3]);
+        dx = parse_number(argv[4]);
+        dy = parse_number(argv[5]);
+        w = parse_number(argv[6]);
+        h = parse_number(argv[7]);
+        if (!gfx_copy_rect(sx, sy, dx, dy, w, h)) {
+            kprintf("Copia 2D no soportada en el modo actual.\n");
+            return 1;
+        }
+        return 0;
+    }
+    if (kstrcmp(argv[1], "rop") == 0) {
+        gfx_rop_t rop;
+        uint32_t fence = 0U;
+        int sx, sy, dx, dy, w, h;
+        if (argc < 9) {
+            kprintf("Uso: gfx rop <copy|xor|and|or|invert> <sx> <sy> <dx> <dy> <w> <h>\n");
+            return 1;
+        }
+        if (kstrcmp(argv[2], "copy") == 0) rop = GFX_ROP_COPY;
+        else if (kstrcmp(argv[2], "xor") == 0) rop = GFX_ROP_XOR;
+        else if (kstrcmp(argv[2], "and") == 0) rop = GFX_ROP_AND;
+        else if (kstrcmp(argv[2], "or") == 0) rop = GFX_ROP_OR;
+        else if (kstrcmp(argv[2], "invert") == 0) rop = GFX_ROP_INVERT;
+        else { kprintf("ROP desconocido.\n"); return 1; }
+        sx = parse_number(argv[3]); sy = parse_number(argv[4]);
+        dx = parse_number(argv[5]); dy = parse_number(argv[6]);
+        w = parse_number(argv[7]); h = parse_number(argv[8]);
+        if (!gfx_bitblt(sx, sy, dx, dy, w, h, rop, &fence)) {
+            kprintf("BitBlt fallo.\n");
+            return 1;
+        }
+        kprintf("BitBlt completado; fence=%u.\n", fence);
+        return 0;
+    }
+    if (kstrcmp(argv[1], "fence") == 0) {
+        uint32_t fence = gfx_last_fence();
+        if (!fence) {
+            kprintf("El host no expuso fences o no hay uno pendiente.\n");
+            return 0;
+        }
+        kprintf("Esperando fence %u... ", fence);
+        if (!gfx_wait_fence(fence)) {
+            kprintf("timeout.\n");
+            return 1;
+        }
+        kprintf("completado.\n");
+        return 0;
+    }
+    if (kstrcmp(argv[1], "surface") == 0) {
+        const uint16_t sw = 96U, sh = 64U;
+        gfx_surface_handle_t surface = GFX_SURFACE_INVALID;
+        uint32_t *pixels;
+        uint32_t fence = 0U;
+        pixels = (uint32_t *)kmalloc((size_t)sw * sh * sizeof(uint32_t));
+        if (!pixels) { kprintf("Sin memoria para la prueba.\n"); return 1; }
+        for (uint32_t y = 0; y < sh; y++)
+            for (uint32_t x = 0; x < sw; x++)
+                pixels[y * sw + x] = ((x / 8U + y / 8U) & 1U)
+                    ? 0x00FFFFFFU : 0x000060C0U;
+        if (!gfx_surface_create(sw, sh, &surface) ||
+            !gfx_surface_upload(surface, pixels, sw, NULL) ||
+            !gfx_surface_blit(surface, 0, 0, 64, 64, sw, sh, &fence)) {
+            if (surface != GFX_SURFACE_INVALID)
+                (void)gfx_surface_destroy(surface);
+            kfree(pixels);
+            kprintf("La superficie VRAM no esta disponible.\n");
+            return 1;
+        }
+        if (fence) (void)gfx_wait_fence(fence);
+        (void)gfx_surface_destroy(surface);
+        kfree(pixels);
+        kprintf("Superficie off-screen dibujada; fence=%u.\n", fence);
         return 0;
     }
     if (kstrcmp(argv[1], "line") == 0) {
@@ -730,7 +910,7 @@ static int cmd_gfx(int argc, char **argv) {
         return 0;
     }
 
-    kprintf("Uso: gfx <mode12|mode13|demo|clear|pixel|rect|line|text|palette>\n");
+    kprintf("Uso: gfx <mode12|mode13|demo|clear|pixel|rect|copy|line|text|palette>\n");
     return 1;
 }
 
@@ -781,6 +961,7 @@ static int cmd_vesa(int argc, char **argv) {
         rgb = parse_number(argv[4]);
         if (x < 0 || y < 0 || rgb < 0) return 1;
         gfx_putpixel_rgb(x, y, (uint32_t)rgb);
+        (void)gfx_flush();
         return 0;
     }
     if (kstrcmp(argv[1], "rect") == 0) {
@@ -848,6 +1029,87 @@ static int cmd_mouse(int argc, char **argv) {
     return state.present ? 0 : 1;
 }
 
+static bool parse_ipv4(const char *text, uint8_t address[4]) {
+    uint32_t value = 0;
+    uint8_t part = 0;
+    bool digit = false;
+    if (!text || !address) return false;
+    while (true) {
+        char c = *text++;
+        if (c >= '0' && c <= '9') {
+            value = value * 10U + (uint32_t)(c - '0');
+            if (value > 255U) return false;
+            digit = true;
+        } else if (c == '.' || c == '\0') {
+            if (!digit || part >= 4U) return false;
+            address[part++] = (uint8_t)value;
+            value = 0;
+            digit = false;
+            if (c == '\0') return part == 4U;
+        } else return false;
+    }
+}
+
+static void print_ipv4(const uint8_t address[4]) {
+    kprintf("%u.%u.%u.%u", address[0], address[1], address[2], address[3]);
+}
+
+static int cmd_net(int argc, char **argv) {
+    net_info_t info;
+    if (argc < 2 || kstrcmp(argv[1], "info") == 0) {
+        network_get_info(&info);
+        kprintf("Red: dispositivo=%s enlace=%s configurada=%s\n",
+                info.device[0] ? info.device : "ninguno",
+                info.link_up ? "activo" : "inactivo",
+                info.configured ? "si" : "no");
+        kprintf("  MAC=%x:%x:%x:%x:%x:%x RX=%u TX=%u descartados=%u\n",
+                info.mac[0], info.mac[1], info.mac[2], info.mac[3],
+                info.mac[4], info.mac[5], info.rx_packets,
+                info.tx_packets, info.rx_dropped);
+        kprintf("  IP="); print_ipv4(info.address);
+        kprintf(" mascara="); print_ipv4(info.netmask);
+        kprintf(" gateway="); print_ipv4(info.gateway);
+        kprintf(" DNS="); print_ipv4(info.dns); kprintf("\n");
+        return info.device[0] ? 0 : 1;
+    }
+    if (kstrcmp(argv[1], "dhcp") == 0) {
+        kprintf("Solicitando configuracion DHCP...\n");
+        if (!network_dhcp(10000U)) {
+            kprintf("DHCP fallo o no hay NETSTACK.DVR/NIC.\n");
+            return 1;
+        }
+        kprintf("DHCP completado. Use 'net info'.\n");
+        return 0;
+    }
+    if (kstrcmp(argv[1], "static") == 0) {
+        uint8_t ip[4], mask[4], gateway[4], dns[4];
+        if (argc < 6 || !parse_ipv4(argv[2], ip) ||
+            !parse_ipv4(argv[3], mask) || !parse_ipv4(argv[4], gateway) ||
+            !parse_ipv4(argv[5], dns)) {
+            kprintf("Uso: net static <ip> <mascara> <gateway> <dns>\n");
+            return 1;
+        }
+        return network_configure(ip, mask, gateway, dns) ? 0 : 1;
+    }
+    if (kstrcmp(argv[1], "ping") == 0) {
+        uint8_t ip[4];
+        uint32_t elapsed;
+        if (argc < 3 || !parse_ipv4(argv[2], ip)) {
+            kprintf("Uso: net ping <ipv4>\n");
+            return 1;
+        }
+        if (!network_ping(ip, 3000U, &elapsed)) {
+            kprintf("Sin respuesta de "); print_ipv4(ip); kprintf("\n");
+            return 1;
+        }
+        kprintf("Respuesta de "); print_ipv4(ip);
+        kprintf(": tiempo=%u ms\n", elapsed);
+        return 0;
+    }
+    kprintf("Uso: net [info|dhcp|static <ip> <mask> <gw> <dns>|ping <ip>]\n");
+    return 1;
+}
+
 static int cmd_stub(int argc UNUSED, char **argv UNUSED) {
     kprintf("Comando pendiente de implementar.\n");
     return 0;
@@ -882,9 +1144,12 @@ static const shell_cmd_t commands[] = {
     {"mkdir", "Crea un directorio", cmd_mkdir},
     {"pci", "Lista e inspecciona dispositivos PCI", cmd_pci},
     {"video", "Muestra info de video o vuelve a texto", cmd_video},
+    {"gfx3d", "Diagnostica y prueba el backend 3D activo", cmd_gfx3d},
+    {"svga3d", "Alias compatible del diagnostico GFX3D", cmd_gfx3d},
     {"gfx", "Prueba primitivas graficas VGA", cmd_gfx},
     {"vesa", "Prueba backend VESA LFB", cmd_vesa},
     {"mouse", "Muestra estado del mouse PS/2", cmd_mouse},
+    {"net", "Configura y prueba la red IPv4", cmd_net},
     {"lsmem", "Pendiente", cmd_stub},
     {"lsirq", "Pendiente", cmd_stub},
     {"gdt", "Pendiente", cmd_stub},

@@ -1,5 +1,27 @@
 #include "../math.h"
 
+double floor(double x) {
+    int i = (int)x;
+    if ((double)i > x) i--;
+    return (double)i;
+}
+
+double pow(double base, double exp) {
+    int n = (int)exp;
+    double result = 1.0;
+    int negative = 0;
+    if (exp == 0.0) return 1.0;
+    if (base == 0.0) return 0.0;
+    if (n < 0) { negative = 1; n = -n; }
+    if ((double)n != (negative ? -exp : exp)) return base;
+    while (n > 0) {
+        if (n & 1) result *= base;
+        base *= base;
+        n >>= 1;
+    }
+    return negative ? 1.0 / result : result;
+}
+
 #define PI       3.14159265358979323846
 #define HALF_PI  1.57079632679489661923
 #define TWO_PI   6.28318530717958647692

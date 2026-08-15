@@ -113,6 +113,7 @@ const GLubyte *extensions_string = (const GLubyte *)
 	       "TGL_FEATURE_ALIGNAS "
 #endif
                "TGL_BUFFER_EXT "
+               "TGL_BLESKERNOS_GFX3D "
 #if TGL_HAS(ALT_RENDERMODES)
                "TGL_FEEDBACK "
                "TGL_SELECT "
@@ -126,7 +127,7 @@ const GLubyte *glGetString(GLenum name)
     case GL_VENDOR:
         return vendor_string;
     case GL_RENDERER:
-        return renderer_string;
+        return tglBlesKernOSRendererName();
     case GL_VERSION:
         return version_string;
     case GL_EXTENSIONS:

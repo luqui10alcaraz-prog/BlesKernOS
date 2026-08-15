@@ -1,0 +1,7 @@
+[Printer]
+Id=USBPS
+Name=USB Printer PostScript
+Language=POSTSCRIPT
+Transport=LPT
+Port=USBPRN1
+DPI=600

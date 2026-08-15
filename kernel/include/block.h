@@ -3,14 +3,15 @@
 
 #include "types.h"
 
-#define BLOCK_MAX_DEVICES 8
+#define BLOCK_MAX_DEVICES 24
 #define BLOCK_SECTOR_SIZE 512
 
 typedef enum {
     BLOCK_DEVICE_NONE = 0,
     BLOCK_DEVICE_ATA,
     BLOCK_DEVICE_FLOPPY,
-    BLOCK_DEVICE_ATAPI
+    BLOCK_DEVICE_ATAPI,
+    BLOCK_DEVICE_USB
 } block_device_type_t;
 
 typedef struct block_device block_device_t;
@@ -32,6 +33,10 @@ struct block_device {
 void block_init(void);
 bool block_register(const char *name, block_device_type_t type, uint32_t sector_count, void *driver_data, block_read_fn_t read);
 bool block_register_ex(const char *name, block_device_type_t type, uint32_t sector_count, uint16_t sector_size, bool read_only, void *driver_data, block_read_fn_t read);
+/* Register a bounded view into an existing disk. The view reuses the parent
+ * controller callbacks but all block I/O is translated by base_lba. */
+bool block_register_view(const char *name, block_device_t *parent,
+                         uint32_t base_lba, uint32_t sector_count);
 block_device_t *block_get(const char *name);
 uint32_t block_count(void);
 block_device_t *block_at(uint32_t index);

@@ -60,11 +60,13 @@ void gui_event_init(gui_event_queue_t *queue) {
     queue->last_mouse_buttons = mouse.buttons;
     queue->last_mouse_x = mouse.x;
     queue->last_mouse_y = mouse.y;
+    queue->last_mouse_wheel = mouse.wheel;
 }
 
 void gui_event_poll(gui_event_queue_t *queue) {
     mouse_state_t mouse;
     kbd_modifiers_t mods;
+    kbd_key_event_t key_event;
     uint8_t changed;
 
     if (!queue) return;
@@ -73,37 +75,49 @@ void gui_event_poll(gui_event_queue_t *queue) {
 
     if (mouse.x != queue->last_mouse_x || mouse.y != queue->last_mouse_y) {
         push_event(queue, (gui_event_t){
-            GUI_EVENT_MOUSE_MOVE, mouse.x, mouse.y,
-            mouse.x - queue->last_mouse_x, mouse.y - queue->last_mouse_y,
-            mouse.buttons, 0, 0
+            .type = GUI_EVENT_MOUSE_MOVE, .x = mouse.x, .y = mouse.y,
+            .dx = mouse.x - queue->last_mouse_x,
+            .dy = mouse.y - queue->last_mouse_y, .buttons = mouse.buttons
+        });
+    }
+
+    if (mouse.wheel != queue->last_mouse_wheel) {
+        push_event(queue, (gui_event_t){
+            .type = GUI_EVENT_MOUSE_WHEEL, .x = mouse.x, .y = mouse.y,
+            .dy = mouse.wheel - queue->last_mouse_wheel,
+            .buttons = mouse.buttons
         });
     }
 
     if (changed & MOUSE_LEFT_BUTTON) {
         push_event(queue, (gui_event_t){
-            (mouse.buttons & MOUSE_LEFT_BUTTON) ? GUI_EVENT_MOUSE_DOWN
-                                                : GUI_EVENT_MOUSE_UP,
-            mouse.x, mouse.y, 0, 0, mouse.buttons, MOUSE_LEFT_BUTTON, 0
+            .type = (mouse.buttons & MOUSE_LEFT_BUTTON)
+                ? GUI_EVENT_MOUSE_DOWN : GUI_EVENT_MOUSE_UP,
+            .x = mouse.x, .y = mouse.y, .buttons = mouse.buttons,
+            .button = MOUSE_LEFT_BUTTON
         });
     }
     if (changed & MOUSE_RIGHT_BUTTON) {
         push_event(queue, (gui_event_t){
-            (mouse.buttons & MOUSE_RIGHT_BUTTON) ? GUI_EVENT_MOUSE_DOWN
-                                                 : GUI_EVENT_MOUSE_UP,
-            mouse.x, mouse.y, 0, 0, mouse.buttons, MOUSE_RIGHT_BUTTON, 0
+            .type = (mouse.buttons & MOUSE_RIGHT_BUTTON)
+                ? GUI_EVENT_MOUSE_DOWN : GUI_EVENT_MOUSE_UP,
+            .x = mouse.x, .y = mouse.y, .buttons = mouse.buttons,
+            .button = MOUSE_RIGHT_BUTTON
         });
     }
 
-    while (kbd_haschar()) {
-        char key = kbd_getchar();
+    while (kbd_next_event(&key_event)) {
+        if (!key_event.pressed) continue;
         kbd_get_modifiers(&mods);
         push_event(queue, (gui_event_t){GUI_EVENT_KEY, mouse.x, mouse.y, 0, 0,
-                   mouse.buttons, 0, key, mods.shift, mods.ctrl, mods.alt});
+                   mouse.buttons, 0, key_event.key,
+                   mods.shift, mods.ctrl, mods.alt});
     }
 
     queue->last_mouse_buttons = mouse.buttons;
     queue->last_mouse_x = mouse.x;
     queue->last_mouse_y = mouse.y;
+    queue->last_mouse_wheel = mouse.wheel;
 }
 
 bool gui_event_next(gui_event_queue_t *queue, gui_event_t *event) {

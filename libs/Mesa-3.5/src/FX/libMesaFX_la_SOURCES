@@ -1,0 +1,15 @@
+libMesaFX_la_SOURCES = \
+	fxapi.c \
+	fxdd.c \
+	fxddspan.c \
+	fxddtex.c \
+	fxdrv.h \
+	fxglidew.c \
+	fxglidew.h \
+	fxsetup.c \
+	fxtexman.c \
+	fxtris.c \
+	fxtritmp.h \
+	fxvb.c \
+	fxvbtmp.h \
+	fxwgl.c

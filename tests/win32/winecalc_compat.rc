@@ -1,0 +1,15 @@
+#include <windows.h>
+#define IDR_MENU 401
+#define IDR_ACCEL 402
+#define IDM_TEST 5001
+IDR_MENU MENU
+BEGIN
+    POPUP "Options"
+    BEGIN
+        MENUITEM "Test", IDM_TEST
+    END
+END
+IDR_ACCEL ACCELERATORS
+BEGIN
+    "T", IDM_TEST, VIRTKEY
+END

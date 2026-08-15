@@ -1,0 +1,8 @@
+[Printer]
+Id=GENTEXT
+Name=Generic Text File Printer
+Language=TEXT
+Transport=FILE
+Output=/TEMP/PRINT
+Extension=TXT
+DPI=120

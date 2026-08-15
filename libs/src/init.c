@@ -353,6 +353,8 @@ void glInit(void *zbuffer1)
     c->zb->depth_write = 1;
     c->zb->pointsize = 1;
 
+    tgl_gpu_context_init(c->zb);
+
     /* raster position */
     c->rasterpos.X = 0;
     c->rasterpos.Y = 0;
@@ -371,6 +373,7 @@ void glInit(void *zbuffer1)
 void glClose(void)
 {
     GLContext *c = gl_get_context();
+    tgl_gpu_context_close(c->zb);
     for (GLuint i = 0; i < 3; i++) {
         gl_free(c->matrix_stack[i]);
     }

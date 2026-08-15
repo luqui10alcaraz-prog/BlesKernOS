@@ -1,0 +1,11 @@
+--- system/control/language.c	2026-07-15 02:49:56.372208736 +0000
++++ system/control/language.c	2026-07-15 02:49:56.401149953 +0000
+@@ -82,7 +82,7 @@
+     (void)bk_about_attach(st->window, desktop, &(bk_about_info_t){
+         bk_lang_get("LANGUAGE.TITLE"), bk_lang_get("COMMON.VERSION_1"),
+         bk_lang_get("LANGUAGE.ABOUT"), "@H7A28E1E5",
+-        "/ICONS/KEYBOARD.BMP"});
++        "/ICONS/LANGUAGE.BMP"});
+     bk_gui_set_window_content(st->window, language_paint, st);
+     st->window->owner_pid = bk_sys_getpid();
+     bk_proc_bind_window(st->window);

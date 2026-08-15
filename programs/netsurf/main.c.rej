@@ -1,0 +1,11 @@
+--- programs/netsurf/main.c
++++ programs/netsurf/main.c
+@@ -1799,7 +1856,7 @@
+         (bk_gui_rect_t){120, 6, 42, 24}, "Det", netsurf_widget_callback);
+     toolbar_log_result("detener", state->stop_button);
+     state->home_button = bk_gui_create_button(state->desktop, state->window,
+-        (bk_gui_rect_t){164, 6, 46, 24}, "Inicio", netsurf_widget_callback);
++        (bk_gui_rect_t){164, 6, 46, 24}, "Inicio", netsurf_home_callback);
+     toolbar_log_result("inicio", state->home_button);
+ 
+     /* The in-page editor is optional.  Without it pages still render and

@@ -1,0 +1,227 @@
+#include "include/types.h"
+#include "include/vga.h"
+#include "include/memory.h"
+#include "include/paging.h"
+#include "include/keyboard.h"
+#include "include/pic.h"
+#include "include/idt.h"
+#include "include/shell.h"
+#include "include/pit.h"
+#include "include/sound.h"
+#include "include/block.h"
+#include "include/ata.h"
+#include "include/vfs.h"
+#include "include/iso9660.h"
+#include "include/pci.h"
+#include "include/gfx.h"
+#include "include/mouse.h"
+#include "../gui/gui.h"
+#include "include/task.h"
+#include "include/gdt.h"
+#include "include/bootsplash.h"
+#include "include/usb_storage.h"
+#include "include/recovery_console.h"
+#include "include/driver.h"
+#include "include/startup_sound.h"
+#include "include/elf_loader.h"
+#include "include/network.h"
+#include "include/language.h"
+#include "include/boot_mode.h"
+#include "include/installer.h"
+#include "include/floppy.h"
+#include "include/floppy_installer.h"
+#include "include/bkl_setup.h"
+#include "include/setup_boot.h"
+#include "include/lpt.h"
+
+#define PRINT_SPOOL_READY_PATH "/TEMP/SPOOL/READY.SYS"
+#define PRINT_SPOOL_START_TIMEOUT_TICKS 500U
+
+static bool kernel_start_print_spooler(void) {
+    vfs_dir_entry_t service;
+    int pid;
+    uint32_t start_ticks;
+
+    if (!vfs_stat("/SYSTEM/SERVICES/PRINTSPL.BEX", &service) ||
+        service.type != VFS_NODE_FILE) {
+        kprintf("[PRINT] PRINTSPL.BEX no encontrado; impresion desactivada\n");
+        return false;
+    }
+
+    /* READY.SYS puede persistir si /TEMP reside en disco. Se elimina antes de
+       arrancar para que la espera corresponda a esta instancia del daemon. */
+    (void)vfs_remove(PRINT_SPOOL_READY_PATH);
+
+    /* PrintSpool no usa el escritorio. El sentinel no nulo permite cargarlo
+       antes de gui_init(), igual que la autoprueba Ring 3 temprana. */
+    pid = elf_spawn_program_ex("/SYSTEM/SERVICES/PRINTSPL.BEX",
+                               (gui_desktop_t *)(uintptr_t)1U, NULL);
+    if (pid < 0) {
+        kprintf("[PRINT] no se pudo iniciar PRINTSPL.BEX: %s\n",
+                elf_last_error());
+        return false;
+    }
+
+    start_ticks = pit_get_ticks();
+    while ((uint32_t)(pit_get_ticks() - start_ticks) <
+           PRINT_SPOOL_START_TIMEOUT_TICKS) {
+        if (vfs_stat(PRINT_SPOOL_READY_PATH, &service) &&
+            service.type == VFS_NODE_FILE) {
+            kprintf("[PRINT] spooler precargado y listo, pid=%d\n", pid);
+            return true;
+        }
+        task_yield();
+    }
+
+    kprintf("[PRINT] aviso: spooler pid=%d no confirmo inicio a tiempo\n", pid);
+    return false;
+}
+
+static void kernel_start_print_spooler_deferred(void *argument UNUSED) {
+    uint32_t hz = pit_get_frequency_hz();
+    /* Let gui_run process its first input/paint cycles before touching FAT. */
+    task_sleep(hz ? hz : 100U);
+    kernel_start_print_spooler();
+    task_exit();
+}
+
+static void kernel_ring3_proxy_selftest(void) {
+    int pid;
+    int32_t status = -1;
+
+    pid = elf_spawn_program_ex("/SYSTEM/PROGRAMS/RING3PROXY.BEX",
+                               (gui_desktop_t *)(uintptr_t)1U, NULL);
+    if (pid < 0) {
+        kprintf("[RING3] no se pudo cargar autoprueba: %s\n",
+                elf_last_error());
+        return;
+    }
+    while (task_waitpid((uint32_t)pid, &status) == 0) task_yield();
+    kprintf("[RING3] proxy API y retorno a user-space: %s\n",
+            status == 0 ? "OK" : "ERROR");
+}
+
+extern void usermode_smoke_entry(void);
+
+void kernel_main(void) {
+    bool installer_boot = boot_mode_is_installer();
+    bool graphical_setup_boot = false;
+    vga_init();
+    gfx_init();
+    bootsplash_show("STARTING KERNEL", 3);
+    (void)paging_init();
+    mm_init();
+    bootsplash_show("MEMORY MANAGER", 10);
+    gdt_init();
+    idt_init();
+    task_init();
+    bootsplash_show("TASK SYSTEM", 18);
+    pic_init();
+    pit_init();
+    bootsplash_show("INTERRUPTS READY", 28);
+    kbd_init();
+    bootsplash_show("INPUT DEVICES", 38);
+    pci_init();
+    lpt_init();
+    block_init();
+    usb_storage_init();
+    ata_init();
+    if (installer_boot) floppy_init();
+    bootsplash_show("STORAGE DRIVERS", 52);
+    vfs_init();
+    driver_loader_init();
+    bootsplash_show("MOUNTING FILESYSTEM", 62);
+    sti();
+
+    /* El Stage 1 de instalacion escribe el magic INST. Primero se intenta
+       montar un CD ISO9660; si no existe, Setup entra en modo multidisquete. */
+    if (installer_boot) {
+        usb_storage_start_hotplug_task();
+        bootsplash_disable();
+        if (iso9660_builtin_init() && iso9660_mount_default()) {
+            kprintf("[SETUP] Instalador CD ISO9660 detectado.\n");
+            vfs_use_cdrom_as_root(true);
+            installer_run();
+        } else {
+            kprintf("[SETUP] Sin CD ISO9660; usando instalador en disquetes.\n");
+            vfs_use_cdrom_as_root(false);
+            floppy_installer_run();
+        }
+        return;
+    }
+
+    usb_storage_start_hotplug_task();
+    task_create_user("ring3-smoke", usermode_smoke_entry);
+    task_yield();
+
+    if (!vfs_mount_default()) {
+        /* Live CD: el kernel trae un lector ISO9660 minimo integrado para
+           romper el ciclo driver-en-CD / CD-sin-driver. El resto de drivers
+           y programas se cargan normalmente desde la raiz ISO de solo lectura. */
+        kprintf("[BOOT] FAT no disponible; intentando Live CD ISO9660...\n");
+        if (iso9660_builtin_init() && iso9660_mount_default()) {
+            vfs_use_cdrom_as_root(true);
+            kprintf("[BOOT] Live CD montado como raiz de solo lectura.\n");
+        } else {
+            /* El splash usa framebuffer; el shell de recuperacion usa VGA texto. */
+            bootsplash_show("RECOVERY SHELL", 100);
+            bootsplash_disable();
+            recovery_console_enter();
+            vga_init();
+            kprintf("[Kernel] No se pudo montar FAT ni ISO9660.\n");
+            kprintf("[Kernel] Iniciando shell de recuperacion.\n");
+            shell_run();
+        }
+    }
+
+    if (bkl_setup_pending()) {
+        bootsplash_disable();
+        vga_init();
+        kprintf("[BKL] Instalacion pendiente detectada; extrayendo paquete.\n");
+        if (!bkl_setup_finalize()) {
+            kprintf("[BKL] Error al finalizar la instalacion.\n");
+            kprintf("Conserve /SETUP para diagnostico y reinicie.\n");
+            for (;;) __asm__ volatile ("hlt");
+        }
+    }
+
+    graphical_setup_boot = setup_boot_requested();
+    if (graphical_setup_boot)
+        kprintf("[SETUP] START.INI solicita el asistente de primer arranque.\n");
+
+    language_init();
+
+    kernel_ring3_proxy_selftest();
+
+    kprintf("[DVR] Buscando modulos en /SYSTEM/DRIVERS\n");
+    kprintf("[DVR] %u modulo(s) cargado(s)\n",
+            driver_load_directory("/SYSTEM/DRIVERS"));
+    network_start_autoconfigure();
+
+    /* El arranque temprano conserva VGA/texto. Con PCI ya enumerado, esta
+       segunda pasada prioriza VMware SVGA-II y conserva VESA como fallback. */
+    gfx_init();
+
+    /* El servicio de impresion debe completar toda su carga antes de crear el
+       escritorio. Asi la primera accion GUI no paga el costo de inicializarlo. */
+    bootsplash_show("LOADING PRINT SERVICE", 68);
+    (void)kernel_start_print_spooler();
+
+    bootsplash_show("STARTING GUI", 70);
+    gui_set_setup_mode(graphical_setup_boot);
+    gui_init();
+    bootsplash_debug("kernel_main: gui_init returned");
+    bootsplash_disable();
+    if (task_create_kernel("print-start", kernel_start_print_spooler_deferred,
+                           NULL) < 0)
+        kprintf("[PRINT] no se pudo crear el inicio diferido del spooler\n");
+    if (graphical_setup_boot) {
+        if (!setup_boot_launch())
+            kprintf("[SETUP] El asistente grafico no pudo iniciarse.\n");
+    } else {
+        kprintf("[BKBOOT] QUEUE STARTUP SOUND\n");
+        startup_sound_play();
+    }
+    kprintf("[BKBOOT] ENTER GUI LOOP\n");
+    gui_run();
+}

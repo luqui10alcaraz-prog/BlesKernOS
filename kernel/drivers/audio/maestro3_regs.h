@@ -1,0 +1,130 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * ESS Allegro/Maestro3 register and DSP layout.
+ * Adapted from the material supplied by the user and Linux maestro3.c.
+ * Copyright (C) 1992-2000 Don Kim <don.kim@esstech.com>
+ */
+#ifndef BLESKERNOS_MAESTRO3_REGS_H
+#define BLESKERNOS_MAESTRO3_REGS_H
+
+#define M3_PCI_LEGACY_AUDIO_CTRL 0x40U
+#define M3_PCI_ALLEGRO_CONFIG    0x50U
+#define M3_PCI_USER_CONFIG       0x58U
+
+#define M3_SOUND_BLASTER_ENABLE  0x00000001U
+#define M3_FM_SYNTHESIS_ENABLE   0x00000002U
+#define M3_MPU401_IO_ENABLE      0x00000008U
+#define M3_MPU401_IRQ_ENABLE     0x00000010U
+#define M3_ALIAS_10BIT_IO        0x00000020U
+#define M3_USE_PCI_TIMING        0x00000040U
+#define M3_REDUCED_DEBOUNCE      0x00400000U
+#define M3_PM_CTRL_ENABLE        0x08000000U
+#define M3_CLK_DIV_BY_49         0x02000000U
+#define M3_CLK_MULT_MODE_SELECT  0x30000000U
+#define M3_CLK_MULT_MODE_SELECT2 0x00040000U
+#define M3_INT_CLK_SELECT        0x40000000U
+#define M3_INT_CLK_MULT_ENABLE   0x80000000U
+#define M3_INT_CLK_SRC_NOT_PCI   0x00100000U
+#define M3_IN_CLK_12MHZ_SELECT   0x00000100U
+
+#define M3_HOST_INT_CTRL         0x18U
+#define M3_HOST_INT_STATUS       0x1AU
+#define M3_CLKRUN_GEN_ENABLE     0x0100U
+#define M3_CODEC_COMMAND         0x30U
+#define M3_CODEC_DATA            0x32U
+#define M3_RING_BUS_CTRL_A       0x36U
+#define M3_RING_BUS_CTRL_B       0x38U
+#define M3_SDO_OUT_DEST_CTRL     0x3AU
+#define M3_SDO_IN_DEST_CTRL      0x3CU
+#define M3_SECOND_CODEC_ID_MASK  0x0003U
+#define M3_COMMAND_ADDR_OUT      0x0003U
+#define M3_STATUS_ADDR_IN        0x0003U
+#define M3_M3I_DOCK_ENABLE       0x0080U
+#define M3_SERIAL_AC_LINK_ENABLE 0x1000U
+#define M3_IO_SRAM_ENABLE        0x2000U
+
+#define M3_GPIO_DATA             0x60U
+#define M3_GPIO_MASK             0x64U
+#define M3_GPIO_DIRECTION        0x68U
+#define M3_GPO_PRIMARY_AC97      0x0001U
+#define M3_GPO_SECONDARY_AC97    0x0008U
+
+#define M3_HARDWARE_VOL_CTRL     0x1BU
+#define M3_SHADOW_MIX_REG_VOICE  0x1CU
+#define M3_HW_VOL_COUNTER_VOICE  0x1DU
+#define M3_SHADOW_MIX_REG_MASTER 0x1EU
+#define M3_HW_VOL_COUNTER_MASTER 0x1FU
+
+#define M3_ASSP_CONTROL_A        0xA2U
+#define M3_ASSP_CONTROL_B        0xA4U
+#define M3_ASSP_CONTROL_C        0xA6U
+#define M3_ASSP_0_WS_ENABLE      0x01U
+#define M3_ASSP_CLK_49MHZ_SELECT 0x08U
+#define M3_DSP_CLK_36MHZ_SELECT  0x40U
+#define M3_RESET_ASSP            0x00U
+#define M3_RUN_ASSP              0x01U
+#define M3_REGB_ENABLE_RESET     0x01U
+#define M3_REGB_STOP_CLOCK       0x10U
+
+#define M3_DSP_MEMORY_INDEX      0x80U
+#define M3_DSP_MEMORY_TYPE       0x82U
+#define M3_DSP_MEMORY_DATA       0x84U
+#define M3_MEM_INTERNAL_CODE     0x0002U
+#define M3_MEM_INTERNAL_DATA     0x0003U
+#define M3_MEMTYPE_MASK          0x0003U
+
+#define M3_REV_B_DATA_UNIT_LEN   0x0080U
+#define M3_NUM_KERNEL_DATA_UNITS 2U
+#define M3_DP_SHIFT_COUNT        7U
+#define M3_KDATA_BASE            0x1000U
+#define M3_KDATA_BASE2           0x1080U
+#define M3_KDATA_TASK0           (M3_KDATA_BASE + 0x00U)
+#define M3_KDATA_INSTANCE0_MINISRC (M3_KDATA_BASE + 0x1EU)
+#define M3_KDATA_CURRENT_DMA     (M3_KDATA_BASE + 0x26U)
+#define M3_KDATA_DMA_ACTIVE      (M3_KDATA_BASE + 0x28U)
+#define M3_KDATA_DMA_XFER0       (M3_KDATA_BASE + 0x29U)
+#define M3_KDATA_TIMER_RELOAD    (M3_KDATA_BASE + 0x36U)
+#define M3_KDATA_TIMER_CURRENT   (M3_KDATA_BASE + 0x37U)
+#define M3_KDATA_MIXER_XFER0     (M3_KDATA_BASE2 + 0x10U)
+#define M3_KDATA_MIXER_TASKS     (M3_KDATA_BASE2 + 0x1BU)
+#define M3_KDATA_DAC_LEFT_VOLUME (M3_KDATA_BASE2 + 0x1FU)
+#define M3_KDATA_DAC_RIGHT_VOLUME (M3_KDATA_BASE2 + 0x20U)
+
+#define M3_CDATA_READY           0x00U
+#define M3_CDATA_HOST_ADDR_LO    0x01U
+#define M3_CDATA_HOST_ADDR_HI    0x02U
+#define M3_CDATA_HOST_END_LO     0x03U
+#define M3_CDATA_HOST_END_HI     0x04U
+#define M3_CDATA_HOST_CUR_LO     0x05U
+#define M3_CDATA_HOST_CUR_HI     0x06U
+#define M3_CDATA_IN_BEGIN        0x09U
+#define M3_CDATA_IN_END          0x0AU
+#define M3_CDATA_IN_HEAD         0x0BU
+#define M3_CDATA_IN_TAIL         0x0CU
+#define M3_CDATA_OUT_BEGIN       0x0DU
+#define M3_CDATA_OUT_END         0x0EU
+#define M3_CDATA_OUT_HEAD        0x0FU
+#define M3_CDATA_OUT_TAIL        0x10U
+#define M3_CDATA_DMA_CONTROL     0x11U
+#define M3_CDATA_FREQUENCY       0x13U
+#define M3_CDATA_LEFT_VOLUME     0x14U
+#define M3_CDATA_RIGHT_VOLUME    0x15U
+
+#define M3_SRC3_DIRECTION        0x18U
+#define M3_SRC3_MODE             0x19U
+#define M3_SRC3_WORD_LENGTH      0x1AU
+#define M3_MINISRC_IN_SIZE       (0x50U * 2U)
+#define M3_MINISRC_OUT_SIZE      (0x50U * 2U * 2U)
+#define M3_MINISRC_BIQUAD_STAGE  2U
+#define M3_MINISRC_TMP_SIZE      (112U + (M3_MINISRC_BIQUAD_STAGE * 3U + 4U) * 4U)
+#define M3_MINISRC_COEF_LOC      0x175U
+#define M3_DMAC_AUTOREPEAT       0x1000U
+#define M3_DMAC_PAGE3            0x0000U
+#define M3_DMAC_BLOCKF           0x000FU
+#define M3_ARB_VOLUME            0x6800U
+
+#define M3_AC97_MASTER_VOLUME    0x02U
+#define M3_AC97_PCM_VOLUME       0x18U
+#define M3_AC97_VENDOR_ID1       0x7CU
+#define M3_AC97_VENDOR_ID2       0x7EU
+
+#endif

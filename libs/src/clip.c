@@ -111,7 +111,10 @@ void gl_draw_point(GLVertex *p0)
         } else
 #endif
         {
-            ZB_plot(c->zb, &p0->zp);
+            if (!tgl_gpu_submit_point(c, p0)) {
+                tgl_gpu_prepare_cpu(c->zb);
+                ZB_plot(c->zb, &p0->zp);
+            }
         }
     }
 }
@@ -178,10 +181,13 @@ void gl_draw_line(GLVertex *p1, GLVertex *p2)
         } else
 #endif
         {
-            if (c->zb->depth_test)
-                ZB_line_z(c->zb, &p1->zp, &p2->zp);
-            else
-                ZB_line(c->zb, &p1->zp, &p2->zp);
+            if (!tgl_gpu_submit_line(c, p1, p2)) {
+                tgl_gpu_prepare_cpu(c->zb);
+                if (c->zb->depth_test)
+                    ZB_line_z(c->zb, &p1->zp, &p2->zp);
+                else
+                    ZB_line(c->zb, &p1->zp, &p2->zp);
+            }
         }
     } else if ((cc1 & cc2) != 0) {
         return;
@@ -215,10 +221,13 @@ void gl_draw_line(GLVertex *p1, GLVertex *p2)
             } else
 #endif
             {
-                if (c->zb->depth_test)
-                    ZB_line_z(c->zb, &q1.zp, &q2.zp);
-                else
-                    ZB_line(c->zb, &q1.zp, &q2.zp);
+                if (!tgl_gpu_submit_line(c, &q1, &q2)) {
+                    tgl_gpu_prepare_cpu(c->zb);
+                    if (c->zb->depth_test)
+                        ZB_line_z(c->zb, &q1.zp, &q2.zp);
+                    else
+                        ZB_line(c->zb, &q1.zp, &q2.zp);
+                }
             }
         }
     }
@@ -447,7 +456,29 @@ int count_triangles, count_triangles_textured, count_pixels;
 void gl_draw_triangle_fill(GLVertex *p0, GLVertex *p1, GLVertex *p2)
 {
     GLContext *c = gl_get_context();
-    ZBuffer *zb = c->zb;
+    ZBuffer *zb;
+    GLVertex clipped[3];
+    if (!c || !c->zb || !p0 || !p1 || !p2) return;
+    zb = c->zb;
+
+    /* NDC +1 maps mathematically to the outer viewport edge (xsize/ysize).
+     * Integer rounding can therefore leave an otherwise correctly clipped
+     * vertex one pixel outside.  The old safety check discarded the whole
+     * triangle, making complex objects vanish as they were moved.  Feed the
+     * branch-free scanline code bounded local copies instead. */
+    clipped[0] = *p0; clipped[1] = *p1; clipped[2] = *p2;
+    for (GLint i = 0; i < 3; i++) {
+        if (clipped[i].zp.x < 0) clipped[i].zp.x = 0;
+        else if (clipped[i].zp.x >= zb->xsize) clipped[i].zp.x = zb->xsize - 1;
+        if (clipped[i].zp.y < 0) clipped[i].zp.y = 0;
+        else if (clipped[i].zp.y >= zb->ysize) clipped[i].zp.y = zb->ysize - 1;
+    }
+    p0 = &clipped[0]; p1 = &clipped[1]; p2 = &clipped[2];
+
+    if (c->texture_2d_enabled && !c->current_texture)
+        return;
+    if (tgl_gpu_submit_triangle(c, p0, p1, p2)) return;
+    tgl_gpu_prepare_cpu(zb);
     GLint dt = zb->depth_test;
     GLint dw = zb->depth_write;
     ZB_fillTriangleFunc func;
@@ -505,31 +536,33 @@ void gl_draw_triangle_fill(GLVertex *p0, GLVertex *p1, GLVertex *p2)
 void gl_draw_triangle_line(GLVertex *p0, GLVertex *p1, GLVertex *p2)
 {
     GLContext *c = gl_get_context();
-    if (c->zb->depth_test) {
-        if (p0->edge_flag)
-            ZB_line_z(c->zb, &p0->zp, &p1->zp);
-        if (p1->edge_flag)
-            ZB_line_z(c->zb, &p1->zp, &p2->zp);
-        if (p2->edge_flag)
-            ZB_line_z(c->zb, &p2->zp, &p0->zp);
-    } else {
-        if (p0->edge_flag)
-            ZB_line(c->zb, &p0->zp, &p1->zp);
-        if (p1->edge_flag)
-            ZB_line(c->zb, &p1->zp, &p2->zp);
-        if (p2->edge_flag)
-            ZB_line(c->zb, &p2->zp, &p0->zp);
-    }
+#define DRAW_EDGE(a_, b_) do { \
+        if (!tgl_gpu_submit_line(c, (a_), (b_))) { \
+            tgl_gpu_prepare_cpu(c->zb); \
+            if (c->zb->depth_test) \
+                ZB_line_z(c->zb, &(a_)->zp, &(b_)->zp); \
+            else \
+                ZB_line(c->zb, &(a_)->zp, &(b_)->zp); \
+        } \
+    } while (0)
+    if (p0->edge_flag) DRAW_EDGE(p0, p1);
+    if (p1->edge_flag) DRAW_EDGE(p1, p2);
+    if (p2->edge_flag) DRAW_EDGE(p2, p0);
+#undef DRAW_EDGE
 }
 
 /* Render a clipped triangle in point mode */
 void gl_draw_triangle_point(GLVertex *p0, GLVertex *p1, GLVertex *p2)
 {
     GLContext *c = gl_get_context();
-    if (p0->edge_flag)
-        ZB_plot(c->zb, &p0->zp);
-    if (p1->edge_flag)
-        ZB_plot(c->zb, &p1->zp);
-    if (p2->edge_flag)
-        ZB_plot(c->zb, &p2->zp);
+#define DRAW_POINT(p_) do { \
+        if (!tgl_gpu_submit_point(c, (p_))) { \
+            tgl_gpu_prepare_cpu(c->zb); \
+            ZB_plot(c->zb, &(p_)->zp); \
+        } \
+    } while (0)
+    if (p0->edge_flag) DRAW_POINT(p0);
+    if (p1->edge_flag) DRAW_POINT(p1);
+    if (p2->edge_flag) DRAW_POINT(p2);
+#undef DRAW_POINT
 }

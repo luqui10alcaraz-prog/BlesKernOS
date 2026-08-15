@@ -1,3 +1,4 @@
+#include "../kernel/include/api.h"
 /*
  * BlesPaint - simple bitmap paint program for BlesKernOS
  *
@@ -10,9 +11,6 @@
  *  - fixed bucket fill after v4 border guard regression
  */
 
-#include "programs.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/task.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -64,6 +62,8 @@ typedef struct {
 
     char status[72];
     uint32_t saves;
+    gui_image_t toolbar_icons[5];
+    bool toolbar_icon_loaded[5];
 } paint_state_t;
 
 static paint_state_t *g_paint;
@@ -190,11 +190,11 @@ static void paint_make_save_path(paint_state_t *st, char *out, uint32_t out_size
 
 static const char *paint_tool_name(uint8_t tool)
 {
-    if (tool == PAINT_TOOL_PENCIL) return "Tool: Pencil";
-    if (tool == PAINT_TOOL_ERASER) return "Tool: Eraser";
-    if (tool == PAINT_TOOL_FILL) return "Tool: Fill";
-    if (tool == PAINT_TOOL_LINE) return "Tool: Line";
-    if (tool == PAINT_TOOL_RECT) return "Tool: Rect";
+    if (tool == PAINT_TOOL_PENCIL) return "@HE209FDA4";
+    if (tool == PAINT_TOOL_ERASER) return "@H0329BD85";
+    if (tool == PAINT_TOOL_FILL) return "@H5D96EFE8";
+    if (tool == PAINT_TOOL_LINE) return "@HC387A3C7";
+    if (tool == PAINT_TOOL_RECT) return "@H968F47A7";
     return "Tool";
 }
 
@@ -356,13 +356,13 @@ static void paint_flood_fill(paint_state_t *st, int x, int y)
     replacement = (st->tool == PAINT_TOOL_ERASER) ? PAINT_COLOR_WHITE : st->color;
 
     if (target == replacement) {
-        paint_status(st, "Nada que rellenar");
+        paint_status(st, "@HD5A87CD7");
         return;
     }
 
-    queue = (paint_point_t *)kzalloc((uint32_t)(sizeof(paint_point_t) * max_points));
+    queue = (paint_point_t *)bk_sys_alloc_zero((uint32_t)(sizeof(paint_point_t) * max_points));
     if (!queue) {
-        paint_status(st, "Sin memoria para cubeta");
+        paint_status(st, "@HD802E81F");
         return;
     }
 
@@ -380,8 +380,8 @@ static void paint_flood_fill(paint_state_t *st, int x, int y)
                             (int)p.x, (int)p.y - 1, target, replacement);
     }
 
-    kfree(queue);
-    paint_status(st, "Relleno aplicado");
+    bk_sys_free(queue);
+    paint_status(st, "@H4D623D47");
     if (st->window) st->window->dirty = true;
 }
 
@@ -401,7 +401,7 @@ static bool paint_build_bmp(paint_state_t *st, uint8_t **out_data, uint32_t *out
     pixel_bytes = row_stride * PAINT_CANVAS_H;
     file_size = 54 + pixel_bytes;
 
-    bmp = (uint8_t *)kzalloc(file_size);
+    bmp = (uint8_t *)bk_sys_alloc_zero(file_size);
     if (!bmp) return false;
 
     bmp[0] = 'B';
@@ -447,23 +447,23 @@ static bool paint_save_bmp(paint_state_t *st)
     paint_make_save_path(st, path, sizeof(path));
 
     if (!paint_build_bmp(st, &bmp, &bmp_size)) {
-        paint_status(st, "No se pudo crear BMP en memoria");
+        paint_status(st, "@HAADFB3C1");
         return false;
     }
 
     file = fopen(path, "wb");
     if (!file) {
-        kfree(bmp);
-        paint_status(st, "Guardar fallo: fopen/VFS write no disponible");
+        bk_sys_free(bmp);
+        paint_status(st, "@H119AE964");
         return false;
     }
 
     wrote = fwrite(bmp, 1, bmp_size, file);
     fclose(file);
-    kfree(bmp);
+    bk_sys_free(bmp);
 
     if ((uint32_t)wrote != bmp_size) {
-        paint_status(st, "Guardar fallo: escritura incompleta");
+        paint_status(st, "@HEB5D3CAF");
         return false;
     }
 
@@ -474,7 +474,7 @@ static bool paint_save_bmp(paint_state_t *st)
 
 static gui_rect_t paint_canvas_rect(const gui_window_t *window)
 {
-    int top = gui_window_content_top(window);
+    int top = bk_gui_window_content_top(window);
     return (gui_rect_t){
         window->bounds.x + 12,
         window->bounds.y + top + 64,
@@ -495,7 +495,7 @@ static gui_rect_t paint_name_rect(const gui_window_t *window)
 
 static gui_rect_t paint_button_rect(const gui_window_t *window, int index)
 {
-    int top = gui_window_content_top(window);
+    int top = bk_gui_window_content_top(window);
     return (gui_rect_t){
         window->bounds.x + 12 + index * 60,
         window->bounds.y + top + 8,
@@ -519,7 +519,7 @@ static gui_rect_t paint_palette_rect(const gui_window_t *window, int index)
 
 static gui_rect_t paint_brush_rect(const gui_window_t *window, int index)
 {
-    int top = gui_window_content_top(window);
+    int top = bk_gui_window_content_top(window);
     return (gui_rect_t){
         window->bounds.x + 332 + index * 30,
         window->bounds.y + top + 9,
@@ -534,23 +534,24 @@ static void paint_draw_relief(gui_surface_t *surface, gui_rect_t rect, bool pres
     uint32_t dark = pressed ? 0x00FFFFFF : 0x00606060;
     uint32_t mid = 0x00A0A0A0;
 
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y, rect.w, 1}, light);
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y, 1, rect.h}, light);
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y + rect.h - 1, rect.w, 1}, dark);
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + rect.w - 1, rect.y, 1, rect.h}, dark);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y, rect.w, 1}, light);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y, 1, rect.h}, light);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x, rect.y + rect.h - 1, rect.w, 1}, dark);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + rect.w - 1, rect.y, 1, rect.h}, dark);
 
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + 1, rect.y + rect.h - 2, rect.w - 2, 1}, mid);
-    gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + rect.w - 2, rect.y + 1, 1, rect.h - 2}, mid);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + 1, rect.y + rect.h - 2, rect.w - 2, 1}, mid);
+    bk_gui_gfx_fill_rect(surface, (gui_rect_t){rect.x + rect.w - 2, rect.y + 1, 1, rect.h - 2}, mid);
 }
 
 static void paint_draw_button(gui_surface_t *surface, gui_rect_t rect,
-                              const char *text, bool active)
+                              const char *text, bool active,
+                              const gui_image_t *icon)
 {
     uint32_t fill = active ? 0x00BFE7FF : 0x00E8E8E8;
-    int text_x = rect.x + 6;
+    int text_x = rect.x + (icon && icon->pixels ? 25 : 6);
     int text_y = rect.y + 8;
 
-    gui_gfx_fill_rect(surface, rect, fill);
+    bk_gui_gfx_fill_rect(surface, rect, fill);
     paint_draw_relief(surface, rect, active);
 
     if (active) {
@@ -558,7 +559,13 @@ static void paint_draw_button(gui_surface_t *surface, gui_rect_t rect,
         text_y++;
     }
 
-    gui_font_draw_string_clipped(surface, text_x, text_y,
+    if (icon && icon->pixels)
+        bk_gui_surface_draw_image(surface,
+            (gui_rect_t){rect.x + 5 + (active ? 1 : 0),
+                         rect.y + (rect.h - 16) / 2 + (active ? 1 : 0),
+                         16, 16}, rect, icon);
+
+    bk_gui_font_draw_string_clipped(surface, text_x, text_y,
                                  text, 0x00000000, rect);
 }
 
@@ -567,9 +574,9 @@ static void paint_draw_brush_button(gui_surface_t *surface, gui_rect_t rect,
 {
     uint32_t fill = active ? 0x00BFE7FF : 0x00E8E8E8;
 
-    gui_gfx_fill_rect(surface, rect, fill);
+    bk_gui_gfx_fill_rect(surface, rect, fill);
     paint_draw_relief(surface, rect, active);
-    gui_font_draw_string_clipped(surface, rect.x + 7, rect.y + 7,
+    bk_gui_font_draw_string_clipped(surface, rect.x + 7, rect.y + 7,
                                  text, 0x00000000, rect);
 }
 
@@ -594,8 +601,8 @@ static void paint_draw_preview(paint_state_t *st, gui_surface_t *surface,
     y1 = canvas_rect.y + st->preview_y;
 
     if (st->tool == PAINT_TOOL_LINE) {
-        gui_gfx_draw_line(surface, x0, y0, x1, y1, preview_color);
-        gui_gfx_draw_line(surface, x0 + 1, y0, x1 + 1, y1, preview_color);
+        bk_gui_gfx_draw_line(surface, x0, y0, x1, y1, preview_color);
+        bk_gui_gfx_draw_line(surface, x0 + 1, y0, x1 + 1, y1, preview_color);
     } else {
         int left = x0 < x1 ? x0 : x1;
         int right = x0 < x1 ? x1 : x0;
@@ -603,8 +610,8 @@ static void paint_draw_preview(paint_state_t *st, gui_surface_t *surface,
         int bottom = y0 < y1 ? y1 : y0;
 
         r = (gui_rect_t){left, top, right - left + 1, bottom - top + 1};
-        gui_gfx_draw_rect(surface, r, preview_color);
-        gui_gfx_draw_rect(surface, (gui_rect_t){r.x + 1, r.y + 1, r.w - 2, r.h - 2},
+        bk_gui_gfx_draw_rect(surface, r, preview_color);
+        bk_gui_gfx_draw_rect(surface, (gui_rect_t){r.x + 1, r.y + 1, r.w - 2, r.h - 2},
                           preview_color);
     }
 }
@@ -632,9 +639,9 @@ static void paint_draw_name_box(paint_state_t *st, gui_window_t *window,
     }
     line[pos] = '\0';
 
-    gui_gfx_fill_rect(surface, box, st->editing_name ? 0x00FFFFFF : 0x00EFEFEF);
-    gui_gfx_draw_rect(surface, box, st->editing_name ? 0x00000000 : 0x00808080);
-    gui_font_draw_string_clipped(surface, box.x + 5, box.y + 5,
+    bk_gui_gfx_fill_rect(surface, box, st->editing_name ? 0x00FFFFFF : 0x00EFEFEF);
+    bk_gui_gfx_draw_rect(surface, box, st->editing_name ? 0x00000000 : 0x00808080);
+    bk_gui_font_draw_string_clipped(surface, box.x + 5, box.y + 5,
                                  line, 0x00000000, box);
 }
 
@@ -651,26 +658,31 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
 
     clip = (gui_rect_t){
         window->bounds.x + GUI_BORDER_SIZE,
-        window->bounds.y + gui_window_content_top(window),
+        window->bounds.y + bk_gui_window_content_top(window),
         window->bounds.w - GUI_BORDER_SIZE * 2,
-        window->bounds.h - gui_window_content_top(window) - GUI_BORDER_SIZE
+        window->bounds.h - bk_gui_window_content_top(window) - GUI_BORDER_SIZE
     };
 
-    gui_gfx_fill_rect(surface, clip, 0x00DCDCDC);
+    bk_gui_gfx_fill_rect(surface, clip, 0x00DCDCDC);
 
     paint_draw_button(surface, paint_button_rect(window, 0), "Pencil",
-                      st->tool == PAINT_TOOL_PENCIL);
+                      st->tool == PAINT_TOOL_PENCIL,
+                      st->toolbar_icon_loaded[0] ? &st->toolbar_icons[0] : NULL);
     paint_draw_button(surface, paint_button_rect(window, 1), "Eraser",
-                      st->tool == PAINT_TOOL_ERASER);
+                      st->tool == PAINT_TOOL_ERASER,
+                      st->toolbar_icon_loaded[1] ? &st->toolbar_icons[1] : NULL);
     paint_draw_button(surface, paint_button_rect(window, 2), "Fill",
-                      st->tool == PAINT_TOOL_FILL);
-    paint_draw_button(surface, paint_button_rect(window, 3), "Clean", false);
-    paint_draw_button(surface, paint_button_rect(window, 4), "Save", false);
+                      st->tool == PAINT_TOOL_FILL,
+                      st->toolbar_icon_loaded[2] ? &st->toolbar_icons[2] : NULL);
+    paint_draw_button(surface, paint_button_rect(window, 3), "Clean", false,
+                      st->toolbar_icon_loaded[3] ? &st->toolbar_icons[3] : NULL);
+    paint_draw_button(surface, paint_button_rect(window, 4), "Save", false,
+                      st->toolbar_icon_loaded[4] ? &st->toolbar_icons[4] : NULL);
 
     label_rect = (gui_rect_t){window->bounds.x + 332,
-                              window->bounds.y + gui_window_content_top(window) + 36,
+                              window->bounds.y + bk_gui_window_content_top(window) + 36,
                               150, 18};
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  "Brush", 0x00000000, label_rect);
 
     for (int i = 0; i < 5; i++) {
@@ -680,7 +692,7 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
     }
 
     canvas_rect = paint_canvas_rect(window);
-    gui_gfx_fill_rect(surface,
+    bk_gui_gfx_fill_rect(surface,
                       (gui_rect_t){canvas_rect.x - 2, canvas_rect.y - 2,
                                    canvas_rect.w + 4, canvas_rect.h + 4},
                       0x00606060);
@@ -688,16 +700,19 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
     if (st->canvas) {
         for (int y = 0; y < PAINT_CANVAS_H; y++) {
             for (int x = 0; x < PAINT_CANVAS_W; x++) {
-                gui_gfx_putpixel(surface, canvas_rect.x + x, canvas_rect.y + y,
+                bk_gui_gfx_putpixel(surface, canvas_rect.x + x, canvas_rect.y + y,
                                  st->canvas[(uint32_t)y * PAINT_CANVAS_W + (uint32_t)x]);
             }
         }
     } else {
-        gui_gfx_fill_rect(surface, canvas_rect, PAINT_COLOR_WHITE);
-        gui_font_draw_string_clipped(surface, canvas_rect.x + 8, canvas_rect.y + 8,
-                                     "Sin memoria para canvas", 0x00000000,
+        bk_gui_gfx_fill_rect(surface, canvas_rect, PAINT_COLOR_WHITE);
+        bk_gui_font_draw_string_clipped(surface, canvas_rect.x + 8, canvas_rect.y + 8,
+                                     "@H58F6DCB9", 0x00000000,
                                      canvas_rect);
     }
+    for (uint32_t i = 0; i < 5U; i++)
+        if (st->toolbar_icon_loaded[i])
+            bk_gui_image_free(&st->toolbar_icons[i]);
 
     paint_draw_preview(st, surface, canvas_rect);
 
@@ -705,37 +720,37 @@ static void paint_content(gui_window_t *window, gui_surface_t *surface, void *co
                               canvas_rect.y,
                               150,
                               18};
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  paint_tool_name(st->tool), 0x00000000,
                                  label_rect);
     label_rect.y += 16;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  st->status, 0x00000000,
                                  label_rect);
     label_rect.y += 18;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
-                                 "Keys: S save", 0x00000000,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+                                 "@H55935899", 0x00000000,
                                  label_rect);
     label_rect.y += 14;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
-                                 "C clean", 0x00000000,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+                                 "@HF51385D3", 0x00000000,
                                  label_rect);
     label_rect.y += 14;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  "P/E/F/L/R", 0x00000000,
                                  label_rect);
     label_rect.y += 22;
-    gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
+    bk_gui_font_draw_string_clipped(surface, label_rect.x, label_rect.y,
                                  "Colors", 0x00000000,
                                  label_rect);
 
     for (int i = 0; i < (int)(sizeof(g_palette) / sizeof(g_palette[0])); i++) {
         r = paint_palette_rect(window, i);
-        gui_gfx_fill_rect(surface, r, g_palette[i]);
-        gui_gfx_draw_rect(surface, r,
+        bk_gui_gfx_fill_rect(surface, r, g_palette[i]);
+        bk_gui_gfx_draw_rect(surface, r,
                           st->color == g_palette[i] ? 0x00FFFFFF : 0x00404040);
         if (st->color == g_palette[i]) {
-            gui_gfx_draw_rect(surface,
+            bk_gui_gfx_draw_rect(surface,
                               (gui_rect_t){r.x - 1, r.y - 1, r.w + 2, r.h + 2},
                               0x00000000);
         }
@@ -802,11 +817,11 @@ static bool paint_canvas_event(paint_state_t *st, const gui_event_t *event)
         } else if (st->tool == PAINT_TOOL_PENCIL ||
                    st->tool == PAINT_TOOL_ERASER) {
             paint_draw_dot(st, cx, cy);
-            paint_status(st, "Dibujando");
+            paint_status(st, "@H7276FA29");
         } else if (st->tool == PAINT_TOOL_LINE) {
-            paint_status(st, "Preview de linea");
+            paint_status(st, "@H6273B627");
         } else if (st->tool == PAINT_TOOL_RECT) {
-            paint_status(st, "Preview de rectangulo");
+            paint_status(st, "@HCE4F3B6E");
         }
 
         if (st->window) st->window->dirty = true;
@@ -837,11 +852,11 @@ static void paint_set_brush(paint_state_t *st, uint8_t size)
 
     st->brush_size = size;
 
-    if (size == 1) paint_status(st, "Brocha 1 px");
-    else if (size == 2) paint_status(st, "Brocha 2 px");
-    else if (size == 4) paint_status(st, "Brocha 4 px");
-    else if (size == 8) paint_status(st, "Brocha 8 px");
-    else paint_status(st, "Brocha 12 px");
+    if (size == 1) paint_status(st, "@HB4B72D15");
+    else if (size == 2) paint_status(st, "@H6581D406");
+    else if (size == 4) paint_status(st, "@HC93EA080");
+    else if (size == 8) paint_status(st, "@H219C73DC");
+    else paint_status(st, "@H14B1A8BD");
 }
 
 static void paint_handle_toolbar(paint_state_t *st, const gui_event_t *event)
@@ -850,23 +865,23 @@ static void paint_handle_toolbar(paint_state_t *st, const gui_event_t *event)
 
     if (paint_inside(paint_name_rect(st->window), event->x, event->y)) {
         st->editing_name = true;
-        paint_status(st, "Escribi nombre y Enter para guardar");
+        paint_status(st, "@H11D1126E");
     } else {
         st->editing_name = false;
     }
 
     if (paint_inside(paint_button_rect(st->window, 0), event->x, event->y)) {
         st->tool = PAINT_TOOL_PENCIL;
-        paint_status(st, "Herramienta: lapiz");
+        paint_status(st, "@HF8AA0271");
     } else if (paint_inside(paint_button_rect(st->window, 1), event->x, event->y)) {
         st->tool = PAINT_TOOL_ERASER;
-        paint_status(st, "Herramienta: goma");
+        paint_status(st, "@HF8760AC1");
     } else if (paint_inside(paint_button_rect(st->window, 2), event->x, event->y)) {
         st->tool = PAINT_TOOL_FILL;
-        paint_status(st, "Herramienta: cubeta");
+        paint_status(st, "@H555E681F");
     } else if (paint_inside(paint_button_rect(st->window, 3), event->x, event->y)) {
         paint_canvas_clear(st, PAINT_COLOR_WHITE);
-        paint_status(st, "Canvas limpio");
+        paint_status(st, "@H1363C4FD");
     } else if (paint_inside(paint_button_rect(st->window, 4), event->x, event->y)) {
         (void)paint_save_bmp(st);
     } else {
@@ -884,7 +899,7 @@ static void paint_handle_toolbar(paint_state_t *st, const gui_event_t *event)
                 if (st->tool == PAINT_TOOL_ERASER) {
                     st->tool = PAINT_TOOL_PENCIL;
                 }
-                paint_status(st, "Color seleccionado");
+                paint_status(st, "@HF1DF428D");
                 break;
             }
         }
@@ -906,7 +921,7 @@ static bool paint_handle_filename_key(paint_state_t *st, char key)
 
     if (key == 27) {
         st->editing_name = false;
-        paint_status(st, "Edicion de nombre cancelada");
+        paint_status(st, "@H676CC11C");
         if (st->window) st->window->dirty = true;
         return true;
     }
@@ -948,10 +963,10 @@ static bool paint_event(gui_window_t *window, const gui_event_t *event, void *co
 
             if (st->tool == PAINT_TOOL_LINE) {
                 paint_draw_line_canvas(st, st->start_x, st->start_y, cx, cy);
-                paint_status(st, "Linea dibujada");
+                paint_status(st, "@HF046A226");
             } else if (st->tool == PAINT_TOOL_RECT) {
                 paint_draw_rect_canvas(st, st->start_x, st->start_y, cx, cy);
-                paint_status(st, "Rectangulo dibujado");
+                paint_status(st, "@HC46B7B89");
             }
         }
         st->mouse_down = false;
@@ -979,22 +994,22 @@ static bool paint_event(gui_window_t *window, const gui_event_t *event, void *co
             (void)paint_save_bmp(st);
         } else if (event->key == 'c' || event->key == 'C') {
             paint_canvas_clear(st, PAINT_COLOR_WHITE);
-            paint_status(st, "Canvas limpio");
+            paint_status(st, "@H1363C4FD");
         } else if (event->key == 'e' || event->key == 'E') {
             st->tool = PAINT_TOOL_ERASER;
-            paint_status(st, "Herramienta: goma");
+            paint_status(st, "@HF8760AC1");
         } else if (event->key == 'p' || event->key == 'P') {
             st->tool = PAINT_TOOL_PENCIL;
-            paint_status(st, "Herramienta: lapiz");
+            paint_status(st, "@HF8AA0271");
         } else if (event->key == 'f' || event->key == 'F') {
             st->tool = PAINT_TOOL_FILL;
-            paint_status(st, "Herramienta: cubeta");
+            paint_status(st, "@H555E681F");
         } else if (event->key == 'l' || event->key == 'L') {
             st->tool = PAINT_TOOL_LINE;
-            paint_status(st, "Herramienta: linea");
+            paint_status(st, "@H07F84CEA");
         } else if (event->key == 'r' || event->key == 'R') {
             st->tool = PAINT_TOOL_RECT;
-            paint_status(st, "Herramienta: rectangulo");
+            paint_status(st, "@HD86C538D");
         } else if (event->key == '1') {
             paint_set_brush(st, 1);
         } else if (event->key == '2') {
@@ -1024,24 +1039,24 @@ static void paint_menu(gui_window_t *window, uint32_t item_id, void *context)
 
     if (item_id == 1) {
         paint_canvas_clear(st, PAINT_COLOR_WHITE);
-        paint_status(st, "Nuevo dibujo");
+        paint_status(st, "@H2251EFB9");
     } else if (item_id == 2) {
         (void)paint_save_bmp(st);
     } else if (item_id == 3) {
         st->tool = PAINT_TOOL_PENCIL;
-        paint_status(st, "Herramienta: lapiz");
+        paint_status(st, "@HF8AA0271");
     } else if (item_id == 4) {
         st->tool = PAINT_TOOL_ERASER;
-        paint_status(st, "Herramienta: goma");
+        paint_status(st, "@HF8760AC1");
     } else if (item_id == 5) {
         st->tool = PAINT_TOOL_FILL;
-        paint_status(st, "Herramienta: cubeta");
+        paint_status(st, "@H555E681F");
     } else if (item_id == 6) {
         st->tool = PAINT_TOOL_LINE;
-        paint_status(st, "Herramienta: linea");
+        paint_status(st, "@H07F84CEA");
     } else if (item_id == 7) {
         st->tool = PAINT_TOOL_RECT;
-        paint_status(st, "Herramienta: rectangulo");
+        paint_status(st, "@HD86C538D");
     } else if (item_id >= 10 && item_id <= 14) {
         paint_set_brush(st, g_brush_sizes[item_id - 10]);
     }
@@ -1054,19 +1069,19 @@ static void paint_cleanup(paint_state_t *st)
     if (!st) return;
 
     if (st->canvas) {
-        kfree(st->canvas);
+        bk_sys_free(st->canvas);
         st->canvas = NULL;
     }
 
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
         st->window = NULL;
     }
 
     if (g_paint == st) g_paint = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 
 bool paint_get_runtime_info(program_runtime_info_t *info)
@@ -1084,80 +1099,91 @@ static void paint_main(void *argument)
 
     if (!st || !st->desktop) {
         paint_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    task_set_memory_hint((uint32_t)sizeof(*st) +
+    bk_proc_set_memory_hint((uint32_t)sizeof(*st) +
                          (uint32_t)(PAINT_CANVAS_W * PAINT_CANVAS_H * sizeof(uint32_t)));
 
-    st->canvas = (uint32_t *)kzalloc((uint32_t)(PAINT_CANVAS_W * PAINT_CANVAS_H * sizeof(uint32_t)));
+    st->canvas = (uint32_t *)bk_sys_alloc_zero((uint32_t)(PAINT_CANVAS_W * PAINT_CANVAS_H * sizeof(uint32_t)));
     if (st->canvas) {
         paint_canvas_clear(st, PAINT_COLOR_WHITE);
     }
 
     paint_set_default_filename(st);
+    {
+        static const char *icons[5] = {
+            "FilePencil", "Pbrush1", "Mspaint", "Delete", "Save"
+        };
+        for (uint32_t i = 0; i < 5U; i++)
+            st->toolbar_icon_loaded[i] =
+                bk_graphics_icon_load(icons[i], &st->toolbar_icons[i]);
+    }
     st->color = PAINT_COLOR_BLACK;
     st->tool = PAINT_TOOL_PENCIL;
     st->brush_size = 2;
     st->preview_x = 0;
     st->preview_y = 0;
-    paint_status(st, "Click abajo para nombrar BMP");
+    paint_status(st, "@H5563FAB6");
 
-    st->window = gui_desktop_create_window(st->desktop, 85, 45,
+    st->window = bk_gui_create_window(st->desktop, 85, 45,
                                            PAINT_WINDOW_W, PAINT_WINDOW_H,
-                                           "Paint");
+                                           "@H36B37BD3");
     if (!st->window) {
         paint_cleanup(st);
-        task_exit();
+        bk_proc_exit();
     }
 
-    gui_window_set_min_size(st->window, PAINT_WINDOW_W, PAINT_WINDOW_H);
-    gui_window_set_content(st->window, paint_content, st);
-    gui_window_set_event_handler(st->window, paint_event, st);
+    bk_gui_set_window_min_size(st->window, PAINT_WINDOW_W, PAINT_WINDOW_H);
+    bk_gui_set_window_content(st->window, paint_content, st);
+    bk_gui_set_window_event_handler(st->window, paint_event, st);
 
     if (!st->window->menu_count) {
-        int file_menu = gui_window_add_menu(st->window, "File");
-        gui_window_add_menu_item(st->window, file_menu, 1, "Nuevo",
+        int file_menu = bk_gui_add_menu(st->window, "@H2B183663");
+        bk_gui_add_menu_item(st->window, file_menu, 1, "@HA4C4AF58",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, file_menu, 2, "Guardar BMP",
-                                 paint_menu, st);
-
-        int tool_menu = gui_window_add_menu(st->window, "Tool");
-        gui_window_add_menu_item(st->window, tool_menu, 3, "Lapiz",
-                                 paint_menu, st);
-        gui_window_add_menu_item(st->window, tool_menu, 4, "Goma",
-                                 paint_menu, st);
-        gui_window_add_menu_item(st->window, tool_menu, 5, "Cubeta",
-                                 paint_menu, st);
-        gui_window_add_menu_item(st->window, tool_menu, 6, "Linea",
-                                 paint_menu, st);
-        gui_window_add_menu_item(st->window, tool_menu, 7, "Rectangulo",
+        bk_gui_add_menu_item(st->window, file_menu, 2, "@H86431FF2",
                                  paint_menu, st);
 
-        int brush_menu = gui_window_add_menu(st->window, "Brush");
-        gui_window_add_menu_item(st->window, brush_menu, 10, "1 px",
+        int tool_menu = bk_gui_add_menu(st->window, "Tool");
+        bk_gui_add_menu_item(st->window, tool_menu, 3, "@HB4256A19",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, brush_menu, 11, "2 px",
+        bk_gui_add_menu_item(st->window, tool_menu, 4, "@H8B9115E9",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, brush_menu, 12, "4 px",
+        bk_gui_add_menu_item(st->window, tool_menu, 5, "@H4A8BA287",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, brush_menu, 13, "8 px",
+        bk_gui_add_menu_item(st->window, tool_menu, 6, "@H7C19EAD2",
                                  paint_menu, st);
-        gui_window_add_menu_item(st->window, brush_menu, 14, "12 px",
+        bk_gui_add_menu_item(st->window, tool_menu, 7, "@H3967F765",
+                                 paint_menu, st);
+
+        int brush_menu = bk_gui_add_menu(st->window, "Brush");
+        bk_gui_add_menu_item(st->window, brush_menu, 10, "@H27763EDC",
+                                 paint_menu, st);
+        bk_gui_add_menu_item(st->window, brush_menu, 11, "@H5988472F",
+                                 paint_menu, st);
+        bk_gui_add_menu_item(st->window, brush_menu, 12, "@HBD4513A9",
+                                 paint_menu, st);
+        bk_gui_add_menu_item(st->window, brush_menu, 13, "@HBA90F815",
+                                 paint_menu, st);
+        bk_gui_add_menu_item(st->window, brush_menu, 14, "@H97F81876",
                                  paint_menu, st);
     }
+    (void)bk_about_attach(st->window, st->desktop, &(bk_about_info_t){
+        "@H36B37BD3", "@H1C1E4EC2", "@HE38CF554",
+        "@H7A28E1E5", "/ICONS/IMAGE.BMP"});
 
-    st->window->owner_pid = task_current_pid();
-    task_bind_window(st->window);
+    st->window->owner_pid = bk_sys_getpid();
+    bk_proc_bind_window(st->window);
     st->window->dirty = true;
 
-    while (!task_exit_requested()) {
+    while (!bk_proc_exit_requested()) {
         if (!st->window || !st->window->listed) break;
-        task_sleep(5);
+        bk_sys_sleep_ticks(5);
     }
 
     paint_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 
 void paint_open_from_desktop(gui_desktop_t *desktop)
@@ -1167,19 +1193,19 @@ void paint_open_from_desktop(gui_desktop_t *desktop)
     if (!desktop) return;
 
     if (g_paint && g_paint->window) {
-        gui_window_restore(g_paint->window);
-        gui_desktop_raise_window(desktop, g_paint->window);
-        gui_desktop_focus_window(desktop, g_paint->window);
+        bk_gui_window_restore(g_paint->window);
+        bk_gui_desktop_raise_window(desktop, g_paint->window);
+        bk_gui_focus_window(desktop, g_paint->window);
         return;
     }
 
-    st = (paint_state_t *)kzalloc(sizeof(*st));
+    st = (paint_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
 
     st->desktop = desktop;
     g_paint = st;
 
-    if (task_create("paint", paint_main, st) < 0) {
+    if (bk_proc_spawn_thread("paint", paint_main, st) < 0) {
         paint_cleanup(st);
     }
 }
@@ -1187,4 +1213,8 @@ void paint_open_from_desktop(gui_desktop_t *desktop)
 void paint_install(gui_desktop_t *desktop)
 {
     (void)desktop;
+}
+
+void bleskernos_program_main(gui_desktop_t *desktop) {
+    paint_open_from_desktop(desktop);
 }

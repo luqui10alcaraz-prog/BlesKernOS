@@ -1,0 +1,187 @@
+--- kernel/win32/shell32.c
++++ kernel/win32/shell32.c
+@@ -11,6 +11,11 @@
+ #define SE_ERR_NOASSOC 31U
+ #define SHELL_SUCCESS 33U
+ #define SHELL_COMMAND_CHARS 520U
++#define GWL_EXSTYLE (-20)
++#define WS_EX_ACCEPTFILES 0x00000010U
++#define MB_OK 0x00000000U
++
++typedef struct PACKED { uint32_t offset; int32_t x,y; int non_client; int wide; } drop_files_t;
+ 
+ static bool equal(const char*a,const char*b){if(!a||!b)return false;while(*a&&*b&&*a==*b){a++;b++;}return *a==*b;}
+ static bool equal_ci(const char*a,const char*b){uint8_t ca,cb;if(!a||!b)return false;do{ca=(uint8_t)*a++;cb=(uint8_t)*b++;if(ca>='a'&&ca<='z')ca-=32;if(cb>='a'&&cb<='z')cb-=32;if(ca!=cb)return false;}while(ca);return true;}
+@@ -43,9 +48,159 @@
+     command[used]='\0';
+     return pe_execute_program_command_line(native,command);
+ }
+-static uint32_t WIN32_API shell_DragQueryFileA(void *drop UNUSED,uint32_t index UNUSED,
+-                                               char *path,uint32_t size){if(path&&size)path[0]='\0';return 0;}
+-static void WIN32_API shell_DragFinish(void *drop UNUSED){}
++static void *shell_drop_data(void *drop, bool *locked) {
++    void *data = drop;
++    if (locked) *locked = false;
++    if (!drop) return NULL;
++    if (win32_global_handle_valid(drop)) {
++        data = win32_global_lock_block(drop);
++        if (locked) *locked = data != NULL;
++    }
++    return data;
++}
++
++static void shell_drop_unlock(void *drop, bool locked) {
++    if (locked) (void)win32_global_unlock_block(drop);
++}
++
++static uint32_t WIN32_API shell_DragQueryFileA(void *drop, uint32_t index,
++                                               char *path, uint32_t size) {
++    bool locked = false;
++    drop_files_t *header = (drop_files_t *)shell_drop_data(drop, &locked);
++    uint8_t *base = (uint8_t *)header;
++    uint32_t count = 0, result = 0;
++
++    if (path && size) path[0] = 0;
++    if (!header || header->offset < sizeof(*header)) {
++        shell_drop_unlock(drop, locked);
++        return 0;
++    }
++    if (header->wide) {
++        uint16_t *item = (uint16_t *)(base + header->offset);
++        while (*item) {
++            uint32_t length = 0;
++            while (item[length]) length++;
++            if (index == count) {
++                result = length;
++                if (path && size) {
++                    uint32_t copy = length < size - 1U ? length : size - 1U;
++                    for (uint32_t i = 0; i < copy; i++)
++                        path[i] = item[i] <= 0xffU ? (char)item[i] : '?';
++                    path[copy] = 0;
++                }
++                break;
++            }
++            count++;
++            item += length + 1U;
++        }
++    } else {
++        char *item = (char *)(base + header->offset);
++        while (*item) {
++            uint32_t length = (uint32_t)kstrlen(item);
++            if (index == count) {
++                result = length;
++                if (path && size) {
++                    kstrncpy(path, item, size - 1U);
++                    path[size - 1U] = 0;
++                }
++                break;
++            }
++            count++;
++            item += length + 1U;
++        }
++    }
++    if (index == 0xffffffffU) result = count;
++    shell_drop_unlock(drop, locked);
++    return result;
++}
++
++static uint32_t WIN32_API shell_DragQueryFileW(void *drop, uint32_t index,
++                                               uint16_t *path, uint32_t size) {
++    char ansi[VFS_MAX_PATH];
++    uint32_t result = shell_DragQueryFileA(drop, index, ansi, sizeof(ansi));
++    if (path && size) ansi_to_wide(ansi, path, size);
++    return result;
++}
++
++static int WIN32_API shell_DragQueryPoint(void *drop, void *point) {
++    bool locked = false;
++    drop_files_t *header = (drop_files_t *)shell_drop_data(drop, &locked);
++    int result = 0;
++    if (header && point) {
++        int32_t *coordinates = (int32_t *)point;
++        coordinates[0] = header->x;
++        coordinates[1] = header->y;
++        result = !header->non_client;
++    }
++    shell_drop_unlock(drop, locked);
++    return result;
++}
++
++static void WIN32_API shell_DragAcceptFiles(void *hwnd, int accept) {
++    int (WIN32_API *is_window)(void *) = (void *)(uintptr_t)
++        win32_resolve_import("USER32.DLL", "IsWindow");
++    int32_t (WIN32_API *get_long)(void *, int) = (void *)(uintptr_t)
++        win32_resolve_import("USER32.DLL", "GetWindowLongA");
++    int32_t (WIN32_API *set_long)(void *, int, int32_t) = (void *)(uintptr_t)
++        win32_resolve_import("USER32.DLL", "SetWindowLongA");
++    int32_t style;
++
++    if (!is_window || !get_long || !set_long || !is_window(hwnd)) return;
++    style = get_long(hwnd, GWL_EXSTYLE);
++    if (accept) style |= (int32_t)WS_EX_ACCEPTFILES;
++    else style &= ~(int32_t)WS_EX_ACCEPTFILES;
++    (void)set_long(hwnd, GWL_EXSTYLE, style);
++}
++
++static void WIN32_API shell_DragFinish(void *drop) {
++    if (win32_global_handle_valid(drop)) win32_global_release_handle(drop);
++}
++
++static int WIN32_API shell_ShellAboutA(void *owner, const char *app,
++                                       const char *other, void *icon UNUSED) {
++    int (WIN32_API *message_box)(void *, const char *, const char *, uint32_t) =
++        (void *)(uintptr_t)win32_resolve_import("USER32.DLL", "MessageBoxA");
++    char caption[128], text[512];
++    uint32_t caption_length = 0, text_length = 0;
++    const char *detail = NULL;
++
++    if (!message_box) return 0;
++    if (!app) app = "BlesKernOS";
++    while (app[caption_length] && app[caption_length] != '#' &&
++           caption_length + 1U < sizeof(caption)) {
++        caption[caption_length] = app[caption_length];
++        caption_length++;
++    }
++    caption[caption_length] = 0;
++    if (app[caption_length] == '#') detail = app + caption_length + 1U;
++    if (detail && *detail) {
++        for (uint32_t i = 0; detail[i] && text_length + 1U < sizeof(text); i++)
++            text[text_length++] = detail[i];
++    }
++    if (other && *other) {
++        if (text_length && text_length + 2U < sizeof(text)) {
++            text[text_length++] = '\n';
++            text[text_length++] = '\n';
++        }
++        for (uint32_t i = 0; other[i] && text_length + 1U < sizeof(text); i++)
++            text[text_length++] = other[i];
++    }
++    if (!text_length) {
++        for (uint32_t i = 0; caption[i] && text_length + 1U < sizeof(text); i++)
++            text[text_length++] = caption[i];
++    }
++    text[text_length] = 0;
++    return message_box(owner, text, caption[0] ? caption : "About", MB_OK) != 0;
++}
++
++static int WIN32_API shell_ShellAboutW(void *owner, const uint16_t *app,
++                                       const uint16_t *other, void *icon) {
++    char ansi_app[128], ansi_other[384];
++    if (app && !wide_to_ansi(app, ansi_app, sizeof(ansi_app))) return 0;
++    if (other && !wide_to_ansi(other, ansi_other, sizeof(ansi_other))) return 0;
++    return shell_ShellAboutA(owner, app ? ansi_app : NULL,
++                             other ? ansi_other : NULL, icon);
++}
+ static void *WIN32_API shell_ShellExecuteA(void *owner UNUSED,const char *verb,
+                                            const char *file,const char *params,
+                                            const char *directory,int show UNUSED){
+@@ -94,7 +249,8 @@
+ static int WIN32_API shell_SHFileOperationA(sh_file_op_a_t*op){char from[VFS_MAX_PATH],to[VFS_MAX_PATH];bool ok=false;if(!op||!op->from)return 87;if(op->to&&!shell_native_path(op->to,to,sizeof(to)))return 87;if(!shell_native_path(op->from,from,sizeof(from)))return 87;switch(op->function){case 1:ok=op->to&&vfs_rename(from,to);break;case 2:ok=op->to&&shell_copy(op->from,op->to);break;case 3:ok=vfs_remove(from);break;case 4:ok=op->to&&vfs_rename(from,to);break;}op->aborted=ok?0:1;return ok?0:1;}
+ uint32_t win32_shell32_resolve(const char *name){
+ #define S(api) if(equal(name,#api))return(uint32_t)(uintptr_t)&shell_##api
+-    S(DragQueryFileA);S(DragFinish);S(ShellExecuteA);S(ShellExecuteW);S(ShellExecuteExA);
++    S(DragAcceptFiles);S(DragQueryFileA);S(DragQueryFileW);S(DragQueryPoint);S(DragFinish);S(ShellAboutA);S(ShellAboutW);
++    S(ShellExecuteA);S(ShellExecuteW);S(ShellExecuteExA);
+     S(SHGetSpecialFolderPathA);S(SHGetSpecialFolderPathW);S(SHGetFolderPathA);S(SHGetFolderPathW);S(SHCreateDirectoryExA);
+     S(ExtractIconA);S(ExtractIconW);S(ExtractIconExA);S(ExtractIconExW);
+     S(ExtractAssociatedIconA);S(ExtractAssociatedIconW);S(FindExecutableA);

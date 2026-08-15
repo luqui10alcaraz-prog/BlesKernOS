@@ -6,6 +6,8 @@
 bool gfx_vga_set_text_mode(gfx_info_t *info);
 bool gfx_vga_set_mode13h(gfx_info_t *info);
 bool gfx_vga_set_mode12h(gfx_info_t *info);
+void gfx_vga_blit_12h(const gfx_info_t *info, const uint32_t *pixels,
+                      uint32_t source_pitch, int x, int y, int w, int h);
 void gfx_vga_set_palette_color(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
 void gfx_vga_set_default_palette(void);
 void gfx_vga_clear(const gfx_info_t *info, uint8_t color);

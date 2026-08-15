@@ -3,25 +3,58 @@
 
 #include "../kernel/include/types.h"
 
-#define GUI_TITLEBAR_HEIGHT 20
-#define GUI_BORDER_SIZE      2
+#define GUI_TITLEBAR_HEIGHT 24
+#define GUI_BORDER_SIZE      5
 #define GUI_MAX_EVENTS      32
 #define GUI_MAX_MENUS        5
 #define GUI_MAX_MENU_ITEMS   8
-#define GUI_MENU_HEIGHT     18
+#define GUI_MAX_CONTEXT_ITEMS 10
+#define GUI_MENU_HEIGHT     20
+#define GUI_CURSOR_TRAIL_MAX 6
+#define GUI_CURSOR_WIDTH    32
+#define GUI_CURSOR_HEIGHT   32
+#define GUI_SCROLLBAR_SIZE  16
+
+typedef enum {
+    GUI_CURSOR_ARROW = 0,
+    GUI_CURSOR_WAIT,
+    GUI_CURSOR_SIZE_WE,
+    GUI_CURSOR_SIZE_NS,
+    GUI_CURSOR_SIZE_NWSE,
+    GUI_CURSOR_SIZE_NESW,
+} gui_cursor_style_t;
+
+typedef enum {
+    GUI_ALERT_INFO = 0,
+    GUI_ALERT_WARNING,
+    GUI_ALERT_ERROR,
+    GUI_ALERT_NETWORK
+} gui_alert_kind_t;
+
+#define GUI_ALERT_WIDTH  446
+#define GUI_ALERT_HEIGHT 188
 
 typedef enum {
     GUI_EVENT_NONE = 0,
     GUI_EVENT_MOUSE_MOVE,
     GUI_EVENT_MOUSE_DOWN,
     GUI_EVENT_MOUSE_UP,
+    GUI_EVENT_MOUSE_WHEEL,
     GUI_EVENT_KEY,
 } gui_event_type_t;
 
 typedef enum {
     GUI_WIDGET_LABEL = 1,
     GUI_WIDGET_BUTTON = 2,
+    GUI_WIDGET_TEXTBOX = 3,
 } gui_widget_type_t;
+
+typedef enum {
+    GUI_WIDGET_STYLE_BUTTON = 0,
+    GUI_WIDGET_STYLE_SELECTABLE = 1,
+    GUI_WIDGET_STYLE_LISTBOX = 2,
+    GUI_WIDGET_STYLE_DROPDOWN = 3,
+} gui_widget_style_t;
 
 typedef struct {
     int x;
@@ -31,10 +64,34 @@ typedef struct {
 } gui_rect_t;
 
 typedef struct {
+    int x;
+    int y;
+} gui_point_t;
+
+typedef struct {
+    gui_rect_t bounds;
+    uint32_t value;
+    uint32_t visible;
+    uint32_t total;
+} gui_scrollbar_t;
+
+typedef struct {
+    bool active;
+    int grab_offset;
+} gui_scrollbar_drag_t;
+
+typedef struct {
     uint32_t *pixels;
     uint16_t width;
     uint16_t height;
     uint16_t pitch;
+    gui_rect_t clip;
+    /* Una superficie de ventana puede conservar coordenadas de escritorio
+       aunque su almacenamiento cubra solamente el rectangulo cliente. */
+    int16_t origin_x;
+    int16_t origin_y;
+    uint16_t storage_width;
+    uint16_t storage_height;
 } gui_surface_t;
 
 typedef enum {
@@ -79,8 +136,10 @@ typedef void (*gui_menu_callback_t)(struct gui_window *window,
 typedef struct {
     uint32_t id;
     char label[24];
+    bool enabled;
     gui_menu_callback_t callback;
     void *context;
+    uint32_t callback_pid;
 } gui_menu_item_t;
 
 typedef struct {
@@ -89,15 +148,45 @@ typedef struct {
     uint8_t item_count;
 } gui_menu_t;
 
+typedef struct {
+    gui_menu_item_t items[GUI_MAX_CONTEXT_ITEMS];
+    uint8_t item_count;
+    bool open;
+    int x;
+    int y;
+    int width;
+    int8_t pressed_item;
+} gui_context_menu_t;
+
+#define GUI_TEXT_ACTION_COPY  1U
+#define GUI_TEXT_ACTION_PASTE 2U
+
+typedef struct {
+    gui_rect_t bounds; /* Coordenadas locales al area de contenido. */
+    bool has_selection;
+    bool editable;
+    gui_menu_callback_t callback;
+    void *context;
+    uint32_t callback_pid;
+} gui_text_context_t;
+
 typedef struct gui_widget {
     uint32_t id;
     gui_widget_type_t type;
+    gui_widget_style_t style;
     gui_rect_t bounds;
     char text[48];
     bool hovered;
     bool pressed;
+    bool selected;
+    bool enabled;
     bool visible;
+    uint32_t *icon_pixels;
+    uint16_t icon_width;
+    uint16_t icon_height;
     gui_widget_callback_t callback;
+    uint32_t callback_pid;
+    void *payload;
     struct gui_widget *prev;
     struct gui_widget *next;
 } gui_widget_t;
@@ -108,6 +197,9 @@ typedef struct gui_window {
     int min_w;
     int min_h;
     char title[48];
+    const uint32_t *icon_pixels;
+    uint16_t icon_width;
+    uint16_t icon_height;
     uint32_t bg_color;
     uint32_t title_color;
     uint32_t border_color;
@@ -115,19 +207,59 @@ typedef struct gui_window {
     bool listed;
     bool minimized;
     bool focused;
+    /* A disabled native window remains visible but must not steal focus or
+       z-order from an owned modal dialog. */
+    bool input_enabled;
     bool dirty;
+    bool borderless;
+    bool resizable;
+    uint8_t drag_height;
     gui_widget_t *widgets;
+    gui_widget_t *focused_widget;
     gui_window_content_paint_t content_paint;
     void *content_context;
+    uint32_t content_pid;
+    bool content_pending;
+    bool content_ready;
+    bool content_repaint;
+    /* 0=alive, 1=destruction requested, 2=finalizer owns the object.
+       This is atomic because several Ring-3 callbacks can finish on different
+       CPUs after the same window was closed. */
+    volatile uint32_t destroy_state;
+    uint32_t *content_cache;
+    uint16_t content_cache_width;
+    uint16_t content_cache_height;
+    bool content_cache_rgb332;
+    gui_surface_t content_staging;
+    bool content_staging_active;
+    int8_t content_staging_slot;
+    gui_rect_t content_staging_rect;
     gui_window_event_t event_handler;
     void *event_context;
+    uint32_t event_pid;
     uint32_t owner_pid;
+    /* Optional GPU-owned client layer. Coordinates are desktop coordinates;
+       the software window cache deliberately leaves this rectangle alone. */
+    uint32_t gpu_view_surface;
+    uint16_t gpu_view_width;
+    uint16_t gpu_view_height;
+    gui_rect_t gpu_view_rect;
+    bool gpu_view_visible;
     gui_menu_t menus[GUI_MAX_MENUS];
     uint8_t menu_count;
     int8_t open_menu;
     int8_t pressed_menu_item;
+    gui_context_menu_t context_menu;
+    gui_text_context_t text_context;
     struct gui_window *prev;
     struct gui_window *next;
+    bool paint_bounds_valid;
+    gui_rect_t paint_bounds;
+    /* Appended fields preserve the offsets used by already compiled 0.8
+       programs that receive gui_window_t pointers through the public SDK. */
+    gui_desktop_t *desktop;
+    gui_rect_t mode_restore_bounds;
+    bool mode_restore_valid;
 } gui_window_t;
 
 struct gui_program {
@@ -137,6 +269,12 @@ struct gui_program {
     gui_program_paint_t paint;
     gui_program_event_t handle_event;
     gui_program_destroy_t destroy;
+    uint32_t callback_pid;
+    bool paint_pending;
+    bool paint_requested;
+    bool paint_ready;
+    gui_surface_t paint_cache;
+    gui_surface_t paint_staging;
     gui_program_t *prev;
     gui_program_t *next;
 };
@@ -156,12 +294,41 @@ struct gui_desktop {
     int resize_start_y;
     int drag_off_x;
     int drag_off_y;
+    bool drag_outline_enabled;
+    bool drag_outline_visible;
+    gui_rect_t drag_outline_bounds;
     int mouse_x;
     int mouse_y;
     uint8_t mouse_buttons;
     uint32_t next_program_id;
     uint32_t next_window_id;
     uint32_t next_widget_id;
+    bool dirty_valid;
+    gui_rect_t dirty_rect;
+    uint32_t dirty_generation;
+    bool cursor_valid;
+    gui_rect_t cursor_rect;
+    uint32_t cursor_backing[GUI_CURSOR_WIDTH * GUI_CURSOR_HEIGHT];
+    uint32_t cursor_pixels[GUI_CURSOR_WIDTH * GUI_CURSOR_HEIGHT];
+    uint16_t cursor_width;
+    uint16_t cursor_height;
+    int16_t cursor_hotspot_x;
+    int16_t cursor_hotspot_y;
+    uint32_t cursor_owner_pid;
+    bool cursor_custom;
+    gui_cursor_style_t cursor_style;
+    bool cursor_trail_enabled;
+    uint8_t cursor_trail_count;
+    int cursor_trail_x[GUI_CURSOR_TRAIL_MAX];
+    int cursor_trail_y[GUI_CURSOR_TRAIL_MAX];
+    uint8_t cursor_paint_count;
+    gui_rect_t cursor_paint_rects[GUI_CURSOR_TRAIL_MAX + 1];
+    bool paint_valid;
+    bool error_visible;
+    gui_alert_kind_t error_kind;
+    int32_t error_code;
+    char error_title[48];
+    char error_text[160];
 };
 
 typedef struct {
@@ -171,8 +338,11 @@ typedef struct {
     uint8_t last_mouse_buttons;
     int last_mouse_x;
     int last_mouse_y;
+    int32_t last_mouse_wheel;
 } gui_event_queue_t;
 
+void gui_set_setup_mode(bool enabled);
+bool gui_setup_mode(void);
 void gui_init(void);
 void gui_run(void);
 uint8_t gui_get_cpu_usage(void);
@@ -184,12 +354,34 @@ bool gui_gfx_init(gui_surface_t *surface);
 bool gui_gfx_reconfigure(gui_surface_t *surface);
 void gui_gfx_shutdown(gui_surface_t *surface);
 void gui_gfx_present(const gui_surface_t *surface);
+void gui_gfx_present_rect(const gui_surface_t *surface, gui_rect_t rect);
+void gui_gfx_present_rects(const gui_surface_t *surface,
+                           const gui_rect_t *rects, uint8_t count);
 void gui_gfx_invalidate_front(void);
+
+/* Compositor SVGA3D opcional. Permanece inactivo en QEMU/SVGA-II 2D. */
+bool gui_gpu_compositor_enabled(void);
+void gui_gpu_compositor_begin_frame(gui_desktop_t *desktop,
+                                    const gui_surface_t *surface);
+void gui_gpu_compositor_capture_background(const gui_surface_t *surface);
+void gui_gpu_compositor_capture_window(gui_window_t *window,
+                                       const gui_surface_t *surface);
+bool gui_gpu_compositor_present(gui_desktop_t *desktop,
+                                const gui_surface_t *final_surface);
+void gui_gpu_compositor_shutdown(void);
+void gui_gfx_set_16_color_mode(bool enabled);
+bool gui_gfx_16_color_mode(void);
 void gui_gfx_clear(gui_surface_t *surface, uint32_t color);
+void gui_gfx_set_clip(gui_surface_t *surface, gui_rect_t clip);
+void gui_gfx_reset_clip(gui_surface_t *surface);
+gui_rect_t gui_gfx_get_clip(const gui_surface_t *surface);
+bool gui_gfx_point_visible(const gui_surface_t *surface, int x, int y);
 void gui_gfx_putpixel(gui_surface_t *surface, int x, int y, uint32_t color);
 void gui_gfx_fill_rect(gui_surface_t *surface, gui_rect_t rect, uint32_t color);
 void gui_gfx_draw_rect(gui_surface_t *surface, gui_rect_t rect, uint32_t color);
 void gui_gfx_draw_line(gui_surface_t *surface, int x0, int y0, int x1, int y1, uint32_t color);
+void gui_gfx_draw_polyline(gui_surface_t *surface, const gui_point_t *points,
+                           uint32_t count, uint32_t color);
 void gui_gfx_fill_gradient(gui_surface_t *surface, gui_rect_t rect, uint32_t top, uint32_t bottom);
 void gui_gfx_fill_rounded_rect(gui_surface_t *surface, gui_rect_t rect, int radius, uint32_t color);
 uint32_t gui_color_blend(uint32_t base, uint32_t top, uint8_t alpha);
@@ -205,29 +397,83 @@ void gui_font_draw_string_clipped(gui_surface_t *surface, int x, int y,
 void gui_font_draw_string_scaled_clipped(gui_surface_t *surface, int x, int y,
                                          const char *text, uint32_t fg,
                                          int scale, gui_rect_t clip);
+bool gui_font_get_glyph8(uint8_t c, uint8_t rows[8]);
 uint16_t gui_font_text_width(const char *text);
+uint16_t gui_font_text_width_px(const char *text, uint32_t length,
+                                int pixel_height, bool monospace, bool bold);
+void gui_font_draw_string_px_clipped(gui_surface_t *surface, int x, int y,
+                                     const char *text, uint32_t length,
+                                     uint32_t fg, int pixel_height,
+                                     bool bold, bool italic, bool monospace,
+                                     gui_rect_t clip);
 
 void gui_desktop_init(gui_desktop_t *desktop, gui_surface_t surface);
 gui_program_t *gui_desktop_register_program(gui_desktop_t *desktop, const char *name, void *state, gui_program_paint_t paint, gui_program_event_t handle_event, gui_program_destroy_t destroy);
 void gui_desktop_focus_window(gui_desktop_t *desktop, gui_window_t *window);
+void gui_desktop_focus_top_window(gui_desktop_t *desktop,
+                                  const gui_window_t *exclude);
+void gui_desktop_window_hidden(gui_desktop_t *desktop, gui_window_t *window);
+bool gui_window_is_focusable(const gui_window_t *window);
 gui_window_t *gui_desktop_create_window(gui_desktop_t *desktop, int x, int y, int w, int h, const char *title);
 void gui_desktop_add_window(gui_desktop_t *desktop, gui_window_t *window);
 void gui_desktop_raise_window(gui_desktop_t *desktop, gui_window_t *window);
 void gui_desktop_remove_window(gui_desktop_t *desktop, gui_window_t *window);
 void gui_desktop_unregister_program(gui_desktop_t *desktop, gui_program_t *program);
+void gui_desktop_cleanup_thread(gui_desktop_t *desktop, uint32_t tid);
+void gui_desktop_cleanup_process(gui_desktop_t *desktop,
+                                 uint32_t process_id);
+void gui_desktop_cleanup_owner(gui_desktop_t *desktop, uint32_t owner_pid);
 gui_window_t *gui_desktop_window_at(gui_desktop_t *desktop, int x, int y);
 void gui_desktop_handle_event(gui_desktop_t *desktop, const gui_event_t *event);
 void gui_desktop_paint(gui_desktop_t *desktop);
+/* Serializa cambios de modo con el compositor. El repaint se difiere al
+ * bucle GUI para no reentrar en callbacks Ring 3 durante la transaccion. */
+void gui_desktop_paint_lock(void);
+void gui_desktop_paint_unlock(void);
 void gui_desktop_paint_programs(gui_desktop_t *desktop);
+bool gui_desktop_request_owner_paint(gui_desktop_t *desktop,
+                                     uint32_t process_id,
+                                     uint32_t thread_id);
+bool gui_program_prepare_paint(gui_program_t *program,
+                               const gui_surface_t *source,
+                               gui_surface_t **staging_out);
+void gui_program_composite_paint(const gui_program_t *program,
+                                 gui_surface_t *destination);
+void gui_program_finish_paint(gui_program_t *program);
+void gui_program_release_paint(gui_program_t *program);
 bool gui_desktop_has_dirty(const gui_desktop_t *desktop);
+void gui_desktop_invalidate_rect(gui_desktop_t *desktop, gui_rect_t rect);
+void gui_desktop_invalidate_all(gui_desktop_t *desktop);
 void gui_desktop_reflow(gui_desktop_t *desktop);
+void gui_desktop_reset_after_mode_change(gui_desktop_t *desktop);
+void gui_desktop_set_cursor_trail(gui_desktop_t *desktop, bool enabled);
+bool gui_desktop_cursor_trail_enabled(const gui_desktop_t *desktop);
+bool gui_desktop_set_cursor_image(gui_desktop_t *desktop,
+                                  const uint32_t *pixels,
+                                  uint16_t width, uint16_t height,
+                                  int hotspot_x, int hotspot_y,
+                                  uint32_t owner_pid);
+void gui_desktop_reset_cursor(gui_desktop_t *desktop, uint32_t owner_pid);
+void gui_desktop_set_cursor_style(gui_desktop_t *desktop,
+                                  gui_cursor_style_t style);
+void gui_desktop_show_error(gui_desktop_t *desktop, const char *title,
+                            const char *text);
+void gui_desktop_show_alert(gui_desktop_t *desktop, gui_alert_kind_t kind,
+                            const char *title, const char *text,
+                            int32_t code);
+void gui_alert_resources_init(void);
+void gui_desktop_set_drag_outline(gui_desktop_t *desktop, bool enabled);
+bool gui_desktop_drag_outline_enabled(const gui_desktop_t *desktop);
 
 bool gui_change_resolution(gui_desktop_t *desktop, uint16_t width,
-                           uint16_t height);
+                           uint16_t height, uint8_t bpp);
+uint8_t gui_display_color_depth(void);
 
 gui_window_t *gui_window_create(gui_desktop_t *desktop, int x, int y, int w, int h, const char *title);
 void gui_window_destroy(gui_window_t *window);
 void gui_window_paint(gui_surface_t *surface, gui_window_t *window, gui_rect_t clip);
+void gui_window_paint_widgets(gui_surface_t *surface, gui_window_t *window,
+                              gui_rect_t clip);
 bool gui_window_contains(gui_window_t *window, int x, int y);
 bool gui_window_titlebar_contains(gui_window_t *window, int x, int y);
 gui_rect_t gui_window_minimize_button_rect(gui_window_t *window);
@@ -237,9 +483,20 @@ void gui_window_minimize(gui_window_t *window);
 void gui_window_close(gui_window_t *window);
 void gui_window_restore(gui_window_t *window);
 void gui_window_set_min_size(gui_window_t *window, int min_w, int min_h);
+void gui_window_set_borderless(gui_window_t *window, bool borderless,
+                               uint8_t drag_height);
 void gui_window_set_content(gui_window_t *window,
                             gui_window_content_paint_t paint,
                             void *context);
+bool gui_window_capture_content(gui_window_t *window,
+                                const gui_surface_t *surface);
+bool gui_window_begin_content_paint(gui_window_t *window,
+                                    const gui_surface_t *source,
+                                    gui_surface_t **staging_out);
+void gui_window_end_content_paint(gui_window_t *window);
+void gui_window_paint_cached_content(gui_surface_t *surface,
+                                     const gui_window_t *window,
+                                     gui_rect_t clip);
 void gui_window_set_event_handler(gui_window_t *window,
                                   gui_window_event_t handler,
                                   void *context);
@@ -252,11 +509,97 @@ bool gui_window_add_menu_item(gui_window_t *window, int menu,
 void gui_window_paint_menus(gui_surface_t *surface, gui_window_t *window);
 bool gui_window_handle_menu_event(gui_window_t *window,
                                   const gui_event_t *event);
+void gui_window_context_clear(gui_window_t *window);
+bool gui_window_context_add_item(gui_window_t *window, uint32_t id,
+                                 const char *label, bool enabled,
+                                 gui_menu_callback_t callback, void *context);
+void gui_window_context_open(gui_window_t *window, int x, int y);
+void gui_window_context_close(gui_window_t *window);
+void gui_window_set_text_context(gui_window_t *window, gui_rect_t bounds,
+                                 bool has_selection, bool editable,
+                                 gui_menu_callback_t callback, void *context);
+void gui_window_clear_text_context(gui_window_t *window);
+bool gui_window_open_text_context_at(gui_window_t *window, int x, int y);
+void gui_context_menu_clear(gui_context_menu_t *menu);
+bool gui_context_menu_add_item(gui_context_menu_t *menu, uint32_t id,
+                               const char *label, bool enabled,
+                               gui_menu_callback_t callback, void *context);
+void gui_context_menu_open(gui_context_menu_t *menu, int x, int y,
+                           gui_rect_t limits);
+void gui_context_menu_close(gui_context_menu_t *menu);
+void gui_context_menu_paint(gui_surface_t *surface,
+                            const gui_context_menu_t *menu);
+bool gui_context_menu_handle_event(gui_context_menu_t *menu,
+                                   gui_window_t *callback_window,
+                                   const gui_event_t *event);
 int gui_window_content_top(const gui_window_t *window);
+gui_rect_t gui_window_content_rect(const gui_window_t *window);
+gui_rect_t gui_window_content_rect_inset(const gui_window_t *window, int inset);
+gui_rect_t gui_window_clamp_local_rect(const gui_window_t *window,
+                                       gui_rect_t rect);
 
 gui_widget_t *gui_widget_create(gui_desktop_t *desktop, gui_window_t *window, gui_widget_type_t type, gui_rect_t bounds, const char *text, gui_widget_callback_t callback);
+gui_widget_t *gui_widget_create_button(gui_desktop_t *desktop,
+                                       gui_window_t *window,
+                                       gui_rect_t bounds,
+                                       const char *text,
+                                       gui_widget_callback_t callback);
+gui_widget_t *gui_widget_create_selectable_button(gui_desktop_t *desktop,
+                                                  gui_window_t *window,
+                                                  gui_rect_t bounds,
+                                                  const char *text,
+                                                  gui_widget_callback_t callback);
+gui_widget_t *gui_widget_create_listbox(gui_desktop_t *desktop,
+                                        gui_window_t *window,
+                                        gui_rect_t bounds,
+                                        const char *text);
+gui_widget_t *gui_widget_create_dropdown(gui_desktop_t *desktop,
+                                         gui_window_t *window,
+                                         gui_rect_t bounds,
+                                         gui_widget_callback_t callback);
+gui_widget_t *gui_widget_create_textbox(gui_desktop_t *desktop,
+                                        gui_window_t *window,
+                                        gui_rect_t bounds,
+                                        const char *text,
+                                        uint16_t max_length,
+                                        gui_widget_callback_t callback);
+gui_rect_t gui_widget_screen_bounds(const gui_window_t *window,
+                                    const gui_widget_t *widget);
+void gui_widget_destroy(gui_widget_t *widget);
+void gui_widget_set_style(gui_widget_t *widget, gui_widget_style_t style);
+void gui_widget_set_selected(gui_widget_t *widget, bool selected);
+void gui_widget_set_enabled(gui_widget_t *widget, bool enabled);
+void gui_widget_set_visible(gui_window_t *window, gui_widget_t *widget,
+                            bool visible);
+void gui_widget_set_bounds(gui_window_t *window, gui_widget_t *widget,
+                           gui_rect_t bounds);
+void gui_widget_set_text(gui_widget_t *widget, const char *text);
+void gui_widget_take_icon(gui_widget_t *widget, uint32_t *pixels,
+                          uint16_t width, uint16_t height);
+bool gui_widget_get_text(const gui_widget_t *widget, char *buffer,
+                         uint32_t capacity);
+void gui_widget_set_focus(gui_window_t *window, gui_widget_t *widget,
+                          bool focused);
+bool gui_widget_is_focused(const gui_window_t *window,
+                           const gui_widget_t *widget);
+void gui_widget_dropdown_clear(gui_widget_t *widget);
+bool gui_widget_dropdown_add_item(gui_widget_t *widget,
+                                  const char *label,
+                                  const char *value);
+int gui_widget_dropdown_get_selected(const gui_widget_t *widget);
+void gui_widget_dropdown_set_selected(gui_widget_t *widget, int index);
+bool gui_widget_dropdown_set_selected_by_value(gui_widget_t *widget,
+                                               const char *value);
+const char *gui_widget_dropdown_get_selected_label(const gui_widget_t *widget);
+const char *gui_widget_dropdown_get_selected_value(const gui_widget_t *widget);
+const char *gui_widget_dropdown_get_item_label(const gui_widget_t *widget,
+                                               int index);
+const char *gui_widget_dropdown_get_item_value(const gui_widget_t *widget,
+                                               int index);
+bool gui_widget_is_dropdown_expanded(const gui_widget_t *widget);
 void gui_widget_paint(gui_surface_t *surface, gui_window_t *window, gui_widget_t *widget, gui_rect_t clip);
 bool gui_widget_handle_event(gui_window_t *window, gui_widget_t *widget, const gui_event_t *event);
+bool gui_widget_open_text_context_at(gui_window_t *window, int x, int y);
 
 void gui_compositor_paint(gui_desktop_t *desktop);
 
@@ -269,5 +612,21 @@ bool gui_event_queue_pop(gui_event_queue_t *queue, gui_event_t *event);
 
 bool gui_rect_intersect(gui_rect_t a, gui_rect_t b, gui_rect_t *out);
 bool gui_rect_contains(gui_rect_t rect, int x, int y);
+gui_rect_t gui_rect_union(gui_rect_t a, gui_rect_t b);
+
+void gui_scrollbar_init_vertical(gui_scrollbar_t *bar, gui_rect_t bounds,
+                                 uint32_t value, uint32_t visible,
+                                 uint32_t total);
+gui_rect_t gui_scrollbar_thumb_rect(const gui_scrollbar_t *bar);
+void gui_scrollbar_paint_vertical(gui_surface_t *surface,
+                                  const gui_scrollbar_t *bar);
+bool gui_scrollbar_handle_click_vertical(const gui_scrollbar_t *bar,
+                                         int x, int y,
+                                         uint32_t *new_value);
+bool gui_scrollbar_handle_event_vertical(const gui_scrollbar_t *bar,
+                                         gui_scrollbar_drag_t *drag,
+                                         const gui_event_t *event,
+                                         uint32_t wheel_step,
+                                         uint32_t *new_value);
 
 #endif

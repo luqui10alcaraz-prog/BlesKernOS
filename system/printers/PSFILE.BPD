@@ -1,0 +1,8 @@
+[Printer]
+Id=PSFILE
+Name=Bles PostScript File Printer
+Language=POSTSCRIPT
+Transport=FILE
+Output=/TEMP/PRINT
+Extension=PS
+DPI=600

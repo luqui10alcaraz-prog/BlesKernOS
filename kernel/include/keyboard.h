@@ -56,5 +56,9 @@ bool kbd_haschar(void);
 void kbd_get_modifiers(kbd_modifiers_t *mods);
 bool kbd_has_event(void);
 bool kbd_next_event(kbd_key_event_t *event);
+bool kbd_next_app_event(kbd_key_event_t *event);
+/* Injection path used by USB HID class drivers. Usage IDs are from the
+ * Keyboard/Keypad usage page (0x07). */
+void kbd_inject_hid_usage(uint16_t usage, bool pressed);
 
 #endif

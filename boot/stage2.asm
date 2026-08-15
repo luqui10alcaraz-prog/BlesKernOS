@@ -6,7 +6,7 @@
 ;   2. Habilitar línea A20
 ;   3. Cargar GDT
 ;   4. Entrar a Modo Protegido (32-bit)
-;   5. Saltar al kernel (en 0x10000 = 64KB)
+;   5. Saltar al kernel (en 0x8E00, justo despues de Stage 2)
 ; =============================================================================
 
 [BITS 16]
@@ -15,7 +15,8 @@
 ; -----------------------------------------------------------------------------
 ; Constantes
 ; -----------------------------------------------------------------------------
-KERNEL_LOAD_ADDR equ 0x10000    ; Donde cargamos el kernel (64KB mark)
+KERNEL_LOAD_ADDR equ 0x00100000 ; destino final del kernel (1 MiB)
+KERNEL_BOUNCE_ADDR equ 0x00010000 ; buffer BIOS temporal de 16 KiB
 %ifndef KERNEL_SECTORS
 %define KERNEL_SECTORS 1024     ; Sectores reservados para el kernel (512KB)
 %endif
@@ -23,10 +24,13 @@ KERNEL_START_LBA equ 9          ; LBA donde empieza el kernel en disco (Stage2 a
 FLOPPY_TRACK_SPAN equ 36
 FLOPPY_SECTORS_PER_TRACK equ 18
 BOOTINFO_ADDR    equ 0x0700     ; Datos de video que stage2 pasa al kernel
+BOOT_MODE_ADDR   equ 0x06F0     ; Magic escrito solo por Stage 1 del CD
+INSTALLER_BOOT_MAGIC equ 0x54534E49 ; bytes "INST"
+BOOT_PART_LBA_SAVE equ 0x0504   ; BPB_HiddSec guardado por stage1 FAT32
 VBE_MODEINFO     equ 0x0800     ; Buffer temporal VBE mode info
 VBE_INFO         equ 0x0900     ; Buffer temporal VBE controller info (512 bytes)
 VBE_MAX_PRINTED  equ 18         ; Evita scrollear toda la pantalla si la BIOS lista demasiado
-VBE_DEFAULT_MODE equ 0x114      ; 800x600x16, modo VESA estandar
+VBE_DEFAULT_MODE equ 0x103      ; 800x600x8, modo VESA estandar
 
 ; Bootinfo extendido para pedir modos VGA desde el kernel.
 ; Magic 'VGA1' en little endian: bytes 56 47 41 31.
@@ -56,6 +60,8 @@ stage2_start:
     mov sp, 0x7C00
     sti
     mov [boot_drive], dl
+    mov eax, [BOOT_PART_LBA_SAVE]
+    mov [boot_part_lba], eax
 
     mov si, msg_stage2_hello
     call print_string
@@ -91,15 +97,24 @@ stage2_start:
     jmp halt16
 
 .kernel_ok:
+    ; Verificar que al menos el encabezado ejecutable realmente llego a 1 MiB.
+    ; Algunas BIOS OEM antiguas devuelven AH=00/CF=0 para INT 15h/87h aunque
+    ; el bloque no haya sido movido correctamente; saltarlo acababa en triple
+    ; fault sin mensaje alguno. FFFF:0012 corresponde a 0x00100002 con A20.
+    push ds
+    mov ax, 0xFFFF
+    mov ds, ax
+    cmp dword [0x0012], 0x314B4C42 ; "BLK1"
+    pop ds
+    jne .kernel_bad_copy
+
     mov si, msg_kernel_ok
     call print_string
-
-    ; ----- Mostrar modos graficos antes de saltar a VESA -----
-    call select_video_mode
 
     ; ----- PASO 4: Entrar a Modo Protegido -----
     mov si, msg_entering_pm
     call print_string
+
     call setup_vesa
 
     ; Último momento en Real Mode: cargar GDTR
@@ -114,6 +129,11 @@ stage2_start:
     ; Far jump para vaciar pipeline y entrar a modo protegido
     ; Selector 0x08 = code descriptor en nuestra GDT
     jmp 0x08:protected_mode_entry
+
+.kernel_bad_copy:
+    mov si, msg_kernel_verify_fail
+    call print_string
+    jmp halt16
 
 halt16:
     hlt
@@ -334,58 +354,78 @@ enable_a20:
 load_kernel:
     pusha
     mov dl, [boot_drive]
+    mov word [kernel_remaining], KERNEL_SECTORS
+    mov dword [kernel_destination], KERNEL_LOAD_ADDR
     cmp dl, 0x80
     jb .load_chs
 
-    ; Leer en bloques pequenos para no cruzar limites de 64 KiB del BIOS.
-    mov cx, KERNEL_SECTORS
-    mov bx, KERNEL_LOAD_ADDR >> 4
-    mov dword [kern_dap_lba_lo], KERNEL_START_LBA
+    ; INT 13h no puede direccionar de forma portable todo el espacio superior
+    ; a 1 MiB. Leemos hasta 32 sectores en un bounce buffer bajo y luego los
+    ; copiamos al destino final usando un descriptor de datos plano temporal.
+    mov eax, [boot_part_lba]
+    add eax, KERNEL_START_LBA
+    mov dword [kern_dap_lba_lo], eax
     mov dword [kern_dap_lba_hi], 0
 
 .next_chunk:
-    mov ax, cx
+    mov ax, [kernel_remaining]
+    test ax, ax
+    jz .done
     cmp ax, 32
     jbe .chunk_size_ok
     mov ax, 32
 
 .chunk_size_ok:
+    mov word [kernel_chunk_sectors], ax
+    mov byte [kern_dap_size], 0x10
+    ; El campo de sectores del DAP es entrada/salida y algunas BIOS lo ponen
+    ; en cero incluso tras una lectura valida. La copia usa por separado
+    ; kernel_chunk_sectors y nunca confia en el valor devuelto por firmware.
+    mov ax, [kernel_chunk_sectors]
     mov word [kern_dap_sectors], ax
-    mov word [kern_dap_offset], 0
-    mov word [kern_dap_segment], bx
-
+    mov word [kern_dap_offset], KERNEL_BOUNCE_ADDR & 0x000F
+    mov word [kern_dap_segment], KERNEL_BOUNCE_ADDR >> 4
     mov ah, 0x42
     mov dl, [boot_drive]
     mov si, kern_dap
     int 0x13
+    pushf
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    popf
     jc .error
 
-    mov ax, [kern_dap_sectors]
-    sub cx, ax
+    call copy_kernel_chunk_high
+    jc .error
+
+.chunk_loaded:
+    mov ax, [kernel_chunk_sectors]
+    sub word [kernel_remaining], ax
     movzx edx, ax
     add dword [kern_dap_lba_lo], edx
-    shl ax, 5                   ; sectores * 512 / 16 = parrafos
-    add bx, ax
-    test cx, cx
-    jnz .next_chunk
+    shl edx, 9
+    add dword [kernel_destination], edx
+    jmp .next_chunk
 
+.done:
     popa
     clc
     ret
 
 .load_chs:
-    mov ax, KERNEL_LOAD_ADDR >> 4
-    mov es, ax
     mov si, KERNEL_START_LBA
-    mov cx, KERNEL_SECTORS
 
 .chs_next_sector:
-    push cx
+    cmp word [kernel_remaining], 0
+    je .done
+
     mov ax, si
     xor dx, dx
     mov bx, FLOPPY_TRACK_SPAN
     div bx
     mov ch, al
+
     mov ax, dx
     xor dx, dx
     mov bx, FLOPPY_SECTORS_PER_TRACK
@@ -393,29 +433,83 @@ load_kernel:
     mov dh, al
     mov cl, dl
     inc cl
+
+    mov ax, KERNEL_BOUNCE_ADDR >> 4
+    mov es, ax
     xor bx, bx
     mov ah, 0x02
     mov al, 0x01
     mov dl, [boot_drive]
     int 0x13
-    jc .error_chs
-
-    mov ax, es
-    add ax, 32
+    pushf
+    xor ax, ax
+    mov ds, ax
     mov es, ax
+    popf
+    jc .error
+
+    mov word [kern_dap_sectors], 1
+    mov word [kernel_chunk_sectors], 1
+    call copy_kernel_chunk_high
+    jc .error
+    add dword [kernel_destination], 512
     inc si
-    pop cx
-    loop .chs_next_sector
+    dec word [kernel_remaining]
+    jmp .chs_next_sector
 
-    popa
-    clc
-    ret
-
-.error_chs:
-    pop cx
 .error:
     popa
     stc
+    ret
+
+; Copia el bounce buffer a memoria extendida sin depender de INT 15h/AH=87h.
+; Algunas BIOS OEM (incluida la TravelMate probada) devuelven CF=0/AH=0 pero
+; no mueven los datos. Entramos brevemente en protected mode de 16 bits,
+; cargamos DS/ES con el descriptor plano, hacemos REP MOVSD y volvemos.
+; Entrada: [kernel_chunk_sectors] y [kernel_destination].
+; Salida: CF=0. A20 ya fue comprobado antes de cargar el kernel.
+copy_kernel_chunk_high:
+    pushf
+    cli
+    push ds
+    push es
+    pusha
+
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+    jmp 0x18:.protected16
+
+.protected16:
+    ; Copiar con segmentos planos mientras PE=1. El contador viene de una
+    ; variable propia: el BIOS puede modificar el campo equivalente del DAP.
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov esi, KERNEL_BOUNCE_ADDR
+    mov edi, [kernel_destination]
+    movzx ecx, word [kernel_chunk_sectors]
+    shl ecx, 7                    ; sectores * 512 / 4
+    a32 rep movsd
+
+    ; No usar la pila entre PE=1 y este far jump: SS conserva el cache de
+    ; real mode. La copia tampoco necesita la pila.
+    mov eax, cr0
+    and eax, 0xFFFFFFFE
+    mov cr0, eax
+    jmp 0x0000:.real16
+
+.real16:
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+
+    popa
+    pop es
+    pop ds
+    popf
+    clc
     ret
 
 ; =============================================================================
@@ -448,23 +542,28 @@ select_video_mode:
     mov si, msg_vesa_header
     call print_string
     xor bp, bp                           ; contador de modos VESA validos
+    mov byte [vbe_menu_pass_bpp], 32     ; mostrar true-color primero
+
+.vesa_pass:
     mov si, vbe_mode_candidates
 
 .vesa_loop:
     lodsw
     test ax, ax
-    jz .vesa_done
+    jz .vesa_pass_done
     mov [vbe_current_mode], ax
 
     ; Consultar el modo candidato. Guardamos SI/DS porque algunas BIOS tocan registros.
     push si
     push ds
+    push es
     xor ax, ax
     mov es, ax
     mov di, VBE_MODEINFO
     mov ax, 0x4F01
     mov cx, [vbe_current_mode]
     int 0x10
+    pop es
     pop ds
     pop si
     cmp ax, 0x004F
@@ -476,13 +575,11 @@ select_video_mode:
     test word [VBE_MODEINFO], 0x0080
     jz .vesa_loop
 
-    ; El kernel ya maneja estos bpp en vesa_attach_lfb().
+    ; Hacer varias pasadas: 32, 24, 16 y 8 bpp. De esta forma los
+    ; modos true-color no quedan escondidos detras de los nueve modos indexados
+    ; que suelen aparecer primero en BIOS VBE antiguas.
     mov al, [VBE_MODEINFO + 25]
-    cmp al, 16
-    je .store_and_print
-    cmp al, 24
-    je .store_and_print
-    cmp al, 32
+    cmp al, [vbe_menu_pass_bpp]
     jne .vesa_loop
 
 .store_and_print:
@@ -527,6 +624,27 @@ select_video_mode:
     mov ax, bp
     mov [vbe_menu_count], al
     jmp .vesa_loop
+
+.vesa_pass_done:
+    cmp bp, 9
+    jae .vesa_done
+    cmp byte [vbe_menu_pass_bpp], 32
+    je .menu_pass_24
+    cmp byte [vbe_menu_pass_bpp], 24
+    je .menu_pass_16
+    cmp byte [vbe_menu_pass_bpp], 16
+    je .menu_pass_8
+    jmp .vesa_done
+
+.menu_pass_24:
+    mov byte [vbe_menu_pass_bpp], 24
+    jmp .vesa_pass
+.menu_pass_16:
+    mov byte [vbe_menu_pass_bpp], 16
+    jmp .vesa_pass
+.menu_pass_8:
+    mov byte [vbe_menu_pass_bpp], 8
+    jmp .vesa_pass
 
 .vesa_done:
     test bp, bp
@@ -634,6 +752,17 @@ setup_vesa:
     pusha
     push es
 
+    ; El CD instalador no muestra el selector VESA ni activa framebuffer.
+    ; Fuerza modo 03h para que Setup sea una interfaz de texto estable.
+    cmp dword [BOOT_MODE_ADDR], INSTALLER_BOOT_MAGIC
+    jne .normal_video_boot
+    mov ax, 0x0003
+    int 0x10
+    mov dword [BOOTINFO_ADDR], VGA_BOOTINFO_MAGIC
+    mov word [BOOTINFO_ADDR + 4], VGA_BOOTINFO_TEXT
+    jmp .done
+
+.normal_video_boot:
     mov dword [BOOTINFO_ADDR], 0
     mov dword [BOOTINFO_ADDR + 4], 0
 
@@ -657,9 +786,61 @@ setup_vesa:
     jmp .query_mode
 
 .auto_list:
-    mov si, vbe_mode_candidates
+    ; La BIOS Phoenix de TravelMate 250 ya configuraba correctamente este
+    ; modo en BlesKernOS 0.6. No reinterpretar sus registros Intel: adoptar
+    ; literalmente el LFB 0x114 que entrega el firmware.
+    call detect_intel_852gme
+    test al, al
+    jz .auto_generic
+    call setup_legacy_852_mode
+    test al, al
+    jnz .done
+
+.auto_generic:
+    ; Preferencia historica y compatible: 640x480 con 256 colores.
+    ; Se prueba antes que cualquier modo de mayor resolucion/profundidad para
+    ; que el arranque automatico sea estable tambien con poca RAM y solo CPU.
+    mov word [vbe_search_width], 640
+    mov word [vbe_search_height], 480
+    mov byte [vbe_search_bpp], 8
+    call find_vbe_mode_exact
+    test ax, ax
+    jnz .auto_found
+
+    ; Si no existe ese modo, conservar candidatos de mejor calidad.
+    mov word [vbe_search_width], 1024
+    mov word [vbe_search_height], 768
+    mov byte [vbe_search_bpp], 32
+    call find_vbe_mode_exact
+    test ax, ax
+    jnz .auto_found
+
+    mov word [vbe_search_width], 800
+    mov word [vbe_search_height], 600
+    call find_vbe_mode_exact
+    test ax, ax
+    jnz .auto_found
+
+    mov word [vbe_search_width], 640
+    mov word [vbe_search_height], 480
+    call find_vbe_mode_exact
+    test ax, ax
+    jnz .auto_found
+
+    ; Ultimo recurso: un modo SVGA de 800x600 con 256 colores.
+    mov word [vbe_search_width], 800
+    mov word [vbe_search_height], 600
+    mov byte [vbe_search_bpp], 8
+    call find_vbe_mode_exact
+    test ax, ax
+    jz .done
+
+.auto_found:
+    mov [BOOTINFO_ADDR + 15], ax
+    jmp .query_mode
 
 .try_mode:
+    ; Conservado para el camino de fallo de una seleccion manual.
     lodsw
     test ax, ax
     jz .done
@@ -681,19 +862,27 @@ setup_vesa:
     test word [VBE_MODEINFO], 0x0080
     jz .mode_failed
     mov al, [VBE_MODEINFO + 25]
+    cmp al, 8
+    jne .check_truecolor
+    cmp byte [VBE_MODEINFO + 27], 4  ; Packed Pixel
+    je .set_mode
+    jmp .mode_failed
+.check_truecolor:
     cmp al, 16
-    je .set_mode
+    je .require_direct_color
     cmp al, 24
-    je .set_mode
+    je .require_direct_color
     cmp al, 32
+    jne .mode_failed
+.require_direct_color:
+    cmp byte [VBE_MODEINFO + 27], 6  ; Direct Color
     je .set_mode
     jmp .mode_failed
 
 .mode_failed:
-    ; Si era seleccion manual, no seguir leyendo la tabla con SI indefinido.
-    cmp word [selected_vbe_mode], 0
-    jne .done
-    jmp .try_mode
+    ; find_vbe_mode_exact ya valido el modo automatico. Si aun asi 4F02 falla,
+    ; no recorrer una tabla con SI indefinido: dejar que el kernel use VGA.
+    jmp .done
 
 .set_mode:
     push si
@@ -727,6 +916,33 @@ setup_vesa:
     cmp ax, 0x004F
     jne .mode_failed
 
+    ; En modos indexados la paleta debe configurarse mediante VBE. Escribir
+    ; 3C8/3C9 desde protected mode no funciona en varios chips de portatiles
+    ; aunque anuncien un framebuffer lineal valido.
+    cmp byte [VBE_MODEINFO + 25], 8
+    jne .refresh_mode_info
+    call set_vbe_palette_332
+
+.refresh_mode_info:
+    ; Consultar otra vez despues de 4F02: BIOS OEM antiguas actualizan pitch o
+    ; PhysBasePtr solamente cuando el modo ya esta activo.
+    push ds
+    push es
+    xor ax, ax
+    mov es, ax
+    mov di, VBE_MODEINFO
+    mov ax, 0x4F01
+    mov cx, [BOOTINFO_ADDR + 15]
+    int 0x10
+    pop es
+    pop ds
+    cmp ax, 0x004F
+    jne .mode_active_failed
+
+    mov eax, [VBE_MODEINFO + 40]
+    test eax, eax
+    jz .mode_active_failed
+
     mov dword [BOOTINFO_ADDR], 0x31495547
     mov eax, [VBE_MODEINFO + 40]
     mov [BOOTINFO_ADDR + 4], eax
@@ -734,10 +950,40 @@ setup_vesa:
     mov [BOOTINFO_ADDR + 8], ax
     mov ax, [VBE_MODEINFO + 20]
     mov [BOOTINFO_ADDR + 10], ax
+    ; BytesPerScanLine (+16) es la fuente segura para BIOS VBE 1.x/2.x. En
+    ; VBE 3.0 aceptar LinBytesPerScanLine (+50) solo si es al menos el ancho
+    ; minimo; buffers parciales de BIOS viejas pueden dejar basura en +50.
+    xor ah, ah
+    mov al, [VBE_MODEINFO + 25]
+    add ax, 7
+    shr ax, 3
+    mov bx, ax                     ; bytes por pixel
+    mov ax, [VBE_MODEINFO + 18]
+    mul bx
+    mov bx, ax                     ; pitch minimo
     mov ax, [VBE_MODEINFO + 16]
+    cmp ax, bx
+    jb .mode_active_failed
+    mov cx, [VBE_MODEINFO + 50]
+    cmp cx, bx
+    jb .pitch_ready
+    cmp cx, 32768
+    ja .pitch_ready
+    mov ax, cx
+.pitch_ready:
     mov [BOOTINFO_ADDR + 12], ax
     mov al, [VBE_MODEINFO + 25]
     mov [BOOTINFO_ADDR + 14], al
+    jmp .done
+
+.mode_active_failed:
+    ; Si un BIOS acepto 4F02 pero devolvio metadata incoherente, no dejar la
+    ; pantalla en un modo grafico que el kernel no puede describir. VGA 12h es
+    ; el respaldo grafico universal y el kernel lo activara correctamente.
+    mov ax, 0x0003
+    int 0x10
+    mov dword [BOOTINFO_ADDR], VGA_BOOTINFO_MAGIC
+    mov word [BOOTINFO_ADDR + 4], VGA_BOOTINFO_12H
     jmp .done
 
 .bootinfo_text:
@@ -759,8 +1005,225 @@ setup_vesa:
     popa
     ret
 
+; Construir y aplicar una paleta RGB332 mediante VBE 4F09h.
+; La tabla B,G,R,0 usa componentes DAC de 6 bits, compatibles con VBE 1.2+.
+set_vbe_palette_332:
+    pusha
+    push ds
+    push es
+    xor ax, ax
+    mov es, ax
+    mov di, VBE_INFO
+    xor si, si
+.palette_loop:
+    mov ax, si
+    and ax, 3
+    mov bl, 21
+    mul bl                         ; azul: 0,21,42,63
+    stosb
+
+    mov ax, si
+    shr ax, 2
+    and ax, 7
+    mov bl, 9
+    mul bl                         ; verde: 0..63
+    stosb
+
+    mov ax, si
+    shr ax, 5
+    and ax, 7
+    mov bl, 9
+    mul bl                         ; rojo: 0..63
+    stosb
+
+    xor al, al
+    stosb
+    inc si
+    cmp si, 256
+    jb .palette_loop
+
+    mov ax, 0x4F09
+    xor bx, bx                     ; BL=0: establecer paleta
+    mov cx, 256
+    xor dx, dx                     ; primer indice = 0
+    mov di, VBE_INFO
+    int 0x10
+    pop es
+    pop ds
+    popa
+    ret
+
+; Ruta deliberadamente igual a 0.6 para Intel 852GME/Phoenix:
+; consulta 0x114, lo activa como LFB y conserva sin reinterpretar PhysBasePtr
+; y BytesPerScanLine devueltos antes del cambio. AL=1 si quedo listo.
+setup_legacy_852_mode:
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov di, VBE_MODEINFO
+    mov ax, 0x4F01
+    mov cx, 0x0114
+    int 0x10
+    cmp ax, 0x004F
+    jne .legacy_fail
+    test word [VBE_MODEINFO], 0x0001
+    jz .legacy_fail
+    test word [VBE_MODEINFO], 0x0080
+    jz .legacy_fail
+    cmp byte [VBE_MODEINFO + 25], 16
+    jne .legacy_fail
+    mov eax, [VBE_MODEINFO + 40]
+    test eax, eax
+    jz .legacy_fail
+    mov ax, [VBE_MODEINFO + 16]
+    cmp ax, 1600
+    jb .legacy_fail
+    mov ax, 0x4F02
+    mov bx, 0x4114
+    int 0x10
+    cmp ax, 0x004F
+    jne .legacy_fail
+    mov dword [BOOTINFO_ADDR], 0x31495547
+    mov eax, [VBE_MODEINFO + 40]
+    mov [BOOTINFO_ADDR + 4], eax
+    mov ax, [VBE_MODEINFO + 18]
+    mov [BOOTINFO_ADDR + 8], ax
+    mov ax, [VBE_MODEINFO + 20]
+    mov [BOOTINFO_ADDR + 10], ax
+    mov ax, [VBE_MODEINFO + 16]
+    mov [BOOTINFO_ADDR + 12], ax
+    mov al, [VBE_MODEINFO + 25]
+    mov [BOOTINFO_ADDR + 14], al
+    mov word [BOOTINFO_ADDR + 15], 0x0114
+    mov al, 1
+    jmp .legacy_done
+.legacy_fail:
+    xor al, al
+.legacy_done:
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+; AL=1 si PCI BIOS encuentra Intel 852GME/Montara-GT (8086:3582).
+detect_intel_852gme:
+%ifdef TEST_FORCE_852
+    mov al, 1
+    ret
+%endif
+    push ds
+    push es
+    push bx
+    push cx
+    push dx
+    push si
+    mov ax, 0xB102
+    mov cx, 0x3582
+    mov dx, 0x8086
+    xor si, si
+    int 0x1A
+    jc .not_852
+    test ah, ah
+    jnz .not_852
+    mov al, 1
+    jmp .detect_done
+.not_852:
+    xor al, al
+.detect_done:
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop es
+    pop ds
+    ret
+
+; Buscar en la tabla un modo LFB que coincida exactamente con las variables
+; vbe_search_*. Devuelve AX=numero VBE o AX=0. Se consulta la informacion real
+; de la BIOS: los numeros 0x11x/0x14x no tienen el mismo formato en todas las
+; implementaciones OEM.
+find_vbe_mode_exact:
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    mov si, vbe_mode_candidates
+.find_loop:
+    lodsw
+    test ax, ax
+    jz .not_found
+    mov [vbe_current_mode], ax
+
+    push si
+    push ds
+    push es
+    xor ax, ax
+    mov es, ax
+    mov di, VBE_MODEINFO
+    mov ax, 0x4F01
+    mov cx, [vbe_current_mode]
+    int 0x10
+    pop es
+    pop ds
+    pop si
+    cmp ax, 0x004F
+    jne .find_loop
+    test word [VBE_MODEINFO], 0x0001
+    jz .find_loop
+    test word [VBE_MODEINFO], 0x0080
+    jz .find_loop
+
+    mov ax, [VBE_MODEINFO + 18]
+    cmp ax, [vbe_search_width]
+    jne .find_loop
+    mov ax, [VBE_MODEINFO + 20]
+    cmp ax, [vbe_search_height]
+    jne .find_loop
+    mov al, [VBE_MODEINFO + 25]
+    cmp al, [vbe_search_bpp]
+    jne .find_loop
+    ; 32 bpp debe ser Direct Color (memory model 6); 8 bpp puede ser packed.
+    cmp al, 32
+    jne .found
+    cmp byte [VBE_MODEINFO + 27], 6
+    jne .find_loop
+.found:
+    mov ax, [vbe_current_mode]
+    jmp .find_done
+.not_found:
+    xor ax, ax
+.find_done:
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
 vbe_mode_candidates:
-    dw VBE_DEFAULT_MODE, 0x115, 0x117, 0x118, 0x111, 0x112, 0
+    dw VBE_DEFAULT_MODE
+    dw 0x101, 0x105, 0x107
+    dw 0x111, 0x112, 0x114, 0x115, 0x117, 0x118
+    dw 0x100, 0x102, 0x104, 0x106
+    dw 0x110, 0x113, 0x116, 0x119
+    dw 0x11A, 0x11B, 0x11C, 0x11D, 0x11E, 0x11F
+    dw 0x120, 0x121, 0x122, 0x123, 0x124, 0x125
+    dw 0x140, 0x141, 0x142, 0x143, 0x144, 0x145
+    dw 0
 
 ; =============================================================================
 ; PRINT_STRING (16-bit, BIOS TTY)
@@ -880,6 +1343,15 @@ gdt_data:
     db 11001111b            ; Flags
     db 0x00                 ; Base bits 24-31
 
+; Descriptor 3 (selector 0x18): Code Segment - 16 bit, flat, ring 0
+gdt_code16:
+    dw 0xFFFF               ; Límite bits 0-15
+    dw 0x0000               ; Base bits 0-15
+    db 0x00                 ; Base bits 16-23
+    db 10011010b            ; Access: Present|Ring0|Code|Exec|Read
+    db 10001111b            ; Flags: 4KB granularidad, 16-bit | límite bits 16-19
+    db 0x00                 ; Base bits 24-31
+
 gdt_end:
 
 gdt_descriptor:
@@ -891,12 +1363,16 @@ kern_dap:
 kern_dap_size     db 0x10
 kern_dap_res      db 0x00
 kern_dap_sectors  dw KERNEL_SECTORS
-kern_dap_offset   dw KERNEL_LOAD_ADDR & 0xFFFF
-kern_dap_segment  dw KERNEL_LOAD_ADDR >> 4
+kern_dap_offset   dw KERNEL_BOUNCE_ADDR & 0x000F
+kern_dap_segment  dw KERNEL_BOUNCE_ADDR >> 4
 kern_dap_lba_lo   dd KERNEL_START_LBA
 kern_dap_lba_hi   dd 0
 boot_drive        db 0
+boot_part_lba     dd 0
 
+kernel_remaining   dw 0
+kernel_chunk_sectors dw 0
+kernel_destination dd KERNEL_LOAD_ADDR
 ; Mensajes
 msg_stage2_hello    db 0x0D, 0x0A, '  [Stage 2] BleskernOS cargando...', 0x0D, 0x0A, 0
 msg_detecting_ram   db '  > Detectando RAM (E820)...', 0x0D, 0x0A, 0
@@ -907,6 +1383,7 @@ msg_a20_fail        db '  [ERROR] A20 no se pudo habilitar!', 0x0D, 0x0A, 0
 msg_loading_kernel  db '  > Cargando kernel...', 0x0D, 0x0A, 0
 msg_kernel_ok       db '  [OK] Kernel en memoria.', 0x0D, 0x0A, 0
 msg_kernel_fail     db '  [ERROR] No se pudo cargar kernel!', 0x0D, 0x0A, 0
+msg_kernel_verify_fail db '  [ERROR] BIOS copio mal el kernel en memoria alta!', 0x0D, 0x0A, 0
 msg_entering_pm     db '  > Entrando a Modo Protegido...', 0x0D, 0x0A, 0
 msg_vga_header      db '  > Modos VGA compatibles:', 0x0D, 0x0A, 0
 msg_vga_text_choice db '    T. VGA 03h: 80x25 texto', 0x0D, 0x0A, 0
@@ -931,7 +1408,11 @@ msg_vesa_using      db '  > Usando modo VESA 0x', 0
 vbe_current_mode    dw 0
 selected_vbe_mode   dw 0       ; 0=auto, 0xFFFF=VGA texto, otro=modo VESA elegido
 vbe_menu_count      db 0
+vbe_menu_pass_bpp   db 32
 vbe_menu_modes      times 9 dw 0
+vbe_search_width    dw 0
+vbe_search_height   dw 0
+vbe_search_bpp      db 0
 
 ; =============================================================================
 ; CÓDIGO DE 32 BITS — Modo Protegido
@@ -946,39 +1427,11 @@ protected_mode_entry:
     mov gs, ax
     mov ss, ax
 
-    ; La 0.4 tiene un .bss mucho mayor que la 0.3 (principalmente por DOOM).
-    ; 0x9FFFF ahora cae dentro del .bss y la pila corrompe VFS, block devices,
-    ; tareas e IDT. El heap comienza en 0x200000, por lo que dejamos la pila
-    ; justo debajo de él, con espacio holgado para crecer hacia abajo.
-    mov esp, 0x001FF000
-
-    ; Escribir mensaje directo en video memory (0xB8000)
-    ; Ya no tenemos BIOS, pero sí VGA text mode buffer
-    mov edi, 0x000B8000
-    mov esi, pm_msg
-    call pm_print
-
+    ; La BSS termina como máximo en 0x340000. Reservar 64 KiB inmediatamente
+    ; después libera 0.7 MiB para el heap del perfil recomendado de 8 MiB.
+    mov esp, 0x00350000
     ; Saltar al kernel
     jmp KERNEL_LOAD_ADDR
-
-pm_print:
-    push eax
-    push edi
-.loop:
-    mov al, [esi]
-    test al, al
-    jz .done
-    mov byte [edi], al
-    mov byte [edi+1], 0x0A  ; Verde sobre negro
-    add edi, 2
-    inc esi
-    jmp .loop
-.done:
-    pop edi
-    pop eax
-    ret
-
-pm_msg db '  [32-bit] Modo Protegido OK! Saltando al kernel...', 0
 
 ; Rellenar hasta el limite de Stage 2 (8 sectores = 4096 bytes)
 times (8 * 512) - ($ - $$) db 0

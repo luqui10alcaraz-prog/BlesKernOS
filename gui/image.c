@@ -1,9 +1,234 @@
 #include "image.h"
 #include "../kernel/include/memory.h"
 #include "../kernel/include/vfs.h"
+#include "../kernel/include/inflate.h"
 
 static uint16_t le16(const uint8_t *p) {
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+
+static uint32_t be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint8_t png_paeth(uint8_t a, uint8_t b, uint8_t c) {
+    int p = (int)a + (int)b - (int)c;
+    int pa = p > (int)a ? p - (int)a : (int)a - p;
+    int pb = p > (int)b ? p - (int)b : (int)b - p;
+    int pc = p > (int)c ? p - (int)c : (int)c - p;
+    if (pa <= pb && pa <= pc) return a;
+    return pb <= pc ? b : c;
+}
+
+static bool png_unfilter(uint8_t *rows, uint32_t row_bytes, uint32_t height,
+                         uint32_t bytes_per_pixel) {
+    uint32_t y, x;
+    if (!rows || !row_bytes || !height || !bytes_per_pixel) return false;
+    for (y = 0U; y < height; y++) {
+        uint8_t filter = rows[y * (row_bytes + 1U)];
+        uint8_t *row = rows + y * (row_bytes + 1U) + 1U;
+        uint8_t *previous = y ? rows + (y - 1U) * (row_bytes + 1U) + 1U : NULL;
+        if (filter > 4U) return false;
+        for (x = 0U; x < row_bytes; x++) {
+            uint8_t left = x >= bytes_per_pixel ? row[x - bytes_per_pixel] : 0U;
+            uint8_t up = previous ? previous[x] : 0U;
+            uint8_t upper_left = previous && x >= bytes_per_pixel ?
+                                 previous[x - bytes_per_pixel] : 0U;
+            if (filter == 1U) row[x] = (uint8_t)(row[x] + left);
+            else if (filter == 2U) row[x] = (uint8_t)(row[x] + up);
+            else if (filter == 3U)
+                row[x] = (uint8_t)(row[x] + ((uint16_t)left + up) / 2U);
+            else if (filter == 4U)
+                row[x] = (uint8_t)(row[x] + png_paeth(left, up, upper_left));
+        }
+    }
+    return true;
+}
+
+static uint8_t png_sample(const uint8_t *row, uint32_t x, uint8_t depth) {
+    uint32_t bit;
+    uint8_t mask;
+    if (depth == 8U) return row[x];
+    bit = x * depth;
+    mask = (uint8_t)((1U << depth) - 1U);
+    return (uint8_t)((row[bit >> 3U] >> (8U - depth - (bit & 7U))) & mask);
+}
+
+bool gui_png_decode(gui_image_t *image, const uint8_t *data, uint32_t length) {
+    static const uint8_t signature[8] = {137,80,78,71,13,10,26,10};
+    uint32_t position = 8U, width = 0U, height = 0U;
+    uint8_t depth = 0U, color_type = 0U, interlace = 0U;
+    uint8_t palette[256][4];
+    uint32_t palette_count = 0U;
+    uint8_t *packed = NULL, *rows = NULL;
+    uint32_t packed_length = 0U, packed_capacity = 0U;
+    uint32_t channels, row_bits, row_bytes, filtered_size, bpp;
+    uint32_t *pixels = NULL;
+    int32_t inflated;
+    uint32_t x, y;
+    if (!image || !data || length < 33U ||
+        kmemcmp(data, signature, sizeof(signature)) != 0) return false;
+    image->pixels = NULL; image->width = 0U; image->height = 0U;
+    for (x = 0U; x < 256U; x++) {
+        palette[x][0] = palette[x][1] = palette[x][2] = 0U;
+        palette[x][3] = 0xFFU;
+    }
+    while (position + 12U <= length) {
+        uint32_t chunk_length = be32(data + position);
+        const uint8_t *type = data + position + 4U;
+        const uint8_t *chunk = data + position + 8U;
+        if (chunk_length > length - position - 12U) goto fail;
+        if (type[0]=='I' && type[1]=='H' && type[2]=='D' && type[3]=='R') {
+            if (chunk_length != 13U) goto fail;
+            width = be32(chunk); height = be32(chunk + 4U);
+            depth = chunk[8]; color_type = chunk[9]; interlace = chunk[12];
+            if (!width || !height || width > 4096U || height > 4096U ||
+                width > 0xFFFFFFFFU / height / 4U || chunk[10] || chunk[11] ||
+                interlace != 0U) goto fail;
+            if (color_type == 3U) {
+                if (depth != 1U && depth != 2U && depth != 4U && depth != 8U)
+                    goto fail;
+            } else if (depth != 8U) goto fail;
+            if (color_type != 0U && color_type != 2U && color_type != 3U &&
+                color_type != 4U && color_type != 6U) goto fail;
+        } else if (type[0]=='P' && type[1]=='L' && type[2]=='T' && type[3]=='E') {
+            if (chunk_length == 0U || chunk_length % 3U || chunk_length > 768U)
+                goto fail;
+            palette_count = chunk_length / 3U;
+            for (x = 0U; x < palette_count; x++) {
+                palette[x][0] = chunk[x * 3U];
+                palette[x][1] = chunk[x * 3U + 1U];
+                palette[x][2] = chunk[x * 3U + 2U];
+            }
+        } else if (type[0]=='t' && type[1]=='R' && type[2]=='N' && type[3]=='S') {
+            if (color_type == 3U) {
+                uint32_t count = chunk_length < palette_count ? chunk_length : palette_count;
+                for (x = 0U; x < count; x++) palette[x][3] = chunk[x];
+            }
+        } else if (type[0]=='I' && type[1]=='D' && type[2]=='A' && type[3]=='T') {
+            uint32_t needed;
+            if (!width || !height || chunk_length > 4U * 1024U * 1024U)
+                goto fail;
+            needed = packed_length + chunk_length;
+            if (needed < packed_length) goto fail;
+            if (needed > packed_capacity) {
+                uint32_t next = packed_capacity ? packed_capacity : 4096U;
+                uint8_t *replacement;
+                while (next < needed) {
+                    if (next > 4U * 1024U * 1024U / 2U) { next = needed; break; }
+                    next *= 2U;
+                }
+                replacement = (uint8_t *)kmalloc(next);
+                if (!replacement) goto fail;
+                if (packed_length) kmemcpy(replacement, packed, packed_length);
+                if (packed) kfree(packed);
+                packed = replacement; packed_capacity = next;
+            }
+            kmemcpy(packed + packed_length, chunk, chunk_length);
+            packed_length += chunk_length;
+        } else if (type[0]=='I' && type[1]=='E' && type[2]=='N' && type[3]=='D') {
+            break;
+        }
+        position += chunk_length + 12U;
+    }
+    if (!width || !height || !packed_length) goto fail;
+    channels = color_type == 0U ? 1U : color_type == 2U ? 3U :
+               color_type == 3U ? 1U : color_type == 4U ? 2U : 4U;
+    row_bits = width * channels * depth;
+    if (width && row_bits / width != channels * depth) goto fail;
+    row_bytes = (row_bits + 7U) / 8U;
+    if (!row_bytes || height > 0xFFFFFFFFU / (row_bytes + 1U)) goto fail;
+    filtered_size = (row_bytes + 1U) * height;
+    rows = (uint8_t *)kmalloc(filtered_size);
+    if (!rows) goto fail;
+    inflated = inflate_zlib(packed, packed_length, rows, filtered_size);
+    if (inflated != (int32_t)filtered_size) goto fail;
+    bpp = color_type == 3U || depth < 8U ? 1U : channels;
+    if (!png_unfilter(rows, row_bytes, height, bpp)) goto fail;
+    pixels = (uint32_t *)kmalloc(width * height * 4U);
+    if (!pixels) goto fail;
+    for (y = 0U; y < height; y++) {
+        const uint8_t *row = rows + y * (row_bytes + 1U) + 1U;
+        for (x = 0U; x < width; x++) {
+            uint8_t r=0U,g=0U,b=0U,a=0xFFU;
+            if (color_type == 0U) r = g = b = row[x];
+            else if (color_type == 2U) {
+                r=row[x*3U]; g=row[x*3U+1U]; b=row[x*3U+2U];
+            } else if (color_type == 3U) {
+                uint8_t index = png_sample(row, x, depth);
+                if (index >= palette_count) goto fail;
+                r=palette[index][0]; g=palette[index][1];
+                b=palette[index][2]; a=palette[index][3];
+            } else if (color_type == 4U) {
+                r=g=b=row[x*2U]; a=row[x*2U+1U];
+            } else {
+                r=row[x*4U]; g=row[x*4U+1U]; b=row[x*4U+2U]; a=row[x*4U+3U];
+            }
+            pixels[y*width+x] = ((uint32_t)a<<24)|((uint32_t)r<<16)|
+                                ((uint32_t)g<<8)|b;
+        }
+    }
+    if (packed) kfree(packed);
+    if (rows) kfree(rows);
+    image->pixels = pixels; image->width = (uint16_t)width;
+    image->height = (uint16_t)height;
+    return true;
+fail:
+    if (pixels) kfree(pixels);
+    if (rows) kfree(rows);
+    if (packed) kfree(packed);
+    return false;
+}
+
+bool gui_bmp_decode(gui_image_t *image, const uint8_t *data, uint32_t length) {
+    uint32_t offset, stride, compression;
+    int32_t width, raw_height, height;
+    uint16_t bpp;
+    uint32_t *pixels;
+    if (!image || !data || length < 54U) return false;
+    image->pixels = NULL;
+    image->width = 0U;
+    image->height = 0U;
+    if (data[0] != 'B' || data[1] != 'M' || le32(data + 14U) < 40U)
+        return false;
+    offset = le32(data + 10U);
+    width = (int32_t)le32(data + 18U);
+    raw_height = (int32_t)le32(data + 22U);
+    bpp = le16(data + 28U);
+    compression = le32(data + 30U);
+    if (width <= 0 || raw_height == 0 || raw_height == (int32_t)0x80000000U ||
+        width > 4096 || raw_height > 4096 || raw_height < -4096 ||
+        (bpp != 24U && bpp != 32U) || compression != 0U) return false;
+    height = raw_height < 0 ? -raw_height : raw_height;
+    stride = ((uint32_t)width * (uint32_t)(bpp / 8U) + 3U) & ~3U;
+    if (offset >= length || stride > length ||
+        (uint32_t)height > (length - offset) / stride) return false;
+    if ((uint32_t)width > 0xFFFFFFFFU / (uint32_t)height / 4U) return false;
+    pixels = (uint32_t *)kmalloc((uint32_t)width * (uint32_t)height * 4U);
+    if (!pixels) return false;
+    for (int32_t y = 0; y < height; y++) {
+        int32_t source_y = raw_height > 0 ? height - 1 - y : y;
+        const uint8_t *row = data + offset + (uint32_t)source_y * stride;
+        for (int32_t x = 0; x < width; x++) {
+            const uint8_t *pixel = row + (uint32_t)x * (uint32_t)(bpp / 8U);
+            uint32_t alpha = bpp == 32U ? pixel[3] : 0xFFU;
+            if (bpp == 32U && alpha == 0U) alpha = 0xFFU;
+            pixels[(uint32_t)y * (uint32_t)width + (uint32_t)x] =
+                (alpha << 24) | ((uint32_t)pixel[2] << 16) |
+                ((uint32_t)pixel[1] << 8) | pixel[0];
+        }
+    }
+    image->pixels = pixels;
+    image->width = (uint16_t)width;
+    image->height = (uint16_t)height;
+    return true;
 }
 
 void gui_image_free(gui_image_t *image) {

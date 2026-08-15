@@ -1,4 +1,5 @@
 #include "../stdio.h"
+#include "../include/language.h"
 #include "../stdlib.h"
 #include "../string.h"
 #include "../ctype.h"
@@ -557,6 +558,7 @@ int printf(const char *fmt, ...) {
 }
 
 int vsnprintf(char *buffer, size_t size, const char *fmt, va_list args) {
+    if (fmt && fmt[0] == '@') fmt = language_translate(fmt);
     return format_vprintf_to_buffer(buffer, size, fmt, args);
 }
 

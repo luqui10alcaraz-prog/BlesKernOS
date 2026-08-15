@@ -2,6 +2,11 @@
 #include "include/gfx.h"
 #include "include/pic.h"
 #include "include/sound.h"
+#include "include/smp.h"
+#include "include/task.h"
+#include "include/kernel_domains.h"
+#include "include/smp_watchdog.h"
+#include "include/vga.h"
 
 static void panic_hex(char *out, uint32_t value) {
     static const char digits[] = "0123456789ABCDEF";
@@ -57,10 +62,20 @@ void panic_show(const char *message, uint32_t interrupt,
                 uint32_t error_code, uint32_t address) {
     const gfx_info_t *info;
     char number[16];
+    uint32_t panic_cpu = smp_cpu_index();
+    uint32_t panic_pid = task_current_pid();
+    uint32_t held_domains = kernel_domains_held_mask();
+    uint32_t stalled_cpus = smp_watchdog_stalled_mask();
     cli();
 
+    kprintf("[PANIC] cpu=%u pid=%u int=%u error=%x eip=%x "
+            "domains=%x stalled=%x\n",
+            panic_cpu, panic_pid, interrupt, error_code, address,
+            held_domains, stalled_cpus);
+    kernel_domains_dump_current();
+
     info = gfx_get_info();
-    if (!info || (info->mode != GFX_MODE_VESA_LFB &&
+    if (!info || (!gfx_is_linear_framebuffer() &&
                   !gfx_set_mode13h())) {
         for (;;) __asm__ volatile ("hlt");
     }
@@ -88,24 +103,34 @@ void panic_show(const char *message, uint32_t interrupt,
 
     panic_bomb(bomb_x, bomb_y);
 
-    gfx_fill_rect_rgb(text_x - 16, bomb_y - 96,
-                      width - text_x - left + 16, 168, 0x00850012);
-    gfx_draw_string(text_x, bomb_y - 78, "DIAGNOSTICO", 15, 0, false);
-    gfx_draw_string(text_x, bomb_y - 56,
+    gfx_fill_rect_rgb(text_x - 16, bomb_y - 116,
+                      width - text_x - left + 16, 220, 0x00850012);
+    gfx_draw_string(text_x, bomb_y - 98, "DIAGNOSTICO", 15, 0, false);
+    gfx_draw_string(text_x, bomb_y - 76,
                     message ? message : "KERNEL PANIC", 15, 0, false);
 
-    gfx_draw_string(text_x, bomb_y - 20, "INTERRUPCION:", 15, 0, false);
+    gfx_draw_string(text_x, bomb_y - 40, "INTERRUPCION:", 15, 0, false);
     panic_dec(number, interrupt);
+    gfx_draw_string(text_x + 112, bomb_y - 40, number, 15, 0, false);
+
+    gfx_draw_string(text_x, bomb_y - 20, "ERROR CODE:", 15, 0, false);
+    panic_hex(number, error_code);
     gfx_draw_string(text_x + 112, bomb_y - 20, number, 15, 0, false);
 
-    gfx_draw_string(text_x, bomb_y, "ERROR CODE:", 15, 0, false);
-    panic_hex(number, error_code);
+    gfx_draw_string(text_x, bomb_y, "DIRECCION:", 15, 0, false);
+    panic_hex(number, address);
     gfx_draw_string(text_x + 112, bomb_y, number, 15, 0, false);
 
-    gfx_draw_string(text_x, bomb_y + 20, "DIRECCION:", 15, 0, false);
-    panic_hex(number, address);
+    gfx_draw_string(text_x, bomb_y + 20, "CPU / PID:", 15, 0, false);
+    panic_dec(number, panic_cpu);
     gfx_draw_string(text_x + 112, bomb_y + 20, number, 15, 0, false);
-    gfx_draw_string(text_x, bomb_y + 46, "ESTADO: CPU DETENIDO",
+    panic_dec(number, panic_pid);
+    gfx_draw_string(text_x + 144, bomb_y + 20, number, 15, 0, false);
+
+    gfx_draw_string(text_x, bomb_y + 40, "LOCKS:", 15, 0, false);
+    panic_hex(number, held_domains);
+    gfx_draw_string(text_x + 112, bomb_y + 40, number, 15, 0, false);
+    gfx_draw_string(text_x, bomb_y + 66, "ESTADO: CPU DETENIDO",
                     15, 0, false);
 
     gfx_fill_rect_rgb(0, height - 92, width, 92, 0x006E000F);

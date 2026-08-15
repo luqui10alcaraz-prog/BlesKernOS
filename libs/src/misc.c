@@ -261,19 +261,13 @@ void glReadPixels(GLint x,
                   void *data)
 {
     GLContext *c = gl_get_context();
+    GLint row, column;
+    GLubyte *bytes = (GLubyte *)data;
 #include "error_check.h"
-    if (c->readbuffer != GL_FRONT ||
+    if (!c || !data || width < 0 || height < 0 ||
+        c->readbuffer != GL_FRONT ||
         (format != GL_RGBA && format != GL_RGB &&
-         format != GL_DEPTH_COMPONENT) ||
-#if TGL_FEATURE_RENDER_BITS == 32
-        (type != GL_UNSIGNED_INT && type != GL_UNSIGNED_INT_8_8_8_8)
-#elif TGL_FEATURE_RENDER_BITS == 16
-        (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_SHORT_5_6_5)
-#else
-#error "Unsupported TGL_FEATURE_RENDER_BITS"
-#endif
-
-    ) {
+         format != GL_DEPTH_COMPONENT)) {
 #if TGL_HAS(ERROR_CHECK)
 #define ERROR_FLAG GL_INVALID_OPERATION
 #include "error_check.h"
@@ -281,12 +275,64 @@ void glReadPixels(GLint x,
         return;
 #endif
     }
-    /* TODO: implement read pixels.*/
+    if (format == GL_DEPTH_COMPONENT) {
+        if (type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_INT) return;
+    } else {
+#if TGL_FEATURE_RENDER_BITS == 32
+        if (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_INT &&
+            type != GL_UNSIGNED_INT_8_8_8_8) return;
+#elif TGL_FEATURE_RENDER_BITS == 16
+        if (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT &&
+            type != GL_UNSIGNED_SHORT_5_6_5) return;
+#endif
+    }
+
+    tgl_gpu_prepare_cpu(c->zb);
+    for (row = 0; row < height; ++row) {
+        GLint gl_y = y + row;
+        GLint source_y = c->zb->ysize - 1 - gl_y;
+        for (column = 0; column < width; ++column) {
+            GLint source_x = x + column;
+            PIXEL pixel = 0;
+            GLushort depth = 0;
+            if (source_x >= 0 && source_x < c->zb->xsize &&
+                source_y >= 0 && source_y < c->zb->ysize) {
+                GLint offset = source_x + source_y * c->zb->xsize;
+                pixel = c->zb->pbuf[offset];
+                depth = c->zb->zbuf[offset];
+            }
+            if (format == GL_DEPTH_COMPONENT) {
+                if (type == GL_UNSIGNED_SHORT) {
+                    *((GLushort *)bytes) = depth;
+                    bytes += sizeof(GLushort);
+                } else {
+                    *((GLuint *)bytes) = ((GLuint)depth << 16) | depth;
+                    bytes += sizeof(GLuint);
+                }
+            } else if (type == GL_UNSIGNED_BYTE) {
+                *bytes++ = (GLubyte)GET_RED(pixel);
+                *bytes++ = (GLubyte)GET_GREEN(pixel);
+                *bytes++ = (GLubyte)GET_BLUE(pixel);
+                if (format == GL_RGBA) *bytes++ = 255U;
+            } else {
+#if TGL_FEATURE_RENDER_BITS == 32
+                GLuint packed = (GLuint)pixel;
+                if (format == GL_RGBA) packed |= 0xFF000000U;
+                *((GLuint *)bytes) = packed;
+                bytes += sizeof(GLuint);
+#else
+                *((GLushort *)bytes) = (GLushort)pixel;
+                bytes += sizeof(GLushort);
+#endif
+            }
+        }
+    }
 }
 
 void glFinish()
 {
-    return;
+    GLContext *c = gl_get_context();
+    tgl_gpu_prepare_cpu(c ? c->zb : NULL);
 }
 
 void gl_eval_viewport()

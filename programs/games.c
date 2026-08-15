@@ -1,6 +1,4 @@
-#include "programs.h"
-#include "../kernel/include/memory.h"
-#include "../kernel/include/task.h"
+#include "../kernel/include/api.h"
 
 #define C4_COLS 7
 #define C4_ROWS 6
@@ -14,7 +12,7 @@ typedef struct {
 static games_state_t *g_games;
 
 static void c4_reset(games_state_t *st) {
-    kmemset(st->board, 0, sizeof(st->board));
+    bk_runtime_memset(st->board, 0, sizeof(st->board));
     st->turn = 1;
     st->winner = 0;
     if (st->window) st->window->dirty = true;
@@ -52,16 +50,16 @@ static void games_reset(gui_window_t *window, uint32_t id UNUSED) {
 static void games_draw(gui_window_t *window UNUSED, gui_surface_t *s, void *ctx) {
     games_state_t *st = (games_state_t *)ctx;
     int x = st->window->bounds.x + 25, y = st->window->bounds.y + 58;
-    const char *msg = st->winner == 1 ? "Gana rojo!" :
-                      st->winner == 2 ? "Gana amarillo!" :
-                      st->turn == 1 ? "Turno: rojo" : "Turno: amarillo";
-    gui_font_draw_string(s, x, st->window->bounds.y + 44, msg,
+    const char *msg = st->winner == 1 ? "@HB582D08F" :
+                      st->winner == 2 ? "@H61EF008C" :
+                      st->turn == 1 ? "@H4DE62A21" : "@H96B4A218";
+    bk_gui_font_draw_string(s, x, st->window->bounds.y + 44, msg,
                          0x00101010, 0, false);
-    gui_gfx_fill_rect(s, (gui_rect_t){x, y, 7 * 34, 6 * 30}, 0x001850B0);
+    bk_gui_gfx_fill_rect(s, (gui_rect_t){x, y, 7 * 34, 6 * 30}, 0x001850B0);
     for (int r = 0; r < C4_ROWS; r++) for (int c = 0; c < C4_COLS; c++) {
         uint32_t color = st->board[r][c] == 1 ? 0x00E03030 :
                          st->board[r][c] == 2 ? 0x00F0D030 : 0x00E8E8E0;
-        gui_gfx_fill_rounded_rect(s,
+        bk_gui_gfx_fill_rounded_rect(s,
             (gui_rect_t){x + c * 34 + 5, y + r * 30 + 3, 24, 24}, 11, color);
     }
 }
@@ -83,38 +81,48 @@ static bool games_event(gui_window_t *window UNUSED, const gui_event_t *e,
 static void games_cleanup(games_state_t *st) {
     if (!st) return;
     if (st->window) {
-        gui_desktop_remove_window(st->desktop, st->window);
-        gui_window_destroy(st->window);
-        task_bind_window(NULL);
+        bk_gui_desktop_remove_window(st->desktop, st->window);
+        bk_gui_window_destroy_raw(st->window);
+        bk_proc_bind_window(NULL);
     }
     if (g_games == st) g_games = NULL;
-    kfree(st);
+    bk_sys_free(st);
 }
 static void games_main(void *arg) {
     games_state_t *st = (games_state_t *)arg;
     c4_reset(st);
-    st->window = gui_desktop_create_window(st->desktop, 120, 40, 290, 280,
-                                           "Juegos - Conecta 4");
+    st->window = bk_gui_create_window(st->desktop, 120, 40, 290, 280,
+                                           "@H2A01C50A");
     if (st->window) {
-        gui_window_set_content(st->window, games_draw, st);
-        gui_window_set_event_handler(st->window, games_event, st);
-        st->window->owner_pid = task_current_pid();
-        task_bind_window(st->window);
-        gui_widget_t *b = gui_widget_create(st->desktop, st->window,
-            GUI_WIDGET_BUTTON, (gui_rect_t){185, 4, 82, 22}, "Reiniciar",
+        (void)bk_about_attach(st->window, st->desktop, &(bk_about_info_t){
+            "@HCBFD67CA", "@H1C1E4EC2", "@H786C13D7",
+            "@H7A28E1E5", "/ICONS/OBJECT.BMP"});
+        bk_gui_set_window_content(st->window, games_draw, st);
+        bk_gui_set_window_event_handler(st->window, games_event, st);
+        st->window->owner_pid = bk_sys_getpid();
+        bk_proc_bind_window(st->window);
+        gui_widget_t *b = bk_gui_widget_create(st->desktop, st->window,
+            GUI_WIDGET_BUTTON, (gui_rect_t){185, 4, 82, 22}, "@H025A86CD",
             games_reset);
-        if (b) st->reset_id = b->id;
+        if (b) {
+            st->reset_id = b->id;
+            (void)bk_gui_widget_set_icon(b, "Refresh");
+        }
     }
-    while (!task_exit_requested() && st->window && st->window->listed) task_sleep(4);
+    while (!bk_proc_exit_requested() && st->window && st->window->listed) bk_sys_sleep_ticks(4);
     games_cleanup(st);
-    task_exit();
+    bk_proc_exit();
 }
 void games_open_from_desktop(gui_desktop_t *desktop) {
     games_state_t *st;
     if (!desktop) return;
-    st = (games_state_t *)kzalloc(sizeof(*st));
+    st = (games_state_t *)bk_sys_alloc_zero(sizeof(*st));
     if (!st) return;
     st->desktop = desktop; g_games = st;
-    if (task_create("games", games_main, st) < 0) games_cleanup(st);
+    if (bk_proc_spawn_thread("games", games_main, st) < 0) games_cleanup(st);
 }
 void games_install(gui_desktop_t *desktop UNUSED) {}
+
+void bleskernos_program_main(gui_desktop_t *desktop) {
+    games_open_from_desktop(desktop);
+}

@@ -112,29 +112,22 @@ int remove(const char *path) {
         errno = EINVAL;
         return -1;
     }
+    if (!vfs_remove(path)) {
+        errno = EIO;
+        return -1;
+    }
     return 0;
 }
 
 int rename(const char *old_path, const char *new_path) {
-    void *buffer = NULL;
-    uint32_t size = 0;
-
     if (!old_path || !new_path) {
         errno = EINVAL;
         return -1;
     }
 
-    if (!vfs_read_all(old_path, &buffer, &size)) {
-        errno = ENOENT;
-        return -1;
-    }
-
-    if (!vfs_write_all(new_path, buffer, size)) {
-        kfree(buffer);
+    if (!vfs_rename(old_path, new_path)) {
         errno = EIO;
         return -1;
     }
-
-    kfree(buffer);
     return 0;
 }

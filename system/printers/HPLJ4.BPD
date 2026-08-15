@@ -1,0 +1,7 @@
+[Printer]
+Id=HPLJ4
+Name=HP LaserJet 4 PCL 5 on LPT1
+Language=PCL5
+Transport=LPT
+Port=LPT1
+DPI=300

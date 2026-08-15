@@ -12,6 +12,9 @@ nop
 %ifndef RESERVED_SECTORS
 %define RESERVED_SECTORS 517
 %endif
+%ifndef BOOT_MODE_MAGIC
+%define BOOT_MODE_MAGIC 0
+%endif
 
 oem_name            db 'BLESFAT '
 bytes_per_sector    dw 512
@@ -38,6 +41,7 @@ STAGE2_LOAD_OFF  equ 0x7E00
 STAGE2_SECTORS   equ 8
 STAGE2_START_LBA equ 1
 BOOT_DRIVE_SAVE  equ 0x0500
+BOOT_MODE_ADDR   equ 0x06F0
 
 start:
     cli
@@ -49,6 +53,7 @@ start:
     sti
 
     mov [BOOT_DRIVE_SAVE], dl
+    mov dword [BOOT_MODE_ADDR], BOOT_MODE_MAGIC
 
     call load_stage2_lba
     jnc stage2_loaded

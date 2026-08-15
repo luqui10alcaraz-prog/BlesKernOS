@@ -27,4 +27,5 @@ void glopClear(GLParam *p)
 
     ZB_clear(c->zb, mask & GL_DEPTH_BUFFER_BIT, z, mask & GL_COLOR_BUFFER_BIT,
              r, g, b);
+    tgl_gpu_begin_frame(c, mask);
 }

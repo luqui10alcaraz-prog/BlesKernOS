@@ -1,26 +1,37 @@
 /*
- * Memory allocator for TinyGL - BlesKernOS port
+ * Memory allocator for TinyGL - BlesKernOS user-space port.
  *
- * TinyGL calls gl_malloc/gl_zalloc/gl_free when TGL_FEATURE_CUSTOM_MALLOC=1.
- * Keep this allocator small and independent from host libc.
+ * Keep TinyGL independent from private kernel allocation symbols. Native
+ * applications resolve malloc/free through the public ET_REL runtime.
  */
 
-#include "../../kernel/include/memory.h"
 #include "zgl.h"
 
-void gl_free(void *p)
+extern void *malloc(unsigned int size);
+extern void free(void *pointer);
+
+static void tinygl_zero(void *pointer, unsigned int size)
 {
-    if (p) kfree(p);
+    unsigned char *bytes = (unsigned char *)pointer;
+    while (size--) *bytes++ = 0;
+}
+
+void gl_free(void *pointer)
+{
+    if (pointer) free(pointer);
 }
 
 void *gl_malloc(GLint size)
 {
     if (size <= 0) return 0;
-    return kzalloc((uint32_t)size);
+    return malloc((unsigned int)size);
 }
 
 void *gl_zalloc(GLint size)
 {
+    void *pointer;
     if (size <= 0) return 0;
-    return kzalloc((uint32_t)size);
+    pointer = malloc((unsigned int)size);
+    if (pointer) tinygl_zero(pointer, (unsigned int)size);
+    return pointer;
 }

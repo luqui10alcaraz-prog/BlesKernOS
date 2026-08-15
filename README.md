@@ -1,4 +1,5 @@
-# BlesKernOS
+# BlesKernOS 0.8
+---
 
 BlesKernOS is an 32-bit operating system written from scratch in x86 Assembly and C.
 
@@ -40,22 +41,30 @@ It features a custom bootloader, a protected-mode kernel, a graphical desktop en
 
 ### Desktop
 - Window manager
-- Taskbar
+- Taskbar / deskbar
 - Desktop icons
-- Image loading (BMP/GIF)
 - Configurable desktop via INI files
+- BMP/GIF image loading
+- Packed icon loading through ICONS.PAK
+- Screensavers
 
 ### Applications
 - File Browser
 - Text Editor
 - Calculator
 - Calendar
-- Settings
+- Control Panel with `.CPL` applets
 - Process Manager
 - MidAmp (MIDI Player)
 - Paint
 - Doom (experimental)
 - Shell
+- Help Center
+- Find Files
+- Archive Manager
+- Disk Tools
+- Network Status
+- Global text clipboard and Clipboard Viewer
 
 ---
 
@@ -68,19 +77,55 @@ Requirements:
 - Python 3
 - QEMU
 
-Build:
+Build the normal desktop edition:
 
 ```bash
-make
+make user
 ```
 
-Run:
+Build the developer edition, or both editions:
 
 ```bash
-qemu-system-i386 \
-    -drive file=build/bleskernos.img,format=raw \
-    -m 128M
+make developer
+make editions
 ```
+
+Run the User edition:
+
+```bash
+make EDITION=user run
+```
+
+The ATA images are written to `build/bleskernos-ata-user.img` and
+`build/bleskernos-ata-developer.img`. See
+[`docs/EDITIONS_AND_UTILITIES.md`](docs/EDITIONS_AND_UTILITIES.md).
+
+### Installer CD
+
+The ISO boots a text-mode installer instead of the desktop. It can erase a
+writable ATA or USB device, create the bootable FAT32 layout, install Stage 1,
+Stage 2 and the kernel, and copy the selected User or Developer edition.
+
+```bash
+make iso-user
+make EDITION=user run-iso
+make run-installed
+```
+
+### Equipos antiguos (8–15 MB)
+
+El kernel detecta automáticamente un perfil austero para equipos con entre 8 y
+15 MB de RAM, como una configuración mínima del Dell Latitude C600. Conserva
+el escritorio y las aplicaciones bajo demanda, pero usa VGA 640×480×4,
+elimina el buffer frontal duplicado, no precarga wallpaper ni iconos, reduce
+la frecuencia del temporizador a 100 Hz y deja red, USB hotplug, impresión,
+salvapantallas y sonido de inicio desactivados. El sistema sigue arrancando
+con 8 MB; las aplicaciones pesadas como NetSurf, Wine o Doom requieren más
+RAM y conviene abrirlas sólo cuando sean necesarias.
+
+Use `make reset-installer-target` to recreate the default blank 64 MiB test
+disk. A 1.44 MiB floppy can be formatted from Setup, but uses FAT12; FAT32 is
+not valid for that media and the complete operating system does not fit on it.
 
 ---
 
@@ -91,9 +136,22 @@ boot/       Bootloader
 kernel/     Kernel
 gui/        Window system
 programs/   Native applications
+system/     Desktop components, services, screensavers, libraries and Control Panel
 assets/     Icons and images
 tools/      Build tools
 ```
+
+Runtime layout inside the FAT32 system image:
+
+```text
+/SYSTEM/PROGRAMS/   Native applications (.o)
+/SYSTEM/CORE/       Desktop core components
+/SYSTEM/WIN32/      Win32 applications (.exe)
+/SYSTEM/GRAPHICS.PAK Shared React95-compatible graphic resources
+```
+
+Native applications use the versioned public API documented in
+[`docs/API.md`](docs/API.md). Kernel driver headers are not part of the app ABI.
 
 ---
 
@@ -102,7 +160,7 @@ tools/      Build tools
 Current focus for version 0.6:
 
 - Complete Ring 3 migration
-- Improve userspace API
+- Continue expanding the versioned userspace API
 - More native applications
 - GUI improvements
 - Better filesystem support
@@ -119,6 +177,7 @@ MIT License.
 
 - DoomGeneric
 - TinyGL
+- React95 (shared icon catalog; see THIRD_PARTY_LICENSES.md)
 - OSDev Wiki
 - James Molloy's Kernel Tutorial
 - Bochs VBE documentation

@@ -110,6 +110,10 @@ GLTexture *alloc_texture(GLint h)
         if (ht)
             *ht = t;
         t->handle = h;
+        t->min_filter = GL_NEAREST;
+        t->mag_filter = GL_NEAREST;
+        t->wrap_s = GL_REPEAT;
+        t->wrap_t = GL_REPEAT;
     }
 
     return t;
@@ -147,6 +151,7 @@ void glDeleteTextures(GLint n, const GLuint *textures)
     for (GLint i = 0; i < n; i++) {
         GLTexture *t = find_texture(textures[i]);
         if (t) {
+            tgl_gpu_texture_invalidated(t);
             if (t == c->current_texture) {
                 glBindTexture(GL_TEXTURE_2D, 0);
 #include "error_check.h"
@@ -258,6 +263,7 @@ void glopCopyTexImage2D(GLParam *p)
                             ((j + y) % (c->zb->ysize)) * (c->zb->xsize)];
         }
 #endif
+    tgl_gpu_texture_invalidated(c->current_texture);
 }
 
 void glopTexImage1D(GLParam *p)
@@ -329,6 +335,7 @@ void glopTexImage1D(GLParam *p)
 #endif
     if (do_free)
         gl_free(pixels1);
+    tgl_gpu_texture_invalidated(c->current_texture);
 }
 
 void glopTexImage2D(GLParam *p)
@@ -397,4 +404,5 @@ void glopTexImage2D(GLParam *p)
 #endif
     if (do_free)
         gl_free(pixels1);
+    tgl_gpu_texture_invalidated(c->current_texture);
 }

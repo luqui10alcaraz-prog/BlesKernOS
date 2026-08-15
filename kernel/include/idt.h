@@ -37,6 +37,8 @@ typedef struct {
 #define IDT_GATE_USER_TRAP 0xEF
 
 void idt_init(void);
+void idt_enable_runtime_handlers(void);
+void idt_load_current(void);
 void idt_set_gate(uint8_t num, uint32_t handler, uint16_t selector, uint8_t flags);
 registers_t *isr_handler(registers_t *regs);
 
@@ -59,5 +61,8 @@ extern void irq9(void); extern void irq10(void); extern void irq11(void);
 extern void irq12(void); extern void irq13(void); extern void irq14(void);
 extern void irq15(void);
 extern void isr128(void);
+extern void lapic_timer_stub(void);
+extern void lapic_reschedule_stub(void);
+extern void lapic_spurious_stub(void);
 
 #endif

@@ -266,29 +266,35 @@ void gl_shade_vertex(GLVertex *v)
             att = 1;
         } else {
             /* distance attenuation */
+            GLfloat distance_sq;
+            GLfloat denominator;
             d.X = l->position.v[0] - v->ec.v[0];
             d.Y = l->position.v[1] - v->ec.v[1];
             d.Z = l->position.v[2] - v->ec.v[2];
+            distance_sq = d.X * d.X + d.Y * d.Y + d.Z * d.Z;
+            if (distance_sq > 1E-12f) {
 #if TGL_HAS(FISR)
-            tmp = fastInvSqrt(d.X * d.X + d.Y * d.Y +
-                              d.Z * d.Z); /* FISR IMPL, MATCHED!*/
-            {
-                d.X *= tmp;
-                d.Y *= tmp;
-                d.Z *= tmp;
-            }
+                tmp = fastInvSqrt(distance_sq);
+                dist = 1.0f / tmp;
 #else
-            dist = sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
-            if (dist > 1E-3) {
-                tmp = 1 / dist;
+                dist = sqrt(distance_sq);
+                tmp = 1.0f / dist;
+#endif
                 d.X *= tmp;
                 d.Y *= tmp;
                 d.Z *= tmp;
+            } else {
+                /* A vertex can coincide exactly with a point light. Do not
+                   feed a zero vector into the specular/normalization path. */
+                dist = 0.0f;
+                d.X = 0.0f;
+                d.Y = 0.0f;
+                d.Z = 1.0f;
             }
-#endif
-            att =
-                1.0f / (l->attenuation[0] +
-                        dist * (l->attenuation[1] + dist * l->attenuation[2]));
+            denominator = l->attenuation[0] +
+                          dist * (l->attenuation[1] + dist * l->attenuation[2]);
+            if (!(denominator > 1E-6f)) denominator = 1E-6f;
+            att = 1.0f / denominator;
         }
         dot = d.X * n.X + d.Y * n.Y + d.Z * n.Z;
         if (twoside && dot < 0)
@@ -325,10 +331,14 @@ void gl_shade_vertex(GLVertex *v)
                     vcoord.Y = v->ec.Y;
                     vcoord.Z = v->ec.Z;
 
-                    gl_V3_Norm_Fast(&vcoord);
+                    if (gl_V3_Norm_Fast(&vcoord)) {
+                        vcoord.X = 0.0f;
+                        vcoord.Y = 0.0f;
+                        vcoord.Z = 1.0f;
+                    }
                     s.X = d.X - vcoord.X;
-                    s.Y = d.Y - vcoord.X;
-                    s.Z = d.Z - vcoord.X;
+                    s.Y = d.Y - vcoord.Y;
+                    s.Z = d.Z - vcoord.Z;
                 } else {
                     s.X = d.X;
                     s.Y = d.Y;
@@ -338,6 +348,8 @@ void gl_shade_vertex(GLVertex *v)
                 dot_spec = n.X * s.X + n.Y * s.Y + n.Z * s.Z;
                 if (twoside && dot_spec < 0)
                     dot_spec = -dot_spec;
+                if (!(dot_spec >= 0.0f) || !(dot_spec <= 1.0e20f))
+                    dot_spec = 0.0f;
                 if (dot_spec > 0) {
 #if TGL_HAS(SPECULAR_BUFFERS)
                     GLSpecBuf *specbuf;

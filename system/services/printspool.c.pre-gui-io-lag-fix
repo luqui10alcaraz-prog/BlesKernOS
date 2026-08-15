@@ -1,0 +1,1407 @@
+#include <bleskernos_api.h>
+#include <bleskernos_print.h>
+
+#define SPOOL_DIR "/TEMP/SPOOL"
+#define SPOOL_HISTORY_DIR "/TEMP/SPOOL/HISTORY"
+#define OUTPUT_DIR "/TEMP/PRINT"
+#define PROFILE_DIR "/SYSTEM/PRINTERS"
+#define SPOOL_READY_PATH "/TEMP/SPOOL/READY.SYS"
+#define SPOOL_SCAN_MAX BK_DIRECTORY_MAX
+#define OUTPUT_MAX (16U * 1024U * 1024U)
+#define PRINT_IDLE_TIMEOUT_MS 5000U
+#define PRINT_MAX_RETRIES 3U
+#define PRINT_RETRY_DELAY_MS 1000U
+#define PRINT_IDLE_SCAN_MS 1000U
+#define PRINT_ACTIVE_SCAN_MS 50U
+
+static bk_file_entry_t *g_spool_scan_entries;
+#define PRINT_MAX_PAGE_POINTS 4096U
+#define PRINT_MAX_RASTER_DIMENSION 16384U
+#define PRINT_MAX_LINE_BITMAP_BYTES (1024U * 1024U)
+
+#define BPJ_TOTAL_OFFSET 8U
+#define BPJ_PAGES_OFFSET 16U
+#define BPJ_COMMANDS_OFFSET 20U
+#define BPJ_TITLE_OFFSET 24U
+#define BPJ_TITLE_CAPACITY 64U
+#define BPJ_ID_OFFSET 88U
+#define BPJ_ID_CAPACITY 32U
+
+typedef enum {
+    LANG_TEXT = 0,
+    LANG_ESCP,
+    LANG_ESCP2,
+    LANG_PCL5,
+    LANG_POSTSCRIPT
+} print_language_t;
+
+typedef enum {
+    TRANSPORT_FILE = 0,
+    TRANSPORT_LPT
+} print_transport_t;
+
+typedef struct {
+    char id[16];
+    char name[64];
+    print_language_t language;
+    print_transport_t transport;
+    char output_dir[BK_PATH_MAX];
+    char extension[8];
+    uint32_t lpt_index;
+    char port_name[16];
+    uint32_t dpi;
+    uint8_t escp_mode;
+} printer_profile_t;
+
+typedef struct {
+    uint8_t *data;
+    uint32_t size;
+    uint32_t capacity;
+    bool failed;
+} output_buffer_t;
+
+typedef struct {
+    const uint8_t *cursor;
+    const uint8_t *end;
+    uint32_t remaining;
+} job_iterator_t;
+
+typedef struct {
+    uint16_t type;
+    uint16_t flags;
+    const uint8_t *payload;
+    uint32_t payload_size;
+} job_command_t;
+
+typedef struct {
+    uint16_t family;
+    uint16_t points;
+    uint32_t flags;
+} font_state_t;
+
+typedef struct {
+    uint32_t width_points;
+    uint32_t height_points;
+    uint32_t raster_dpi;
+} page_command_t;
+
+typedef struct {
+    int32_t x1;
+    int32_t y1;
+    int32_t x2;
+    int32_t y2;
+    uint32_t width_points;
+} line_command_t;
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t data_size;
+    uint16_t dpi;
+    const uint8_t *pixels;
+} bitmap_command_t;
+
+static void memory_zero(void *pointer, uint32_t size) {
+    uint8_t *bytes = (uint8_t *)pointer;
+    while (bytes && size--) *bytes++ = 0;
+}
+
+static void memory_copy(void *destination, const void *source, uint32_t size) {
+    uint8_t *dst = (uint8_t *)destination;
+    const uint8_t *src = (const uint8_t *)source;
+    while (size--) *dst++ = *src++;
+}
+
+static uint32_t text_length(const char *text) {
+    uint32_t length = 0;
+    while (text && text[length]) length++;
+    return length;
+}
+
+static char upper_ascii(char value) {
+    if (value >= 'a' && value <= 'z') return (char)(value - 'a' + 'A');
+    return value;
+}
+
+static bool text_equal_ci(const char *left, const char *right) {
+    if (!left || !right) return false;
+    while (*left && *right) {
+        if (upper_ascii(*left++) != upper_ascii(*right++)) return false;
+    }
+    return *left == *right;
+}
+
+static bool text_ends_ci(const char *text, const char *suffix) {
+    uint32_t text_len = text_length(text);
+    uint32_t suffix_len = text_length(suffix);
+    if (suffix_len > text_len) return false;
+    return text_equal_ci(text + text_len - suffix_len, suffix);
+}
+
+static void text_copy(char *destination, uint32_t capacity,
+                      const char *source) {
+    uint32_t i = 0;
+    if (!destination || !capacity) return;
+    while (source && source[i] && i + 1U < capacity) {
+        destination[i] = source[i];
+        i++;
+    }
+    destination[i] = '\0';
+}
+
+static bool text_append(char *destination, uint32_t capacity,
+                        const char *source) {
+    uint32_t length = text_length(destination);
+    uint32_t i = 0;
+    if (!destination || length >= capacity) return false;
+    while (source && source[i]) {
+        if (length + i + 1U >= capacity) return false;
+        destination[length + i] = source[i];
+        i++;
+    }
+    destination[length + i] = '\0';
+    return true;
+}
+
+static uint32_t parse_uint(const char *text, uint32_t fallback) {
+    uint32_t value = 0;
+    bool any = false;
+    while (text && *text >= '0' && *text <= '9') {
+        any = true;
+        if (value > 0xFFFFFFFFU / 10U) return fallback;
+        value = value * 10U + (uint32_t)(*text++ - '0');
+    }
+    return any ? value : fallback;
+}
+
+static uint16_t read_u16(const uint8_t *source) {
+    return (uint16_t)((uint16_t)source[0] |
+                      ((uint16_t)source[1] << 8));
+}
+
+static uint32_t read_u32(const uint8_t *source) {
+    return (uint32_t)source[0] |
+           ((uint32_t)source[1] << 8) |
+           ((uint32_t)source[2] << 16) |
+           ((uint32_t)source[3] << 24);
+}
+
+static int32_t read_i32(const uint8_t *source) {
+    return (int32_t)read_u32(source);
+}
+
+static bool output_reserve(output_buffer_t *output, uint32_t extra) {
+    uint32_t required;
+    uint32_t capacity;
+    uint8_t *replacement;
+    if (!output || output->failed) return false;
+    required = output->size + extra;
+    if (required < output->size || required > OUTPUT_MAX) {
+        output->failed = true;
+        return false;
+    }
+    if (required <= output->capacity) return true;
+    capacity = output->capacity ? output->capacity : 1024U;
+    while (capacity < required) {
+        uint32_t next = capacity << 1;
+        if (next <= capacity || next > OUTPUT_MAX) {
+            capacity = OUTPUT_MAX;
+            break;
+        }
+        capacity = next;
+    }
+    if (capacity < required) {
+        output->failed = true;
+        return false;
+    }
+    replacement = (uint8_t *)bk_sys_alloc(capacity);
+    if (!replacement) {
+        output->failed = true;
+        return false;
+    }
+    if (output->data && output->size)
+        memory_copy(replacement, output->data, output->size);
+    if (output->data) bk_sys_free(output->data);
+    output->data = replacement;
+    output->capacity = capacity;
+    return true;
+}
+
+static bool output_append(output_buffer_t *output, const void *data,
+                          uint32_t size) {
+    if (!output_reserve(output, size)) return false;
+    if (size) memory_copy(output->data + output->size, data, size);
+    output->size += size;
+    return true;
+}
+
+static bool output_byte(output_buffer_t *output, uint8_t value) {
+    return output_append(output, &value, 1U);
+}
+
+static bool output_text(output_buffer_t *output, const char *text) {
+    return output_append(output, text, text_length(text));
+}
+
+static bool output_uint(output_buffer_t *output, uint32_t value) {
+    char digits[11];
+    uint32_t count = 0;
+    if (!value) return output_byte(output, '0');
+    while (value && count < sizeof(digits)) {
+        digits[count++] = (char)('0' + value % 10U);
+        value /= 10U;
+    }
+    while (count) if (!output_byte(output, (uint8_t)digits[--count]))
+        return false;
+    return true;
+}
+
+static bool output_int(output_buffer_t *output, int32_t value) {
+    uint32_t magnitude;
+    if (value < 0) {
+        if (!output_byte(output, '-')) return false;
+        magnitude = (uint32_t)(-(value + 1)) + 1U;
+    } else magnitude = (uint32_t)value;
+    return output_uint(output, magnitude);
+}
+
+static bool output_hex_byte(output_buffer_t *output, uint8_t value) {
+    static const char digits[] = "0123456789ABCDEF";
+    uint8_t pair[2];
+    pair[0] = (uint8_t)digits[value >> 4];
+    pair[1] = (uint8_t)digits[value & 15U];
+    return output_append(output, pair, sizeof(pair));
+}
+
+static void output_free(output_buffer_t *output) {
+    if (!output) return;
+    if (output->data) bk_sys_free(output->data);
+    memory_zero(output, sizeof(*output));
+}
+
+static bool job_valid(const uint8_t *data, uint32_t size) {
+    uint32_t declared;
+    uint16_t header_size;
+    if (!data || size < BK_PRINT_JOB_HEADER_SIZE) return false;
+    if (data[0] != BK_PRINT_JOB_MAGIC_0 ||
+        data[1] != BK_PRINT_JOB_MAGIC_1 ||
+        data[2] != BK_PRINT_JOB_MAGIC_2 ||
+        data[3] != BK_PRINT_JOB_MAGIC_3 ||
+        read_u16(data + 4) != BK_PRINT_JOB_VERSION) return false;
+    header_size = read_u16(data + 6);
+    declared = read_u32(data + BPJ_TOTAL_OFFSET);
+    return header_size >= BK_PRINT_JOB_HEADER_SIZE && header_size <= size &&
+           declared == size && size <= BK_PRINT_JOB_MAX_SIZE;
+}
+
+static bool job_iterator_init(job_iterator_t *iterator, const uint8_t *data,
+                              uint32_t size) {
+    uint16_t header_size;
+    if (!iterator || !job_valid(data, size)) return false;
+    header_size = read_u16(data + 6);
+    iterator->cursor = data + header_size;
+    iterator->end = data + size;
+    iterator->remaining = read_u32(data + BPJ_COMMANDS_OFFSET);
+    return true;
+}
+
+static bool job_iterator_next(job_iterator_t *iterator,
+                              job_command_t *command) {
+    uint32_t payload_size;
+    if (!iterator || !command || !iterator->remaining) return false;
+    if ((uint32_t)(iterator->end - iterator->cursor) < 8U) return false;
+    command->type = read_u16(iterator->cursor);
+    command->flags = read_u16(iterator->cursor + 2);
+    payload_size = read_u32(iterator->cursor + 4);
+    iterator->cursor += 8;
+    if (payload_size > (uint32_t)(iterator->end - iterator->cursor))
+        return false;
+    command->payload = iterator->cursor;
+    command->payload_size = payload_size;
+    iterator->cursor += payload_size;
+    iterator->remaining--;
+    return true;
+}
+
+static bool job_iterator_complete(const job_iterator_t *iterator) {
+    return iterator && !iterator->remaining && iterator->cursor == iterator->end;
+}
+
+static void profile_defaults(printer_profile_t *profile, const char *id) {
+    memory_zero(profile, sizeof(*profile));
+    text_copy(profile->id, sizeof(profile->id), id);
+    text_copy(profile->name, sizeof(profile->name), "Bles PostScript File Printer");
+    profile->language = LANG_POSTSCRIPT;
+    profile->transport = TRANSPORT_FILE;
+    text_copy(profile->output_dir, sizeof(profile->output_dir), OUTPUT_DIR);
+    text_copy(profile->extension, sizeof(profile->extension), "PS");
+    text_copy(profile->port_name, sizeof(profile->port_name), "LPT1");
+    profile->dpi = 300U;
+    profile->escp_mode = 1U;
+}
+
+static void sanitize_profile_id(char *destination, uint32_t capacity,
+                                const char *source) {
+    uint32_t out = 0;
+    while (source && *source && out + 1U < capacity) {
+        char value = upper_ascii(*source++);
+        if ((value >= 'A' && value <= 'Z') ||
+            (value >= '0' && value <= '9') || value == '_')
+            destination[out++] = value;
+    }
+    destination[out] = '\0';
+    if (!out) text_copy(destination, capacity, BK_PRINT_DEFAULT_PRINTER);
+}
+
+static bool escp_8dot_mode_valid(uint32_t mode) {
+    return mode == 0U || mode == 1U || mode == 2U || mode == 3U ||
+           mode == 4U || mode == 6U;
+}
+
+static void profile_apply(printer_profile_t *profile, const char *key,
+                          const char *value) {
+    if (text_equal_ci(key, "Id")) sanitize_profile_id(profile->id,
+            sizeof(profile->id), value);
+    else if (text_equal_ci(key, "Name"))
+        text_copy(profile->name, sizeof(profile->name), value);
+    else if (text_equal_ci(key, "Language")) {
+        if (text_equal_ci(value, "TEXT")) profile->language = LANG_TEXT;
+        else if (text_equal_ci(value, "ESCP")) profile->language = LANG_ESCP;
+        else if (text_equal_ci(value, "ESCP2")) profile->language = LANG_ESCP2;
+        else if (text_equal_ci(value, "PCL5")) profile->language = LANG_PCL5;
+        else if (text_equal_ci(value, "POSTSCRIPT"))
+            profile->language = LANG_POSTSCRIPT;
+    } else if (text_equal_ci(key, "Transport")) {
+        if (text_equal_ci(value, "LPT")) profile->transport = TRANSPORT_LPT;
+        else if (text_equal_ci(value, "FILE"))
+            profile->transport = TRANSPORT_FILE;
+    } else if (text_equal_ci(key, "Output"))
+        text_copy(profile->output_dir, sizeof(profile->output_dir), value);
+    else if (text_equal_ci(key, "Extension"))
+        sanitize_profile_id(profile->extension, sizeof(profile->extension), value);
+    else if (text_equal_ci(key, "Port")) {
+        uint32_t number = 1U;
+        uint32_t value_length = text_length(value);
+        text_copy(profile->port_name, sizeof(profile->port_name), value);
+        if (value_length >= 3U && upper_ascii(value[0]) == 'L' &&
+            upper_ascii(value[1]) == 'P' && upper_ascii(value[2]) == 'T')
+            number = parse_uint(value + 3, 1U);
+        else number = parse_uint(value, 1U);
+        profile->lpt_index = number ? number - 1U : 0U;
+    } else if (text_equal_ci(key, "DPI")) {
+        uint32_t dpi = parse_uint(value, profile->dpi);
+        if (dpi >= 60U && dpi <= 1200U) profile->dpi = dpi;
+    } else if (text_equal_ci(key, "EscpMode")) {
+        uint32_t mode = parse_uint(value, profile->escp_mode);
+        if (escp_8dot_mode_valid(mode)) profile->escp_mode = (uint8_t)mode;
+    }
+}
+
+static bool profile_load(const char *requested_id, printer_profile_t *profile) {
+    char id[16];
+    char path[BK_PATH_MAX];
+    void *raw = NULL;
+    uint32_t size = 0;
+    char *text;
+    uint32_t position = 0;
+
+    sanitize_profile_id(id, sizeof(id), requested_id);
+    profile_defaults(profile, id);
+    text_copy(path, sizeof(path), PROFILE_DIR "/");
+    if (!text_append(path, sizeof(path), id) ||
+        !text_append(path, sizeof(path), ".BPD")) return false;
+    if (!bk_file_read_all(path, &raw, &size) || !raw) return false;
+    text = (char *)bk_sys_alloc(size + 1U);
+    if (!text) {
+        bk_sys_free(raw);
+        return false;
+    }
+    memory_copy(text, raw, size);
+    text[size] = '\0';
+    bk_sys_free(raw);
+
+    while (position < size) {
+        char key[32];
+        char value[BK_PATH_MAX];
+        uint32_t key_len = 0;
+        uint32_t value_len = 0;
+        while (position < size && (text[position] == '\r' ||
+               text[position] == '\n' || text[position] == ' ' ||
+               text[position] == '\t')) position++;
+        if (position >= size) break;
+        if (text[position] == ';' || text[position] == '#' ||
+            text[position] == '[') {
+            while (position < size && text[position] != '\n') position++;
+            continue;
+        }
+        while (position < size && text[position] != '=' &&
+               text[position] != '\r' && text[position] != '\n') {
+            if (key_len + 1U < sizeof(key)) key[key_len++] = text[position];
+            position++;
+        }
+        while (key_len && (key[key_len - 1U] == ' ' ||
+               key[key_len - 1U] == '\t')) key_len--;
+        key[key_len] = '\0';
+        if (position >= size || text[position] != '=') {
+            while (position < size && text[position] != '\n') position++;
+            continue;
+        }
+        position++;
+        while (position < size && (text[position] == ' ' ||
+               text[position] == '\t')) position++;
+        while (position < size && text[position] != '\r' &&
+               text[position] != '\n') {
+            if (value_len + 1U < sizeof(value))
+                value[value_len++] = text[position];
+            position++;
+        }
+        while (value_len && (value[value_len - 1U] == ' ' ||
+               value[value_len - 1U] == '\t')) value_len--;
+        value[value_len] = '\0';
+        if (key[0]) profile_apply(profile, key, value);
+    }
+    bk_sys_free(text);
+    if (!profile->extension[0])
+        text_copy(profile->extension, sizeof(profile->extension), "PRN");
+    if (!profile->output_dir[0])
+        text_copy(profile->output_dir, sizeof(profile->output_dir), OUTPUT_DIR);
+    return true;
+}
+
+static bool command_text_valid(const job_command_t *command,
+                               int32_t *x, int32_t *y,
+                               const uint8_t **text, uint32_t *length) {
+    uint32_t amount;
+    if (!command || command->payload_size < 12U) return false;
+    amount = read_u32(command->payload + 8);
+    if (amount > command->payload_size - 12U) return false;
+    if (x) *x = read_i32(command->payload);
+    if (y) *y = read_i32(command->payload + 4);
+    if (text) *text = command->payload + 12;
+    if (length) *length = amount;
+    return true;
+}
+
+static bool command_page_valid(const job_command_t *command,
+                               page_command_t *page) {
+    uint32_t width;
+    uint32_t height;
+    uint32_t dpi;
+    if (!command || !page || command->payload_size != 12U) return false;
+    width = read_u32(command->payload);
+    height = read_u32(command->payload + 4);
+    dpi = read_u32(command->payload + 8);
+    if (!width || !height || width > PRINT_MAX_PAGE_POINTS ||
+        height > PRINT_MAX_PAGE_POINTS || dpi < 60U || dpi > 1200U)
+        return false;
+    page->width_points = width;
+    page->height_points = height;
+    page->raster_dpi = dpi;
+    return true;
+}
+
+static bool coordinate_in_page(int32_t x, int32_t y,
+                               const page_command_t *page) {
+    return page && x >= 0 && y >= 0 &&
+           (uint32_t)x <= page->width_points &&
+           (uint32_t)y <= page->height_points;
+}
+
+static bool command_line_valid(const job_command_t *command,
+                               const page_command_t *page,
+                               line_command_t *line) {
+    if (!command || !page || !line || command->payload_size != 20U)
+        return false;
+    line->x1 = read_i32(command->payload);
+    line->y1 = read_i32(command->payload + 4);
+    line->x2 = read_i32(command->payload + 8);
+    line->y2 = read_i32(command->payload + 12);
+    line->width_points = read_u32(command->payload + 16);
+    return line->width_points >= 1U && line->width_points <= 72U &&
+           coordinate_in_page(line->x1, line->y1, page) &&
+           coordinate_in_page(line->x2, line->y2, page);
+}
+
+static bool command_bitmap_valid(const job_command_t *command,
+                                 const page_command_t *page,
+                                 bitmap_command_t *bitmap) {
+    uint32_t row_bytes;
+    uint32_t expected_size;
+    uint32_t width_points;
+    uint32_t height_points;
+    if (!command || !page || !bitmap || command->payload_size < 28U)
+        return false;
+    bitmap->x = read_i32(command->payload);
+    bitmap->y = read_i32(command->payload + 4);
+    bitmap->width = read_u32(command->payload + 8);
+    bitmap->height = read_u32(command->payload + 12);
+    bitmap->stride = read_u32(command->payload + 16);
+    bitmap->data_size = read_u32(command->payload + 20);
+    bitmap->dpi = read_u16(command->payload + 24);
+    if (!bitmap->width || !bitmap->height ||
+        bitmap->width > PRINT_MAX_RASTER_DIMENSION ||
+        bitmap->height > PRINT_MAX_RASTER_DIMENSION ||
+        bitmap->dpi < 60U || bitmap->dpi > 1200U ||
+        !coordinate_in_page(bitmap->x, bitmap->y, page)) return false;
+    row_bytes = (bitmap->width + 7U) >> 3;
+    if (!bitmap->stride || bitmap->stride < row_bytes ||
+        bitmap->height > BK_PRINT_JOB_MAX_SIZE / bitmap->stride) return false;
+    expected_size = bitmap->stride * bitmap->height;
+    if (bitmap->data_size != expected_size ||
+        bitmap->data_size != command->payload_size - 28U) return false;
+    width_points = (bitmap->width * 72U + bitmap->dpi - 1U) / bitmap->dpi;
+    height_points = (bitmap->height * 72U + bitmap->dpi - 1U) / bitmap->dpi;
+    if (width_points > page->width_points - (uint32_t)bitmap->x ||
+        height_points > page->height_points - (uint32_t)bitmap->y)
+        return false;
+    bitmap->pixels = command->payload + 28;
+    return true;
+}
+
+static bool render_text_driver(const uint8_t *job, uint32_t size,
+                               output_buffer_t *output) {
+    job_iterator_t iterator;
+    job_command_t command;
+    page_command_t page;
+    bool page_open = false;
+    memory_zero(&page, sizeof(page));
+    if (!job_iterator_init(&iterator, job, size)) return false;
+    while (job_iterator_next(&iterator, &command)) {
+        if (command.type == BK_PRINT_CMD_BEGIN_PAGE) {
+            if (page_open || !command_page_valid(&command, &page)) return false;
+            page_open = true;
+        } else if (command.type == BK_PRINT_CMD_SET_FONT) {
+            if (!page_open || command.payload_size != 8U) return false;
+        } else if (command.type == BK_PRINT_CMD_TEXT) {
+            const uint8_t *text;
+            uint32_t length;
+            int32_t x, y;
+            if (!page_open ||
+                !command_text_valid(&command, &x, &y, &text, &length) ||
+                !coordinate_in_page(x, y, &page) ||
+                !output_append(output, text, length) ||
+                !output_text(output, "\r\n")) return false;
+        } else if (command.type == BK_PRINT_CMD_LINE) {
+            line_command_t line;
+            if (!page_open || !command_line_valid(&command, &page, &line) ||
+                !output_text(output,
+                "------------------------------------------------------------\r\n"))
+                return false;
+        } else if (command.type == BK_PRINT_CMD_BITMAP_MONO) {
+            bitmap_command_t bitmap;
+            if (!page_open || !command_bitmap_valid(&command, &page, &bitmap) ||
+                !output_text(output, "[BITMAP]\r\n")) return false;
+        } else if (command.type == BK_PRINT_CMD_END_PAGE) {
+            if (!page_open || command.payload_size != 0U ||
+                !output_byte(output, 0x0CU)) return false;
+            page_open = false;
+        } else return false;
+    }
+    return job_iterator_complete(&iterator) && !page_open && !output->failed;
+}
+
+static const char *ps_font_name(const font_state_t *font) {
+    bool bold = (font->flags & BK_PRINT_FONT_BOLD) != 0U;
+    bool italic = (font->flags & BK_PRINT_FONT_ITALIC) != 0U;
+    if (font->family == BK_PRINT_FONT_MONO)
+        return bold ? (italic ? "Courier-BoldOblique" : "Courier-Bold")
+                    : (italic ? "Courier-Oblique" : "Courier");
+    if (font->family == BK_PRINT_FONT_SANS)
+        return bold ? (italic ? "Helvetica-BoldOblique" : "Helvetica-Bold")
+                    : (italic ? "Helvetica-Oblique" : "Helvetica");
+    return bold ? (italic ? "Times-BoldItalic" : "Times-Bold")
+                : (italic ? "Times-Italic" : "Times-Roman");
+}
+
+static bool ps_set_font(output_buffer_t *output, const font_state_t *font) {
+    return output_byte(output, '/') &&
+           output_text(output, ps_font_name(font)) &&
+           output_text(output, " findfont ") &&
+           output_uint(output, font->points ? font->points : 12U) &&
+           output_text(output, " scalefont setfont\n");
+}
+
+static bool ps_string(output_buffer_t *output, const uint8_t *text,
+                      uint32_t length) {
+    if (!output_byte(output, '(')) return false;
+    for (uint32_t i = 0; i < length; i++) {
+        uint8_t value = text[i];
+        if (value == '(' || value == ')' || value == '\\')
+            if (!output_byte(output, '\\')) return false;
+        if (value < 32U && value != '\t') value = ' ';
+        if (!output_byte(output, value)) return false;
+    }
+    return output_byte(output, ')');
+}
+
+static bool render_postscript(const uint8_t *job, uint32_t size,
+                              output_buffer_t *output) {
+    job_iterator_t iterator;
+    job_command_t command;
+    font_state_t font = {BK_PRINT_FONT_SERIF, 12U, 0U};
+    page_command_t page_info;
+    uint32_t page_number = 0;
+    bool page_open = false;
+
+    memory_zero(&page_info, sizeof(page_info));
+    if (!output_text(output, "%!PS-Adobe-3.0\n%%Creator: BlesKernOS PrintSpool\n") ||
+        !output_text(output, "%%Pages: (atend)\n%%EndComments\n") ||
+        !job_iterator_init(&iterator, job, size)) return false;
+    while (job_iterator_next(&iterator, &command)) {
+        if (command.type == BK_PRINT_CMD_BEGIN_PAGE) {
+            if (page_open || !command_page_valid(&command, &page_info))
+                return false;
+            page_number++;
+            if (!output_text(output, "%%Page: ") ||
+                !output_uint(output, page_number) || !output_byte(output, ' ') ||
+                !output_uint(output, page_number) ||
+                !output_text(output, "\ngsave\n0 ") ||
+                !output_uint(output, page_info.height_points) ||
+                !output_text(output, " translate 1 -1 scale\n") ||
+                !ps_set_font(output, &font)) return false;
+            page_open = true;
+        } else if (command.type == BK_PRINT_CMD_SET_FONT) {
+            if (command.payload_size != 8U || !page_open) return false;
+            font.family = read_u16(command.payload);
+            font.points = read_u16(command.payload + 2);
+            font.flags = read_u32(command.payload + 4);
+            if (font.family > BK_PRINT_FONT_MONO || font.points < 4U ||
+                font.points > 144U || !ps_set_font(output, &font)) return false;
+        } else if (command.type == BK_PRINT_CMD_TEXT) {
+            const uint8_t *text;
+            uint32_t length;
+            int32_t x, y;
+            if (!page_open || !command_text_valid(&command, &x, &y,
+                                                   &text, &length) ||
+                !coordinate_in_page(x, y, &page_info) ||
+                !output_int(output, x) || !output_byte(output, ' ') ||
+                !output_int(output, y) || !output_text(output, " moveto ") ||
+                !ps_string(output, text, length) ||
+                !output_text(output, " show\n")) return false;
+            if (font.flags & BK_PRINT_FONT_UNDERLINE) {
+                uint32_t width = length * (uint32_t)font.points * 3U / 5U;
+                uint32_t remaining = page_info.width_points - (uint32_t)x;
+                if (width > remaining) width = remaining;
+                if (!output_text(output, "newpath ") || !output_int(output, x) ||
+                    !output_byte(output, ' ') || !output_int(output, y + 2) ||
+                    !output_text(output, " moveto ") ||
+                    !output_int(output, x + (int32_t)width) ||
+                    !output_byte(output, ' ') || !output_int(output, y + 2) ||
+                    !output_text(output, " lineto stroke\n")) return false;
+            }
+        } else if (command.type == BK_PRINT_CMD_LINE) {
+            line_command_t line;
+            if (!page_open || !command_line_valid(&command, &page_info, &line) ||
+                !output_uint(output, line.width_points) ||
+                !output_text(output, " setlinewidth newpath ") ||
+                !output_int(output, line.x1) || !output_byte(output, ' ') ||
+                !output_int(output, line.y1) || !output_text(output, " moveto ") ||
+                !output_int(output, line.x2) || !output_byte(output, ' ') ||
+                !output_int(output, line.y2) ||
+                !output_text(output, " lineto stroke\n")) return false;
+        } else if (command.type == BK_PRINT_CMD_BITMAP_MONO) {
+            bitmap_command_t bitmap;
+            uint32_t width_points;
+            uint32_t height_points;
+            if (!page_open ||
+                !command_bitmap_valid(&command, &page_info, &bitmap))
+                return false;
+            width_points = (bitmap.width * 72U + bitmap.dpi - 1U) / bitmap.dpi;
+            height_points = (bitmap.height * 72U + bitmap.dpi - 1U) / bitmap.dpi;
+            if (!output_text(output, "gsave ") || !output_int(output, bitmap.x) ||
+                !output_byte(output, ' ') || !output_int(output, bitmap.y) ||
+                !output_text(output, " translate ") ||
+                !output_uint(output, width_points) || !output_byte(output, ' ') ||
+                !output_uint(output, height_points) ||
+                !output_text(output, " scale\n") ||
+                !output_uint(output, bitmap.width) || !output_byte(output, ' ') ||
+                !output_uint(output, bitmap.height) ||
+                !output_text(output, " 1 [") ||
+                !output_uint(output, bitmap.width) ||
+                !output_text(output, " 0 0 -") ||
+                !output_uint(output, bitmap.height) ||
+                !output_text(output, " 0 ") ||
+                !output_uint(output, bitmap.height) ||
+                !output_text(output, "] {<\n")) return false;
+            for (uint32_t row = 0; row < bitmap.height; row++) {
+                uint32_t row_bytes = (bitmap.width + 7U) >> 3;
+                for (uint32_t column = 0; column < row_bytes; column++)
+                    if (!output_hex_byte(output,
+                            bitmap.pixels[row * bitmap.stride + column]))
+                        return false;
+                if (!output_byte(output, '\n')) return false;
+            }
+            if (!output_text(output, ">} image\ngrestore\n")) return false;
+        } else if (command.type == BK_PRINT_CMD_END_PAGE) {
+            if (!page_open || command.payload_size != 0U ||
+                !output_text(output, "grestore\nshowpage\n")) return false;
+            page_open = false;
+        } else return false;
+    }
+    if (!job_iterator_complete(&iterator) || page_open) return false;
+    return output_text(output, "%%Trailer\n%%Pages: ") &&
+           output_uint(output, page_number) &&
+           output_text(output, "\n%%EOF\n") && !output->failed;
+}
+
+static bool pcl_command(output_buffer_t *output, const char *prefix,
+                        uint32_t value, const char *suffix) {
+    return output_byte(output, 0x1BU) && output_text(output, prefix) &&
+           output_uint(output, value) && output_text(output, suffix);
+}
+
+static uint32_t points_to_pcl(int32_t points) {
+    if (points <= 0) return 0U;
+    return ((uint32_t)points * 300U + 36U) / 72U;
+}
+
+static bool pcl_position(output_buffer_t *output, int32_t x, int32_t y) {
+    return pcl_command(output, "*p", points_to_pcl(x), "X") &&
+           pcl_command(output, "*p", points_to_pcl(y), "Y");
+}
+
+static bool pcl_set_font(output_buffer_t *output, const font_state_t *font) {
+    uint32_t bold = (font->flags & BK_PRINT_FONT_BOLD) ? 3U : 0U;
+    uint32_t italic = (font->flags & BK_PRINT_FONT_ITALIC) ? 1U : 0U;
+    return pcl_command(output, "(s", font->points ? font->points : 12U, "V") &&
+           pcl_command(output, "(s", italic, "S") &&
+           pcl_command(output, "(s", bold, "B") &&
+           /* Courier (typeface 3) es la fuente residente mas compatible.
+              La familia abstracta se conserva para perfiles PCL futuros. */
+           pcl_command(output, "(s", 3U, "T") &&
+           output_text(output, (font->flags & BK_PRINT_FONT_UNDERLINE)
+                       ? "\x1B&d0D" : "\x1B&d@");
+}
+
+static bool render_pcl5(const uint8_t *job, uint32_t size,
+                        output_buffer_t *output) {
+    job_iterator_t iterator;
+    job_command_t command;
+    font_state_t font = {BK_PRINT_FONT_SERIF, 12U, 0U};
+    page_command_t page_info;
+    bool page_open = false;
+    memory_zero(&page_info, sizeof(page_info));
+    if (!output_text(output, "\x1B" "E") ||
+        !pcl_command(output, "&u", 300U, "D") ||
+        !job_iterator_init(&iterator, job, size)) return false;
+    while (job_iterator_next(&iterator, &command)) {
+        if (command.type == BK_PRINT_CMD_BEGIN_PAGE) {
+            if (page_open || !command_page_valid(&command, &page_info))
+                return false;
+            if (!output_text(output,
+                    (page_info.width_points == BK_PRINT_LETTER_WIDTH_POINTS &&
+                     page_info.height_points == BK_PRINT_LETTER_HEIGHT_POINTS)
+                        ? "\x1B&l2A\x1B&l0O"
+                        : "\x1B&l26A\x1B&l0O") ||
+                !pcl_set_font(output, &font)) return false;
+            page_open = true;
+        } else if (command.type == BK_PRINT_CMD_SET_FONT) {
+            if (command.payload_size != 8U || !page_open) return false;
+            font.family = read_u16(command.payload);
+            font.points = read_u16(command.payload + 2);
+            font.flags = read_u32(command.payload + 4);
+            if (font.family > BK_PRINT_FONT_MONO || font.points < 4U ||
+                font.points > 144U || !pcl_set_font(output, &font)) return false;
+        } else if (command.type == BK_PRINT_CMD_TEXT) {
+            const uint8_t *text;
+            uint32_t length;
+            int32_t x, y;
+            if (!page_open || !command_text_valid(&command, &x, &y,
+                                                   &text, &length) ||
+                !coordinate_in_page(x, y, &page_info) ||
+                !pcl_position(output, x, y) ||
+                !output_append(output, text, length)) return false;
+        } else if (command.type == BK_PRINT_CMD_LINE) {
+            line_command_t line;
+            int32_t x1, y1, x2, y2;
+            uint32_t horizontal, vertical;
+            if (!page_open || !command_line_valid(&command, &page_info, &line))
+                return false;
+            x1 = line.x1; y1 = line.y1; x2 = line.x2; y2 = line.y2;
+            if (x2 < x1) { int32_t swap = x1; x1 = x2; x2 = swap; }
+            if (y2 < y1) { int32_t swap = y1; y1 = y2; y2 = swap; }
+            horizontal = points_to_pcl(x2 - x1);
+            vertical = points_to_pcl(y2 - y1);
+            if (!horizontal) horizontal = points_to_pcl((int32_t)line.width_points);
+            if (!vertical) vertical = points_to_pcl((int32_t)line.width_points);
+            if (!pcl_position(output, x1, y1) ||
+                !pcl_command(output, "*c", horizontal, "A") ||
+                !pcl_command(output, "*c", vertical, "B") ||
+                !pcl_command(output, "*c", 0U, "P")) return false;
+        } else if (command.type == BK_PRINT_CMD_BITMAP_MONO) {
+            bitmap_command_t bitmap;
+            uint32_t row_bytes;
+            if (!page_open ||
+                !command_bitmap_valid(&command, &page_info, &bitmap))
+                return false;
+            row_bytes = (bitmap.width + 7U) >> 3;
+            if (!pcl_position(output, bitmap.x, bitmap.y) ||
+                !pcl_command(output, "*t", bitmap.dpi, "R") ||
+                !pcl_command(output, "*r", bitmap.width, "S") ||
+                !pcl_command(output, "*r", bitmap.height, "T") ||
+                !output_text(output, "\x1B*r1A\x1B*b0M")) return false;
+            for (uint32_t row = 0; row < bitmap.height; row++) {
+                if (!pcl_command(output, "*b", row_bytes, "W") ||
+                    !output_append(output,
+                        bitmap.pixels + row * bitmap.stride, row_bytes))
+                    return false;
+            }
+            /* *rB conserva compatibilidad con LaserJet III. */
+            if (!output_text(output, "\x1B*rB")) return false;
+        } else if (command.type == BK_PRINT_CMD_END_PAGE) {
+            if (!page_open || command.payload_size != 0U ||
+                !output_byte(output, 0x0CU)) return false;
+            page_open = false;
+        } else return false;
+    }
+    return job_iterator_complete(&iterator) && !page_open &&
+           output_text(output, "\x1B" "E") && !output->failed;
+}
+
+static bool escp_move_y(output_buffer_t *output, uint32_t *current_y,
+                        int32_t target_y) {
+    uint32_t target = target_y > 0 ? (uint32_t)target_y : 0U;
+    uint32_t units;
+    if (target <= *current_y) return true;
+    units = (target - *current_y) * 3U; /* puntos -> 1/216 pulgada */
+    while (units) {
+        uint8_t amount = (uint8_t)(units > 255U ? 255U : units);
+        uint8_t command[3] = {0x1BU, 'J', amount};
+        if (!output_append(output, command, sizeof(command))) return false;
+        units -= amount;
+    }
+    *current_y = target;
+    return true;
+}
+
+static bool escp_move_x(output_buffer_t *output, int32_t x_points) {
+    uint32_t units = x_points > 0 ? ((uint32_t)x_points * 5U + 3U) / 6U : 0U;
+    uint8_t command[4] = {0x1BU, '$', (uint8_t)units,
+                          (uint8_t)(units >> 8)};
+    return output_append(output, command, sizeof(command));
+}
+
+static bool escp_set_font(output_buffer_t *output, const font_state_t *font) {
+    uint8_t bold[2] = {0x1BU,
+        (font->flags & BK_PRINT_FONT_BOLD) ? 'E' : 'F'};
+    uint8_t italic[2] = {0x1BU,
+        (font->flags & BK_PRINT_FONT_ITALIC) ? '4' : '5'};
+    uint8_t underline[3] = {0x1BU, '-',
+        (font->flags & BK_PRINT_FONT_UNDERLINE) ? 1U : 0U};
+    uint8_t pitch[2] = {0x1BU,
+        font->points <= 10U ? 'M' : 'P'};
+    return output_append(output, bold, sizeof(bold)) &&
+           output_append(output, italic, sizeof(italic)) &&
+           output_append(output, underline, sizeof(underline)) &&
+           output_append(output, pitch, sizeof(pitch));
+}
+
+static bool escp_bitmap(output_buffer_t *output, uint8_t mode,
+                        uint32_t *current_y, int32_t x, int32_t y,
+                        uint32_t width, uint32_t height, uint32_t stride,
+                        const uint8_t *pixels) {
+    uint8_t *columns;
+    if (!width || width > 8191U || !height || !pixels) return false;
+    columns = (uint8_t *)bk_sys_alloc(width);
+    if (!columns) return false;
+    if (!escp_move_y(output, current_y, y)) {
+        bk_sys_free(columns);
+        return false;
+    }
+    for (uint32_t band = 0; band < height; band += 8U) {
+        uint8_t header[5] = {0x1BU, '*', mode, (uint8_t)width,
+                             (uint8_t)(width >> 8)};
+        for (uint32_t column = 0; column < width; column++) {
+            uint8_t value = 0;
+            for (uint32_t bit = 0; bit < 8U && band + bit < height; bit++) {
+                const uint8_t *row = pixels + (band + bit) * stride;
+                if (row[column >> 3] & (uint8_t)(0x80U >> (column & 7U)))
+                    value |= (uint8_t)(0x80U >> bit);
+            }
+            columns[column] = value;
+        }
+        if (!escp_move_x(output, x) ||
+            !output_append(output, header, sizeof(header)) ||
+            !output_append(output, columns, width) ||
+            !output_byte(output, '\r')) {
+            bk_sys_free(columns);
+            return false;
+        }
+        {
+            uint8_t advance[3] = {0x1BU, 'J', 24U};
+            if (!output_append(output, advance, sizeof(advance))) {
+                bk_sys_free(columns);
+                return false;
+            }
+        }
+        *current_y += 8U;
+    }
+    bk_sys_free(columns);
+    return true;
+}
+
+static bool escp_line(output_buffer_t *output, uint8_t mode,
+                      uint32_t *current_y, int32_t x1, int32_t y1,
+                      int32_t x2, int32_t y2, uint32_t thickness) {
+    int32_t min_x = x1 < x2 ? x1 : x2;
+    int32_t min_y = y1 < y2 ? y1 : y2;
+    int32_t max_x = x1 > x2 ? x1 : x2;
+    int32_t max_y = y1 > y2 ? y1 : y2;
+    uint32_t width = (uint32_t)(max_x - min_x) + thickness + 1U;
+    uint32_t height = (uint32_t)(max_y - min_y) + thickness + 1U;
+    uint32_t stride = (width + 7U) >> 3;
+    uint8_t *bitmap;
+    int32_t dx, dy, sx, sy, error;
+    if (width > 4096U || height > 4096U || !stride ||
+        height > PRINT_MAX_LINE_BITMAP_BYTES / stride) return false;
+    bitmap = (uint8_t *)bk_sys_alloc(stride * height);
+    if (!bitmap) return false;
+    memory_zero(bitmap, stride * height);
+    x1 -= min_x; x2 -= min_x; y1 -= min_y; y2 -= min_y;
+    dx = x2 > x1 ? x2 - x1 : x1 - x2;
+    sx = x1 < x2 ? 1 : -1;
+    dy = y2 > y1 ? y1 - y2 : y2 - y1;
+    sy = y1 < y2 ? 1 : -1;
+    error = dx + dy;
+    for (;;) {
+        for (uint32_t ty = 0; ty < thickness && y1 + (int32_t)ty < (int32_t)height; ty++)
+            for (uint32_t tx = 0; tx < thickness && x1 + (int32_t)tx < (int32_t)width; tx++)
+                if (x1 + (int32_t)tx >= 0 && y1 + (int32_t)ty >= 0)
+                    bitmap[(uint32_t)(y1 + (int32_t)ty) * stride +
+                           (uint32_t)(x1 + (int32_t)tx) / 8U] |=
+                        (uint8_t)(0x80U >> ((uint32_t)(x1 + (int32_t)tx) & 7U));
+        if (x1 == x2 && y1 == y2) break;
+        {
+            int32_t twice = error * 2;
+            if (twice >= dy) { error += dy; x1 += sx; }
+            if (twice <= dx) { error += dx; y1 += sy; }
+        }
+    }
+    {
+        bool ok = escp_bitmap(output, mode, current_y, min_x, min_y,
+                              width, height, stride, bitmap);
+        bk_sys_free(bitmap);
+        return ok;
+    }
+}
+
+static bool render_escp(const uint8_t *job, uint32_t size,
+                        const printer_profile_t *profile,
+                        output_buffer_t *output) {
+    job_iterator_t iterator;
+    job_command_t command;
+    font_state_t font = {BK_PRINT_FONT_SERIF, 12U, 0U};
+    page_command_t page_info;
+    uint32_t current_y = 0;
+    bool page_open = false;
+    memory_zero(&page_info, sizeof(page_info));
+    if (!output_text(output, "\x1B@") ||
+        !job_iterator_init(&iterator, job, size)) return false;
+    while (job_iterator_next(&iterator, &command)) {
+        if (command.type == BK_PRINT_CMD_BEGIN_PAGE) {
+            if (page_open || !command_page_valid(&command, &page_info))
+                return false;
+            current_y = 0;
+            if (!output_text(output, "\x1B@") ||
+                !escp_set_font(output, &font)) return false;
+            page_open = true;
+        } else if (command.type == BK_PRINT_CMD_SET_FONT) {
+            if (command.payload_size != 8U || !page_open) return false;
+            font.family = read_u16(command.payload);
+            font.points = read_u16(command.payload + 2);
+            font.flags = read_u32(command.payload + 4);
+            if (font.family > BK_PRINT_FONT_MONO || font.points < 4U ||
+                font.points > 144U || !escp_set_font(output, &font)) return false;
+        } else if (command.type == BK_PRINT_CMD_TEXT) {
+            const uint8_t *text;
+            uint32_t length;
+            int32_t x, y;
+            if (!page_open || !command_text_valid(&command, &x, &y,
+                                                   &text, &length) ||
+                !coordinate_in_page(x, y, &page_info) ||
+                !escp_move_y(output, &current_y, y) ||
+                !escp_move_x(output, x) ||
+                !output_append(output, text, length) ||
+                !output_byte(output, '\r')) return false;
+        } else if (command.type == BK_PRINT_CMD_LINE) {
+            line_command_t line;
+            if (!page_open || !command_line_valid(&command, &page_info, &line) ||
+                !escp_line(output, profile->escp_mode, &current_y,
+                    line.x1, line.y1, line.x2, line.y2,
+                    line.width_points)) return false;
+        } else if (command.type == BK_PRINT_CMD_BITMAP_MONO) {
+            bitmap_command_t bitmap;
+            if (!page_open ||
+                !command_bitmap_valid(&command, &page_info, &bitmap) ||
+                !escp_bitmap(output, profile->escp_mode, &current_y,
+                    bitmap.x, bitmap.y, bitmap.width, bitmap.height,
+                    bitmap.stride, bitmap.pixels)) return false;
+        } else if (command.type == BK_PRINT_CMD_END_PAGE) {
+            if (!page_open || command.payload_size != 0U ||
+                !output_byte(output, 0x0CU)) return false;
+            page_open = false;
+        } else return false;
+    }
+    return job_iterator_complete(&iterator) && !page_open && !output->failed;
+}
+
+static bool render_job(const uint8_t *job, uint32_t size,
+                       const printer_profile_t *profile,
+                       output_buffer_t *output) {
+    switch (profile->language) {
+        case LANG_TEXT: return render_text_driver(job, size, output);
+        case LANG_ESCP:
+        case LANG_ESCP2: return render_escp(job, size, profile, output);
+        case LANG_PCL5: return render_pcl5(job, size, output);
+        case LANG_POSTSCRIPT: return render_postscript(job, size, output);
+        default: return false;
+    }
+}
+
+static void stem_from_name(char *stem, uint32_t capacity, const char *name) {
+    uint32_t i = 0;
+    while (name && name[i] && name[i] != '.' && i + 1U < capacity) {
+        stem[i] = name[i];
+        i++;
+    }
+    stem[i] = '\0';
+}
+
+static bool make_path(char *path, uint32_t capacity, const char *directory,
+                      const char *stem, const char *extension) {
+    text_copy(path, capacity, directory);
+    return text_append(path, capacity, "/") &&
+           text_append(path, capacity, stem) &&
+           text_append(path, capacity, ".") &&
+           text_append(path, capacity, extension);
+}
+
+static bool write_status(const char *stem, const char *state,
+                         const char *message, uint32_t attempt,
+                         const printer_profile_t *profile) {
+    char path[BK_PATH_MAX];
+    char text[384];
+    char number[11];
+    uint32_t count = 0;
+    uint32_t value = attempt;
+    uint32_t length = 0;
+    text[0] = '\0';
+    if (!make_path(path, sizeof(path), SPOOL_DIR, stem, "STS")) return false;
+    text_append(text, sizeof(text), "state=");
+    text_append(text, sizeof(text), state);
+    text_append(text, sizeof(text), "\r\nmessage=");
+    text_append(text, sizeof(text), message ? message : "");
+    text_append(text, sizeof(text), "\r\nattempt=");
+    if (!value) number[count++] = '0';
+    while (value && count < sizeof(number)) {
+        number[count++] = (char)('0' + value % 10U); value /= 10U;
+    }
+    while (count) {
+        uint32_t n = text_length(text);
+        if (n + 2U >= sizeof(text)) break;
+        text[n] = number[--count]; text[n + 1U] = '\0';
+    }
+    text_append(text, sizeof(text), "\r\nprinter=");
+    if (profile) text_append(text, sizeof(text), profile->name);
+    text_append(text, sizeof(text), "\r\n");
+    length = text_length(text);
+    return bk_file_write_all(path, text, length);
+}
+
+static void archive_spool_file(const char *stem, const char *extension) {
+    char source[BK_PATH_MAX];
+    char destination[BK_PATH_MAX];
+    if (!make_path(source, sizeof(source), SPOOL_DIR, stem, extension) ||
+        !make_path(destination, sizeof(destination), SPOOL_HISTORY_DIR, stem,
+                   extension)) return;
+    (void)bk_file_remove(destination);
+    (void)bk_file_rename(source, destination);
+}
+
+static bool find_print_port(const printer_profile_t *profile,
+                            uint32_t *index_out,
+                            bk_print_port_info_t *info_out) {
+    uint32_t count = bk_print_lpt_count();
+    bk_print_port_info_t info;
+    if (!profile || !index_out || !info_out) return false;
+    for (uint32_t i = 0; i < count; i++) {
+        memory_zero(&info, sizeof(info));
+        info.struct_size = sizeof(info);
+        if (!bk_print_port_info(i, &info)) continue;
+        if (profile->port_name[0] && text_equal_ci(info.name,
+                                                   profile->port_name)) {
+            *index_out = i;
+            *info_out = info;
+            return true;
+        }
+    }
+    memory_zero(&info, sizeof(info));
+    info.struct_size = sizeof(info);
+    if (profile->lpt_index < count &&
+        bk_print_port_info(profile->lpt_index, &info)) {
+        *index_out = profile->lpt_index;
+        *info_out = info;
+        return true;
+    }
+    return false;
+}
+
+static bool transport_output(const printer_profile_t *profile,
+                             const char *stem, const output_buffer_t *output,
+                             char *message, uint32_t message_capacity) {
+    if (profile->transport == TRANSPORT_FILE) {
+        char path[BK_PATH_MAX];
+        (void)bk_file_mkdir(profile->output_dir);
+        if (!make_path(path, sizeof(path), profile->output_dir, stem,
+                       profile->extension)) {
+            text_copy(message, message_capacity, "ruta de salida demasiado larga");
+            return false;
+        }
+        if (!bk_file_write_all(path, output->data, output->size)) {
+            text_copy(message, message_capacity, "no se pudo guardar la salida");
+            return false;
+        }
+        text_copy(message, message_capacity, path);
+        return true;
+    }
+    if (profile->transport == TRANSPORT_LPT) {
+        int32_t written;
+        uint32_t port_index;
+        bk_print_port_info_t info;
+        if (!find_print_port(profile, &port_index, &info)) {
+            text_copy(message, message_capacity, "puerto de impresora no detectado");
+            return false;
+        }
+        if (!info.selected || info.paper_out || info.error) {
+            text_copy(message, message_capacity,
+                      info.paper_out ? "impresora sin papel" :
+                      (info.error ? "error de impresora" : "impresora fuera de linea"));
+            return false;
+        }
+        written = bk_print_lpt_write(port_index, output->data,
+                                     output->size, PRINT_IDLE_TIMEOUT_MS);
+        if (written < 0 || (uint32_t)written != output->size) {
+            text_copy(message, message_capacity,
+                      info.virtual_port ? "fallo o timeout enviando por USB" :
+                                          "fallo o timeout enviando a LPT");
+            return false;
+        }
+        text_copy(message, message_capacity,
+                  info.virtual_port ? "enviado por USB" : "enviado a LPT");
+        return true;
+    }
+    text_copy(message, message_capacity, "transporte no soportado");
+    return false;
+}
+
+static uint32_t retry_from_name(const char *name) {
+    if (text_ends_ci(name, ".R01")) return 1U;
+    if (text_ends_ci(name, ".R02")) return 2U;
+    if (text_ends_ci(name, ".R03")) return 3U;
+    return 0U;
+}
+
+static bool is_queued_name(const char *name) {
+    return text_ends_ci(name, ".BPJ") || text_ends_ci(name, ".R01") ||
+           text_ends_ci(name, ".R02") || text_ends_ci(name, ".R03");
+}
+
+static bool control_exists(const char *stem, const char *extension) {
+    char path[BK_PATH_MAX];
+    void *data = NULL;
+    uint32_t size = 0;
+    bool exists;
+    if (!make_path(path, sizeof(path), SPOOL_DIR, stem, extension)) return false;
+    exists = bk_file_read_all(path, &data, &size);
+    if (data) bk_sys_free(data);
+    return exists;
+}
+
+static void remove_control(const char *stem, const char *extension) {
+    char path[BK_PATH_MAX];
+    if (make_path(path, sizeof(path), SPOOL_DIR, stem, extension))
+        (void)bk_file_remove(path);
+}
+
+static void archive_terminal_job(const char *stem, bool archive_error_job) {
+    if (archive_error_job) archive_spool_file(stem, "ERR");
+    archive_spool_file(stem, "STS");
+    remove_control(stem, "CAN");
+    remove_control(stem, "HLD");
+}
+
+static bool process_job(const char *entry_name) {
+    char stem[BK_NAME_MAX];
+    char source[BK_PATH_MAX];
+    char running[BK_PATH_MAX];
+    char destination[BK_PATH_MAX];
+    char profile_id[BPJ_ID_CAPACITY + 1U];
+    char message[128];
+    void *raw = NULL;
+    uint32_t size = 0;
+    uint32_t attempt = retry_from_name(entry_name);
+    printer_profile_t profile;
+    output_buffer_t output;
+    bool success = false;
+
+    memory_zero(&profile, sizeof(profile));
+    memory_zero(&output, sizeof(output));
+    stem_from_name(stem, sizeof(stem), entry_name);
+    if (!make_path(source, sizeof(source), SPOOL_DIR, stem,
+                   attempt ? (attempt == 1U ? "R01" :
+                             (attempt == 2U ? "R02" : "R03")) : "BPJ") ||
+        !make_path(running, sizeof(running), SPOOL_DIR, stem, "RUN"))
+        return false;
+    if (control_exists(stem, "CAN")) {
+        (void)bk_file_remove(source);
+        remove_control(stem, "CAN");
+        remove_control(stem, "HLD");
+        (void)write_status(stem, "canceled", "cancelado por el usuario",
+                           attempt, NULL);
+        archive_terminal_job(stem, false);
+        return true;
+    }
+    if (control_exists(stem, "HLD")) return false;
+    if (!bk_file_rename(source, running)) return false;
+    (void)write_status(stem, "printing", "procesando trabajo", attempt, NULL);
+    if (!bk_file_read_all(running, &raw, &size) || !job_valid(raw, size)) {
+        text_copy(message, sizeof(message), "trabajo BPJ invalido");
+        goto failed;
+    }
+    memory_zero(profile_id, sizeof(profile_id));
+    memory_copy(profile_id, (uint8_t *)raw + BPJ_ID_OFFSET,
+                BPJ_ID_CAPACITY);
+    profile_id[BPJ_ID_CAPACITY] = '\0';
+    if (!profile_load(profile_id, &profile)) {
+        text_copy(message, sizeof(message), "perfil BPD no encontrado");
+        goto failed;
+    }
+    (void)write_status(stem, "rendering", "generando lenguaje de impresion",
+                       attempt, &profile);
+    if (!render_job((const uint8_t *)raw, size, &profile, &output)) {
+        text_copy(message, sizeof(message), "fallo al renderizar el trabajo");
+        goto failed;
+    }
+    if (!transport_output(&profile, stem, &output, message, sizeof(message)))
+        goto failed;
+    success = true;
+    (void)bk_file_remove(running);
+    (void)write_status(stem, "done", message, attempt, &profile);
+    archive_terminal_job(stem, false);
+    goto cleanup;
+
+failed:
+    attempt++;
+    if (attempt <= PRINT_MAX_RETRIES) {
+        const char *extension = attempt == 1U ? "R01" :
+                                (attempt == 2U ? "R02" : "R03");
+        bool moved = false;
+        if (make_path(destination, sizeof(destination), SPOOL_DIR, stem,
+                      extension)) moved = bk_file_rename(running, destination);
+        if (moved) {
+            (void)write_status(stem, "retry", message, attempt,
+                               profile.id[0] ? &profile : NULL);
+            bk_sys_sleep_ms(PRINT_RETRY_DELAY_MS * attempt);
+        } else {
+            if (make_path(destination, sizeof(destination), SPOOL_DIR, stem,
+                          "ERR")) (void)bk_file_rename(running, destination);
+            (void)write_status(stem, "error",
+                               "no se pudo conservar el trabajo para reintento",
+                               attempt, profile.id[0] ? &profile : NULL);
+            archive_terminal_job(stem, true);
+            attempt = PRINT_MAX_RETRIES + 1U;
+        }
+    } else {
+        if (make_path(destination, sizeof(destination), SPOOL_DIR, stem, "ERR"))
+            (void)bk_file_rename(running, destination);
+        (void)write_status(stem, "error", message, attempt,
+                           profile.id[0] ? &profile : NULL);
+        archive_terminal_job(stem, true);
+    }
+cleanup:
+    if (raw) bk_sys_free(raw);
+    output_free(&output);
+    return success || attempt > 0U;
+}
+
+static void recover_interrupted_jobs(void) {
+    bk_file_entry_t *entries = g_spool_scan_entries;
+    uint32_t count = 0;
+    if (!entries ||
+        !bk_file_list_dir(SPOOL_DIR, entries, SPOOL_SCAN_MAX, &count)) return;
+    for (uint32_t i = 0; i < count; i++) {
+        char stem[BK_NAME_MAX];
+        char source[BK_PATH_MAX];
+        char retry[BK_PATH_MAX];
+        if (entries[i].type != BK_FILE_NODE_FILE ||
+            !text_ends_ci(entries[i].name, ".RUN")) continue;
+        stem_from_name(stem, sizeof(stem), entries[i].name);
+        if (!make_path(source, sizeof(source), SPOOL_DIR, stem, "RUN") ||
+            !make_path(retry, sizeof(retry), SPOOL_DIR, stem, "R01"))
+            continue;
+        if (bk_file_rename(source, retry))
+            (void)write_status(stem, "retry",
+                "trabajo recuperado despues de una interrupcion", 1U, NULL);
+    }
+}
+
+static bool spool_once(void) {
+    bk_file_entry_t *entries = g_spool_scan_entries;
+    uint32_t count = 0;
+    bool processed = false;
+    if (!entries ||
+        !bk_file_list_dir(SPOOL_DIR, entries, SPOOL_SCAN_MAX, &count))
+        return false;
+    for (uint32_t i = 0; i < count; i++) {
+        char stem[BK_NAME_MAX];
+        if (entries[i].type != BK_FILE_NODE_FILE ||
+            !is_queued_name(entries[i].name)) continue;
+        stem_from_name(stem, sizeof(stem), entries[i].name);
+        if (control_exists(stem, "HLD") && !control_exists(stem, "CAN"))
+            continue;
+        processed = process_job(entries[i].name);
+        break;
+    }
+    return processed;
+}
+
+void bleskernos_program_main(bk_gui_desktop_t *desktop UNUSED) {
+    if (bk_sys_api_version() < 25U ||
+        (bk_sys_capabilities() & (BK_API_CAP_FILES | BK_API_CAP_PRINT)) !=
+        (BK_API_CAP_FILES | BK_API_CAP_PRINT)) {
+        bk_sys_log("[PRINT] API 25 con archivos/LPT requerida; spooler detenido\n");
+        bk_proc_exit();
+    }
+    (void)bk_file_mkdir("/TEMP");
+    (void)bk_file_mkdir(SPOOL_DIR);
+    (void)bk_file_mkdir(SPOOL_HISTORY_DIR);
+    (void)bk_file_mkdir(OUTPUT_DIR);
+    g_spool_scan_entries = (bk_file_entry_t *)bk_sys_alloc(
+        sizeof(bk_file_entry_t) * SPOOL_SCAN_MAX);
+    if (!g_spool_scan_entries) {
+        bk_sys_log("[PRINT] sin memoria para la cola; spooler detenido\n");
+        bk_proc_exit();
+    }
+    /* READY means printing is available; recovery runs after the desktop is
+     * responsive instead of extending the boot critical path. */
+    /* El kernel espera esta marca antes de iniciar la GUI. Se publica solo
+       despues de crear directorios y recuperar trabajos interrumpidos. */
+    if (!bk_file_write_all(SPOOL_READY_PATH, "READY\n", 6U)) {
+        bk_sys_log("[PRINT] no se pudo publicar READY.SYS; spooler detenido\n");
+        bk_proc_exit();
+        return;
+    }
+    bk_sys_log("[PRINT] PrintSpool Ring 3 listo\n");
+    bk_sys_sleep_ms(250U);
+    recover_interrupted_jobs();
+    while (!bk_proc_exit_requested()) {
+        bk_sys_sleep_ms(spool_once() ? PRINT_ACTIVE_SCAN_MS
+                                     : PRINT_IDLE_SCAN_MS);
+    }
+    bk_sys_free(g_spool_scan_entries);
+    g_spool_scan_entries = NULL;
+    bk_proc_exit();
+}

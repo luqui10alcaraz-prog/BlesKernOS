@@ -2,6 +2,7 @@
 #include "include/pic.h"
 #include "include/vga.h"
 #include "include/task.h"
+#include "include/perfmon.h"
 
 static irq_handler_t irq_handlers[16];
 
@@ -83,6 +84,7 @@ void irq_uninstall_handler(uint8_t irq) {
 registers_t *irq_handler(registers_t *regs) {
     uint8_t irq = (uint8_t)(regs->int_no - 32);
 
+    perfmon_irq(irq);
     if (irq < 16 && irq_handlers[irq] != NULL) {
         irq_handlers[irq](regs);
     }

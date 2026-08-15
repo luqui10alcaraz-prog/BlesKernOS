@@ -39,6 +39,12 @@ void vga_get_cursor(int *x, int *y);
 void vga_set_output_sink(vga_output_char_t output,
                          vga_output_clear_t clear,
                          void *context);
+
+/* Espejo en RAM del flujo de diagnostico que normalmente sale por COM1. */
+uint32_t vga_com1_log_size(void);
+uint32_t vga_com1_log_dropped(void);
+bool vga_com1_log_save(const char *path);
+
 void kprintf(const char *fmt, ...);
 
 #endif

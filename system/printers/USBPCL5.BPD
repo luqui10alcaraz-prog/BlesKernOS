@@ -1,0 +1,7 @@
+[Printer]
+Id=USBPCL5
+Name=USB Printer PCL 5
+Language=PCL5
+Transport=LPT
+Port=USBPRN1
+DPI=300

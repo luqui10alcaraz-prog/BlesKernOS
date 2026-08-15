@@ -1,0 +1,2028 @@
+#include "platform.h"
+
+extern void bk_sys_log(const char *message);
+
+static void nsbk_report_progress(nsbk_document_t *document,
+                                 uint8_t percent, const char *phase);
+
+static bool nsbk_cancelled(const nsbk_document_t *document) {
+    return document && document->cancel_flag && *document->cancel_flag;
+}
+
+#include <string.h>
+
+#define NSBK_REDIRECT_MAX 5U
+#define NSBK_CSS_BYTES_MAX 393216U
+#define NSBK_IMAGE_PIXELS_MAX 600000U
+#define NSBK_IMAGE_PIXELS_TOTAL 1200000U
+
+typedef struct {
+    int status;
+    uint32_t body_offset;
+    uint32_t body_length;
+    uint32_t total_length;
+    uint8_t redirects;
+    bool secure;
+    bool chunked;
+    bool gzip;
+    bool truncated;
+    int32_t tls_error;
+    char final_url[NSBK_URL_MAX];
+    char location[NSBK_URL_MAX];
+    char content_type[NSBK_CONTENT_TYPE_MAX];
+    char content_encoding[32];
+    char charset[32];
+} nsbk_fetch_result_t;
+
+/*
+ * El resultado del parser HTML contiene todas las tablas de enlaces,
+ * formularios, controles, opciones e imágenes descubiertas. En la etapa 10
+ * llegó a superar los 50 KiB. Mantenerlo como variable local dejaba menos de
+ * 12 KiB libres en el stack Ring 3 de 64 KiB; al entrar en HTTPS, el request
+ * temporal de 8 KiB desbordaba la pila justo después de mostrar
+ * "Conectando con el sitio...".
+ *
+ * Este workspace vive en el heap durante toda la vida del documento y también
+ * se reutiliza para los relayouts. Así evitamos el desbordamiento y reducimos
+ * la fragmentación de reservar/liberar 50 KiB en cada repaint o resize.
+ */
+typedef struct {
+    nsbk_html_result_t parsed;
+    nsbk_css_resource_t css_resources[NSBK_CSS_RESOURCE_MAX];
+    nsbk_image_resource_t image_resources[NSBK_IMAGE_RESOURCE_MAX];
+    nsbk_resource_environment_t environment;
+    nsbk_html_control_t old_controls[NSBK_HTML_CONTROL_MAX];
+} nsbk_workspace_t;
+
+static uint32_t nsbk_strlen(const char *text) {
+    uint32_t length = 0U;
+    while (text && text[length]) length++;
+    return length;
+}
+
+static char nsbk_lower(char character) {
+    if (character >= 'A' && character <= 'Z')
+        return (char)(character + ('a' - 'A'));
+    return character;
+}
+
+static bool nsbk_prefix(const char *text, const char *prefix) {
+    uint32_t i = 0U;
+    if (!text || !prefix) return false;
+    while (prefix[i]) {
+        if (!text[i] || nsbk_lower(text[i]) != nsbk_lower(prefix[i]))
+            return false;
+        i++;
+    }
+    return true;
+}
+
+static bool nsbk_equal_nocase(const char *left, const char *right) {
+    uint32_t i = 0U;
+    if (!left || !right) return false;
+    while (left[i] && right[i]) {
+        if (nsbk_lower(left[i]) != nsbk_lower(right[i])) return false;
+        i++;
+    }
+    return left[i] == '\0' && right[i] == '\0';
+}
+
+static bool nsbk_equal_range(const char *text, uint32_t length,
+                             const char *literal) {
+    uint32_t i = 0U;
+    if (!text || !literal) return false;
+    while (literal[i]) {
+        if (i >= length || nsbk_lower(text[i]) != nsbk_lower(literal[i]))
+            return false;
+        i++;
+    }
+    return i == length;
+}
+
+static bool nsbk_contains_nocase(const char *text, const char *needle) {
+    uint32_t text_length = nsbk_strlen(text);
+    uint32_t needle_length = nsbk_strlen(needle);
+    uint32_t i, j;
+    if (!needle_length) return true;
+    if (needle_length > text_length) return false;
+    for (i = 0U; i + needle_length <= text_length; i++) {
+        for (j = 0U; j < needle_length; j++)
+            if (nsbk_lower(text[i + j]) != nsbk_lower(needle[j])) break;
+        if (j == needle_length) return true;
+    }
+    return false;
+}
+
+static void nsbk_copy(char *destination, uint32_t capacity,
+                      const char *source) {
+    uint32_t i = 0U;
+    if (!destination || capacity == 0U) return;
+    while (source && source[i] && i + 1U < capacity) {
+        destination[i] = source[i];
+        i++;
+    }
+    destination[i] = '\0';
+}
+
+static void nsbk_copy_range(char *destination, uint32_t capacity,
+                            const char *source, uint32_t length) {
+    uint32_t copy = length;
+    if (!destination || capacity == 0U) return;
+    if (!source) { destination[0] = '\0'; return; }
+    if (copy >= capacity) copy = capacity - 1U;
+    if (copy) memcpy(destination, source, copy);
+    destination[copy] = '\0';
+}
+
+static void nsbk_append(char *destination, uint32_t capacity,
+                        const char *source) {
+    uint32_t used = nsbk_strlen(destination);
+    uint32_t i = 0U;
+    if (!destination || capacity == 0U) return;
+    while (source && source[i] && used + 1U < capacity)
+        destination[used++] = source[i++];
+    destination[used] = '\0';
+}
+
+static void nsbk_set_error(nsbk_document_t *document, const char *message) {
+    if (!document) return;
+    nsbk_copy(document->error, sizeof(document->error), message);
+    nsbk_copy(document->text_data, NSBK_TEXT_BUFFER_SIZE, message);
+    document->text_length = nsbk_strlen(document->text_data);
+}
+
+void nsbk_url_normalize(char *destination, uint32_t capacity,
+                        const char *source) {
+    uint32_t start = 0U;
+    uint32_t end;
+    if (!destination || capacity == 0U) return;
+    destination[0] = '\0';
+    if (!source) return;
+    while (source[start] == ' ' || source[start] == '\t' ||
+           source[start] == '\r' || source[start] == '\n') start++;
+    end = nsbk_strlen(source + start);
+    while (end > 0U && (source[start + end - 1U] == ' ' ||
+           source[start + end - 1U] == '\t' ||
+           source[start + end - 1U] == '\r' ||
+           source[start + end - 1U] == '\n')) end--;
+    if (!end) return;
+    if (nsbk_prefix(source + start, "http://") ||
+        nsbk_prefix(source + start, "https://")) {
+        nsbk_copy_range(destination, capacity, source + start, end);
+        return;
+    }
+    nsbk_copy(destination, capacity, "http://");
+    if (nsbk_strlen(destination) + end + 1U < capacity)
+        nsbk_copy_range(destination + nsbk_strlen(destination),
+                        capacity - nsbk_strlen(destination),
+                        source + start, end);
+}
+
+static uint32_t nsbk_scheme_end(const char *url) {
+    uint32_t i;
+    if (!url) return 0U;
+    for (i = 0U; url[i] && i + 2U < NSBK_URL_MAX; i++) {
+        if (url[i] == ':' && url[i + 1U] == '/' && url[i + 2U] == '/')
+            return i + 3U;
+    }
+    return 0U;
+}
+
+static uint32_t nsbk_host_end(const char *url) {
+    uint32_t end = nsbk_scheme_end(url);
+    while (url && url[end] && url[end] != '/' && url[end] != '?' &&
+           url[end] != '#') end++;
+    return end;
+}
+
+static void nsbk_collapse_url_path(char *url, uint32_t capacity) {
+    char input[NSBK_URL_MAX * 2U];
+    char suffix[NSBK_URL_MAX];
+    uint32_t host_end, input_length, suffix_at, in, out;
+    bool trailing_slash;
+    if (!url || capacity == 0U) return;
+    nsbk_copy(input, sizeof(input), url);
+    host_end = nsbk_host_end(input);
+    input_length = nsbk_strlen(input);
+    suffix_at = host_end;
+    while (suffix_at < input_length && input[suffix_at] != '?' &&
+           input[suffix_at] != '#') suffix_at++;
+    nsbk_copy(suffix, sizeof(suffix), input + suffix_at);
+    trailing_slash = suffix_at > host_end && input[suffix_at - 1U] == '/';
+    nsbk_copy_range(url, capacity, input, host_end);
+    out = nsbk_strlen(url);
+    if (out + 1U < capacity) url[out++] = '/';
+    url[out] = '\0';
+    in = host_end;
+    while (in < suffix_at) {
+        uint32_t start, length;
+        while (in < suffix_at && input[in] == '/') in++;
+        start = in;
+        while (in < suffix_at && input[in] != '/') in++;
+        length = in - start;
+        if (length == 0U || (length == 1U && input[start] == '.')) continue;
+        if (length == 2U && input[start] == '.' && input[start + 1U] == '.') {
+            if (out > host_end + 1U) {
+                out--;
+                while (out > host_end && url[out - 1U] != '/') out--;
+                url[out] = '\0';
+            }
+            continue;
+        }
+        if (out > 0U && url[out - 1U] != '/' && out + 1U < capacity)
+            url[out++] = '/';
+        if (length > capacity - out - 1U) length = capacity - out - 1U;
+        if (length) memcpy(url + out, input + start, length);
+        out += length;
+        url[out] = '\0';
+    }
+    if (trailing_slash && out > 0U && url[out - 1U] != '/' &&
+        out + 1U < capacity) {
+        url[out++] = '/';
+        url[out] = '\0';
+    }
+    nsbk_append(url, capacity, suffix);
+}
+
+void nsbk_url_resolve(char *destination, uint32_t capacity,
+                      const char *base, const char *reference) {
+    char combined[NSBK_URL_MAX * 2U];
+    uint32_t scheme, host_end, base_end, directory_end, i;
+    if (!destination || capacity == 0U) return;
+    destination[0] = '\0';
+    if (!reference || !reference[0]) {
+        nsbk_copy(destination, capacity, base);
+        return;
+    }
+    if (nsbk_prefix(reference, "http://") ||
+        nsbk_prefix(reference, "https://")) {
+        nsbk_copy(destination, capacity, reference);
+        nsbk_collapse_url_path(destination, capacity);
+        return;
+    }
+    if (!base || !base[0]) {
+        nsbk_url_normalize(destination, capacity, reference);
+        return;
+    }
+    scheme = nsbk_scheme_end(base);
+    host_end = nsbk_host_end(base);
+    if (reference[0] == '/' && reference[1] == '/') {
+        nsbk_copy_range(combined, sizeof(combined), base, scheme);
+        nsbk_append(combined, sizeof(combined), reference + 2U);
+    } else if (reference[0] == '#') {
+        base_end = 0U;
+        while (base[base_end] && base[base_end] != '#') base_end++;
+        nsbk_copy_range(combined, sizeof(combined), base, base_end);
+        nsbk_append(combined, sizeof(combined), reference);
+    } else if (reference[0] == '?') {
+        base_end = 0U;
+        while (base[base_end] && base[base_end] != '?' &&
+               base[base_end] != '#') base_end++;
+        nsbk_copy_range(combined, sizeof(combined), base, base_end);
+        nsbk_append(combined, sizeof(combined), reference);
+    } else if (reference[0] == '/') {
+        nsbk_copy_range(combined, sizeof(combined), base, host_end);
+        nsbk_append(combined, sizeof(combined), reference);
+    } else {
+        base_end = nsbk_strlen(base);
+        for (i = host_end; i < base_end; i++)
+            if (base[i] == '?' || base[i] == '#') { base_end = i; break; }
+        directory_end = base_end;
+        while (directory_end > host_end && base[directory_end - 1U] != '/')
+            directory_end--;
+        if (directory_end == host_end) directory_end = host_end + 1U;
+        nsbk_copy_range(combined, sizeof(combined), base, directory_end);
+        nsbk_append(combined, sizeof(combined), reference);
+    }
+    nsbk_copy(destination, capacity, combined);
+    nsbk_collapse_url_path(destination, capacity);
+}
+
+
+static bool nsbk_url_parts(const char *url, char *authority,
+                           uint32_t authority_capacity, char *host,
+                           uint32_t host_capacity, char *path,
+                           uint32_t path_capacity, bool *secure) {
+    uint32_t scheme, host_start, host_end, host_name_end, path_start, i;
+    if (!url || !authority || !host || !path || !secure) return false;
+    *secure = nsbk_prefix(url, "https://");
+    if (!*secure && !nsbk_prefix(url, "http://")) return false;
+    scheme = *secure ? 8U : 7U;
+    host_start = scheme;
+    host_end = host_start;
+    while (url[host_end] && url[host_end] != '/' &&
+           url[host_end] != '?' && url[host_end] != '#') host_end++;
+    if (host_end == host_start) return false;
+    nsbk_copy_range(authority, authority_capacity, url + host_start,
+                    host_end - host_start);
+    host_name_end = host_start;
+    while (host_name_end < host_end && url[host_name_end] != ':')
+        host_name_end++;
+    nsbk_copy_range(host, host_capacity, url + host_start,
+                    host_name_end - host_start);
+    path_start = host_end;
+    if (url[path_start] == '?') {
+        nsbk_copy(path, path_capacity, "/");
+        nsbk_append(path, path_capacity, url + path_start);
+    } else if (url[path_start] == '/') {
+        i = path_start;
+        while (url[i] && url[i] != '#') i++;
+        nsbk_copy_range(path, path_capacity, url + path_start, i - path_start);
+    } else {
+        nsbk_copy(path, path_capacity, "/");
+    }
+    return host[0] && path[0];
+}
+
+static bool nsbk_domain_matches(const char *host, const char *domain,
+                                bool host_only) {
+    uint32_t host_length = nsbk_strlen(host);
+    uint32_t domain_length = nsbk_strlen(domain);
+    uint32_t i;
+    if (!host || !domain || !domain_length || domain_length > host_length)
+        return false;
+    if (host_only && host_length != domain_length) return false;
+    for (i = 0U; i < domain_length; i++)
+        if (nsbk_lower(host[host_length - domain_length + i]) !=
+            nsbk_lower(domain[i])) return false;
+    return host_length == domain_length ||
+           (!host_only && host[host_length - domain_length - 1U] == '.');
+}
+
+static bool nsbk_path_matches(const char *request_path, const char *cookie_path) {
+    uint32_t i = 0U;
+    if (!request_path || !cookie_path || !cookie_path[0]) return true;
+    while (cookie_path[i]) {
+        if (!request_path[i] || request_path[i] != cookie_path[i]) return false;
+        i++;
+    }
+    if (!request_path[i] || (i > 0U && cookie_path[i - 1U] == '/'))
+        return true;
+    return request_path[i] == '/';
+}
+
+static void nsbk_default_cookie_path(const char *path, char *output,
+                                     uint32_t capacity) {
+    uint32_t length, end;
+    if (!output || !capacity) return;
+    if (!path || path[0] != '/') { nsbk_copy(output, capacity, "/"); return; }
+    length = nsbk_strlen(path);
+    end = length;
+    while (end > 1U && path[end - 1U] != '/') end--;
+    if (end <= 1U) nsbk_copy(output, capacity, "/");
+    else nsbk_copy_range(output, capacity, path, end - 1U);
+}
+
+static void nsbk_cookie_remove(nsbk_document_t *document, uint32_t index) {
+    uint32_t i;
+    if (!document || index >= document->cookie_count) return;
+    for (i = index + 1U; i < document->cookie_count; i++)
+        document->cookies[i - 1U] = document->cookies[i];
+    document->cookie_count--;
+    memset(&document->cookies[document->cookie_count], 0,
+           sizeof(document->cookies[0]));
+}
+
+static void nsbk_store_cookie(nsbk_document_t *document, const char *url,
+                              const char *header) {
+    char authority[128], host[NSBK_COOKIE_DOMAIN_MAX], path[NSBK_URL_MAX];
+    char name[NSBK_COOKIE_NAME_MAX], value[NSBK_COOKIE_VALUE_MAX];
+    char domain[NSBK_COOKIE_DOMAIN_MAX], cookie_path[NSBK_COOKIE_PATH_MAX];
+    bool secure_url, secure = false, host_only = true, remove = false;
+    uint32_t pos = 0U, start, end, i, target = NSBK_COOKIE_MAX;
+    if (!document || !header ||
+        !nsbk_url_parts(url, authority, sizeof(authority), host, sizeof(host),
+                        path, sizeof(path), &secure_url)) return;
+    (void)secure_url;
+    while (header[pos] == ' ' || header[pos] == '\t') pos++;
+    start = pos;
+    while (header[pos] && header[pos] != '=' && header[pos] != ';') pos++;
+    if (header[pos] != '=') return;
+    end = pos++;
+    while (end > start && (header[end - 1U] == ' ' ||
+           header[end - 1U] == '\t')) end--;
+    nsbk_copy_range(name, sizeof(name), header + start, end - start);
+    start = pos;
+    while (header[pos] && header[pos] != ';') pos++;
+    end = pos;
+    while (end > start && (header[end - 1U] == ' ' ||
+           header[end - 1U] == '\t')) end--;
+    nsbk_copy_range(value, sizeof(value), header + start, end - start);
+    nsbk_copy(domain, sizeof(domain), host);
+    nsbk_default_cookie_path(path, cookie_path, sizeof(cookie_path));
+    while (header[pos]) {
+        char attribute[32], attribute_value[NSBK_COOKIE_PATH_MAX];
+        uint32_t attr_start, attr_end;
+        if (header[pos] == ';') pos++;
+        while (header[pos] == ' ' || header[pos] == '\t') pos++;
+        attr_start = pos;
+        while (header[pos] && header[pos] != '=' && header[pos] != ';') pos++;
+        attr_end = pos;
+        while (attr_end > attr_start && (header[attr_end - 1U] == ' ' ||
+               header[attr_end - 1U] == '\t')) attr_end--;
+        nsbk_copy_range(attribute, sizeof(attribute), header + attr_start,
+                        attr_end - attr_start);
+        attribute_value[0] = '\0';
+        if (header[pos] == '=') {
+            pos++;
+            start = pos;
+            while (header[pos] && header[pos] != ';') pos++;
+            end = pos;
+            while (end > start && (header[end - 1U] == ' ' ||
+                   header[end - 1U] == '\t')) end--;
+            nsbk_copy_range(attribute_value, sizeof(attribute_value),
+                            header + start, end - start);
+        }
+        if (nsbk_equal_nocase(attribute, "domain") && attribute_value[0]) {
+            const char *source = attribute_value[0] == '.' ?
+                                 attribute_value + 1U : attribute_value;
+            if (!nsbk_domain_matches(host, source, false)) return;
+            nsbk_copy(domain, sizeof(domain), source);
+            host_only = false;
+        } else if (nsbk_equal_nocase(attribute, "path") &&
+                   attribute_value[0] == '/') {
+            nsbk_copy(cookie_path, sizeof(cookie_path), attribute_value);
+        } else if (nsbk_equal_nocase(attribute, "secure")) {
+            secure = true;
+        } else if (nsbk_equal_nocase(attribute, "max-age") &&
+                   (attribute_value[0] == '0' ||
+                    (attribute_value[0] == '-' && attribute_value[1]))) {
+            remove = true;
+        }
+    }
+    if (!name[0]) return;
+    for (i = 0U; i < document->cookie_count; i++) {
+        if (nsbk_equal_nocase(document->cookies[i].name, name) &&
+            nsbk_equal_nocase(document->cookies[i].domain, domain) &&
+            strcmp(document->cookies[i].path, cookie_path) == 0) {
+            target = i;
+            break;
+        }
+    }
+    if (remove) {
+        if (target < document->cookie_count) nsbk_cookie_remove(document, target);
+        return;
+    }
+    if (target == NSBK_COOKIE_MAX) {
+        if (document->cookie_count < NSBK_COOKIE_MAX)
+            target = document->cookie_count++;
+        else {
+            nsbk_cookie_remove(document, 0U);
+            target = document->cookie_count++;
+        }
+    }
+    nsbk_copy(document->cookies[target].name,
+              sizeof(document->cookies[target].name), name);
+    nsbk_copy(document->cookies[target].value,
+              sizeof(document->cookies[target].value), value);
+    nsbk_copy(document->cookies[target].domain,
+              sizeof(document->cookies[target].domain), domain);
+    nsbk_copy(document->cookies[target].path,
+              sizeof(document->cookies[target].path), cookie_path);
+    document->cookies[target].secure = secure;
+    document->cookies[target].host_only = host_only;
+}
+
+static void nsbk_collect_set_cookies(nsbk_document_t *document,
+                                     const char *url, const char *data,
+                                     uint32_t header_length) {
+    uint32_t position = 0U;
+    if (!document || !document->allow_cookies || !data) return;
+    while (position < header_length && data[position] != '\n') position++;
+    if (position < header_length) position++;
+    while (position < header_length) {
+        uint32_t line_start = position, line_end, colon;
+        while (position < header_length && data[position] != '\n') position++;
+        line_end = position;
+        if (position < header_length) position++;
+        while (line_end > line_start && (data[line_end - 1U] == '\r' ||
+               data[line_end - 1U] == ' ' || data[line_end - 1U] == '\t'))
+            line_end--;
+        colon = line_start;
+        while (colon < line_end && data[colon] != ':') colon++;
+        if (colon < line_end &&
+            nsbk_equal_range(data + line_start, colon - line_start,
+                             "Set-Cookie")) {
+            char cookie[384];
+            colon++;
+            while (colon < line_end &&
+                   (data[colon] == ' ' || data[colon] == '\t')) colon++;
+            nsbk_copy_range(cookie, sizeof(cookie), data + colon,
+                            line_end - colon);
+            nsbk_store_cookie(document, url, cookie);
+        }
+    }
+}
+
+static bool nsbk_append_uint_text(char *output, uint32_t capacity,
+                                  uint32_t *used, uint32_t value) {
+    char digits[11];
+    uint32_t count = 0U;
+    if (value == 0U) digits[count++] = '0';
+    while (value && count < sizeof(digits)) {
+        digits[count++] = (char)('0' + value % 10U);
+        value /= 10U;
+    }
+    while (count) {
+        if (*used + 1U >= capacity) return false;
+        output[(*used)++] = digits[--count];
+    }
+    output[*used] = '\0';
+    return true;
+}
+
+static bool nsbk_request_append(char *request, uint32_t capacity,
+                                uint32_t *used, const char *text) {
+    while (text && *text) {
+        if (*used + 1U >= capacity) return false;
+        request[(*used)++] = *text++;
+    }
+    request[*used] = '\0';
+    return true;
+}
+
+static void nsbk_css_log(const char *event, const char *url,
+                         uint32_t status, uint32_t bytes) {
+    char line[640];
+    uint32_t used = 0U;
+    line[0] = '\0';
+    (void)nsbk_request_append(line, sizeof(line), &used, "[NETSURF][CSS] ");
+    (void)nsbk_request_append(line, sizeof(line), &used,
+                              event && event[0] ? event : "evento");
+    if (status) {
+        (void)nsbk_request_append(line, sizeof(line), &used, " HTTP=");
+        (void)nsbk_append_uint_text(line, sizeof(line), &used, status);
+    }
+    if (bytes) {
+        (void)nsbk_request_append(line, sizeof(line), &used, " bytes=");
+        (void)nsbk_append_uint_text(line, sizeof(line), &used, bytes);
+    }
+    if (url && url[0]) {
+        (void)nsbk_request_append(line, sizeof(line), &used, " url=");
+        (void)nsbk_request_append(line, sizeof(line), &used, url);
+    }
+    bk_sys_log(line);
+}
+
+static bool nsbk_build_request(nsbk_document_t *document, const char *url,
+                               const char *method, const char *body,
+                               uint32_t body_length, char *request,
+                               uint32_t capacity, uint32_t *request_length) {
+    char authority[128], host[NSBK_COOKIE_DOMAIN_MAX], path[NSBK_URL_MAX];
+    bool secure;
+    uint32_t used = 0U, i;
+    bool have_cookie = false;
+    bool send_body_headers;
+    if (!request || !request_length ||
+        !nsbk_url_parts(url, authority, sizeof(authority), host, sizeof(host),
+                        path, sizeof(path), &secure)) return false;
+    if (!method || !method[0]) method = "GET";
+    send_body_headers = body != NULL || nsbk_equal_nocase(method, "POST");
+    request[0] = '\0';
+    if (!nsbk_request_append(request, capacity, &used, method) ||
+        !nsbk_request_append(request, capacity, &used, " ") ||
+        !nsbk_request_append(request, capacity, &used, path) ||
+        !nsbk_request_append(request, capacity, &used,
+            " HTTP/1.1\r\nHost: ") ||
+        !nsbk_request_append(request, capacity, &used, authority) ||
+        !nsbk_request_append(request, capacity, &used,
+            "\r\nUser-Agent: NetSurf/3.11 (BlesKernOS 0.8)\r\n"
+            "Accept: text/html,application/xhtml+xml,text/css,image/png,image/jpeg,image/gif,image/bmp,*/*;q=0.2\r\n"
+            "Accept-Encoding: gzip, identity\r\n")) return false;
+    for (i = 0U; document && document->allow_cookies &&
+         i < document->cookie_count; i++) {
+        nsbk_cookie_t *cookie = &document->cookies[i];
+        if ((cookie->secure && !secure) ||
+            !nsbk_domain_matches(host, cookie->domain, cookie->host_only) ||
+            !nsbk_path_matches(path, cookie->path)) continue;
+        if (!have_cookie) {
+            if (!nsbk_request_append(request, capacity, &used, "Cookie: "))
+                return false;
+            have_cookie = true;
+        } else if (!nsbk_request_append(request, capacity, &used, "; "))
+            return false;
+        if (!nsbk_request_append(request, capacity, &used, cookie->name) ||
+            !nsbk_request_append(request, capacity, &used, "=") ||
+            !nsbk_request_append(request, capacity, &used, cookie->value))
+            return false;
+    }
+    if (have_cookie &&
+        !nsbk_request_append(request, capacity, &used, "\r\n")) return false;
+    if (send_body_headers) {
+        if (!nsbk_request_append(request, capacity, &used,
+                "Content-Type: application/x-www-form-urlencoded\r\n"
+                "Content-Length: ") ||
+            !nsbk_append_uint_text(request, capacity, &used, body_length) ||
+            !nsbk_request_append(request, capacity, &used, "\r\n"))
+            return false;
+    }
+    if (!nsbk_request_append(request, capacity, &used,
+            "Connection: close\r\n\r\n")) return false;
+    if (body_length) {
+        if (!body || body_length > capacity - used - 1U) return false;
+        memcpy(request + used, body, body_length);
+        used += body_length;
+        request[used] = '\0';
+    }
+    *request_length = used;
+    return true;
+}
+
+static uint32_t nsbk_body_offset(const char *data, uint32_t length) {
+    uint32_t i;
+    if (!data) return 0U;
+    for (i = 0U; i + 3U < length; i++) {
+        if (data[i] == '\r' && data[i + 1U] == '\n' &&
+            data[i + 2U] == '\r' && data[i + 3U] == '\n') return i + 4U;
+    }
+    for (i = 0U; i + 1U < length; i++)
+        if (data[i] == '\n' && data[i + 1U] == '\n') return i + 2U;
+    return 0U;
+}
+
+static int nsbk_http_status(const char *data, uint32_t length) {
+    uint32_t i;
+    if (!data || length < 12U || !nsbk_prefix(data, "HTTP/")) return 200;
+    for (i = 0U; i + 3U < length && i < 24U; i++) {
+        if (data[i] == ' ' && data[i + 1U] >= '0' && data[i + 1U] <= '9' &&
+            data[i + 2U] >= '0' && data[i + 2U] <= '9' &&
+            data[i + 3U] >= '0' && data[i + 3U] <= '9')
+            return (data[i + 1U] - '0') * 100 +
+                   (data[i + 2U] - '0') * 10 + (data[i + 3U] - '0');
+    }
+    return 0;
+}
+
+static bool nsbk_header_value(const char *data, uint32_t header_length,
+                              const char *name, char *value,
+                              uint32_t capacity) {
+    uint32_t position = 0U;
+    if (!data || !name || !value || capacity == 0U) return false;
+    value[0] = '\0';
+    while (position < header_length && data[position] != '\n') position++;
+    if (position < header_length) position++;
+    while (position < header_length) {
+        uint32_t line_start = position;
+        uint32_t line_end;
+        uint32_t colon;
+        while (position < header_length && data[position] != '\n') position++;
+        line_end = position;
+        if (position < header_length) position++;
+        while (line_end > line_start && (data[line_end - 1U] == '\r' ||
+               data[line_end - 1U] == ' ' || data[line_end - 1U] == '\t'))
+            line_end--;
+        if (line_end == line_start) break;
+        colon = line_start;
+        while (colon < line_end && data[colon] != ':') colon++;
+        if (colon == line_end ||
+            !nsbk_equal_range(data + line_start, colon - line_start, name))
+            continue;
+        colon++;
+        while (colon < line_end && (data[colon] == ' ' || data[colon] == '\t'))
+            colon++;
+        nsbk_copy_range(value, capacity, data + colon, line_end - colon);
+        return true;
+    }
+    return false;
+}
+
+static uint32_t nsbk_parse_decimal(const char *text) {
+    uint32_t value = 0U;
+    if (!text) return 0U;
+    while (*text == ' ' || *text == '\t') text++;
+    while (*text >= '0' && *text <= '9') {
+        if (value > 0xFFFFFFFFU / 10U) return 0xFFFFFFFFU;
+        value = value * 10U + (uint32_t)(*text++ - '0');
+    }
+    return value;
+}
+
+static void nsbk_content_charset(const char *content_type, char charset[32]) {
+    uint32_t i;
+    nsbk_copy(charset, 32U, "UTF-8");
+    if (!content_type) return;
+    for (i = 0U; content_type[i]; i++) {
+        if (nsbk_lower(content_type[i]) == 'c' &&
+            nsbk_prefix(content_type + i, "charset=")) {
+            uint32_t start = i + 8U;
+            uint32_t used = 0U;
+            if (content_type[start] == '"' || content_type[start] == '\'')
+                start++;
+            while (content_type[start] && used + 1U < 32U) {
+                char character = content_type[start++];
+                if (character == ';' || character == '"' || character == '\'' ||
+                    character == ' ' || character == '\t') break;
+                charset[used++] = character;
+            }
+            charset[used] = '\0';
+            if (!used) nsbk_copy(charset, 32U, "UTF-8");
+            return;
+        }
+    }
+}
+
+static bool nsbk_hex_digit(char character, uint32_t *value) {
+    if (character >= '0' && character <= '9') *value = character - '0';
+    else if (character >= 'a' && character <= 'f') *value = character - 'a' + 10U;
+    else if (character >= 'A' && character <= 'F') *value = character - 'A' + 10U;
+    else return false;
+    return true;
+}
+
+static bool nsbk_decode_chunked(char *data, uint32_t body_offset,
+                                uint32_t total_length, uint32_t *body_length) {
+    uint32_t read = body_offset;
+    uint32_t write = body_offset;
+    if (!data || !body_length) return false;
+    while (read < total_length) {
+        uint32_t chunk = 0U;
+        bool have_digit = false;
+        while (read < total_length && data[read] != '\r' && data[read] != '\n') {
+            uint32_t digit;
+            if (data[read] == ';') {
+                while (read < total_length && data[read] != '\r' &&
+                       data[read] != '\n') read++;
+                break;
+            }
+            if (data[read] == ' ' || data[read] == '\t') { read++; continue; }
+            if (!nsbk_hex_digit(data[read++], &digit) || chunk > 0x0FFFFFFFU)
+                return false;
+            chunk = (chunk << 4) | digit;
+            have_digit = true;
+        }
+        if (!have_digit) return false;
+        if (read < total_length && data[read] == '\r') read++;
+        if (read < total_length && data[read] == '\n') read++;
+        if (chunk == 0U) {
+            *body_length = write - body_offset;
+            data[write] = '\0';
+            return true;
+        }
+        if (chunk > total_length - read) return false;
+        memmove(data + write, data + read, chunk);
+        write += chunk;
+        read += chunk;
+        if (read < total_length && data[read] == '\r') read++;
+        if (read < total_length && data[read] == '\n') read++;
+    }
+    return false;
+}
+
+static bool nsbk_parse_response(char *data, uint32_t length,
+                                nsbk_fetch_result_t *result) {
+    char transfer[48];
+    char content_length[32];
+    uint32_t body;
+    if (!data || !result || !length) return false;
+    result->status = nsbk_http_status(data, length);
+    body = nsbk_body_offset(data, length);
+    if (!body && nsbk_prefix(data, "HTTP/")) return false;
+    result->body_offset = body;
+    result->body_length = length - body;
+    result->total_length = length;
+    result->chunked = false;
+    result->location[0] = '\0';
+    result->content_type[0] = '\0';
+    result->content_encoding[0] = '\0';
+    transfer[0] = '\0';
+    content_length[0] = '\0';
+    if (body) {
+        (void)nsbk_header_value(data, body, "Location", result->location,
+                                sizeof(result->location));
+        (void)nsbk_header_value(data, body, "Content-Type", result->content_type,
+                                sizeof(result->content_type));
+        (void)nsbk_header_value(data, body, "Content-Encoding",
+                                result->content_encoding,
+                                sizeof(result->content_encoding));
+        (void)nsbk_header_value(data, body, "Transfer-Encoding", transfer,
+                                sizeof(transfer));
+        (void)nsbk_header_value(data, body, "Content-Length", content_length,
+                                sizeof(content_length));
+    }
+    nsbk_content_charset(result->content_type, result->charset);
+    if (nsbk_contains_nocase(transfer, "chunked")) {
+        result->chunked = true;
+        if (!nsbk_decode_chunked(data, body, length, &result->body_length))
+            return false;
+    } else if (content_length[0]) {
+        uint32_t declared = nsbk_parse_decimal(content_length);
+        if (declared > 0U && declared < result->body_length)
+            result->body_length = declared;
+    }
+    if (result->body_offset + result->body_length < length)
+        data[result->body_offset + result->body_length] = '\0';
+    return true;
+}
+
+static bool nsbk_redirect_status(int status) {
+    return status == 301 || status == 302 || status == 303 ||
+           status == 307 || status == 308;
+}
+
+static bool nsbk_fetch_follow(nsbk_document_t *document, char *buffer,
+                              uint32_t capacity, char *decode_buffer,
+                              uint32_t decode_capacity, const char *url,
+                              const char *method, const char *body,
+                              uint32_t body_length, uint32_t timeout_ms,
+                              nsbk_fetch_result_t *result) {
+    char current[NSBK_URL_MAX];
+    char active_method[8];
+    const char *active_body = body;
+    uint32_t active_body_length = body_length;
+    uint8_t redirect;
+    if (!buffer || capacity < 2U || !url || !result) return false;
+    memset(result, 0, sizeof(*result));
+    nsbk_url_normalize(current, sizeof(current), url);
+    nsbk_copy(active_method, sizeof(active_method),
+              method && method[0] ? method : "GET");
+    if (!current[0]) return false;
+    for (redirect = 0U; redirect <= NSBK_REDIRECT_MAX; redirect++) {
+        char request[8192];
+        uint32_t request_length = 0U;
+        int32_t received;
+        memset(result, 0, sizeof(*result));
+        result->secure = nsbk_prefix(current, "https://");
+        if (!nsbk_build_request(document, current, active_method, active_body,
+                                active_body_length, request, sizeof(request),
+                                &request_length))
+            return false;
+        received = bk_net_http_exchange(current, request, request_length,
+                                        buffer, capacity - 1U, timeout_ms);
+        if (received <= 0) {
+            result->tls_error = result->secure ? bk_net_tls_last_error() : 0;
+            nsbk_copy(result->final_url, sizeof(result->final_url), current);
+            return false;
+        }
+        result->truncated = (uint32_t)received == capacity - 1U;
+        buffer[received] = '\0';
+        if (!nsbk_parse_response(buffer, (uint32_t)received, result))
+            return false;
+        result->secure = nsbk_prefix(current, "https://");
+        result->redirects = redirect;
+        nsbk_copy(result->final_url, sizeof(result->final_url), current);
+        if (document && result->body_offset)
+            nsbk_collect_set_cookies(document, current, buffer,
+                                     result->body_offset);
+        if (result->content_encoding[0] &&
+            nsbk_contains_nocase(result->content_encoding, "gzip")) {
+            int32_t decoded;
+            if (!decode_buffer || !decode_capacity) return false;
+            decoded = bk_data_inflate_gzip(buffer + result->body_offset,
+                                           result->body_length,
+                                           decode_buffer, decode_capacity);
+            if (decoded < 0 ||
+                (uint32_t)decoded > capacity - result->body_offset - 1U)
+                return false;
+            memcpy(buffer + result->body_offset, decode_buffer,
+                   (uint32_t)decoded);
+            result->body_length = (uint32_t)decoded;
+            result->total_length = result->body_offset + result->body_length;
+            buffer[result->total_length] = '\0';
+            result->gzip = true;
+            result->content_encoding[0] = '\0';
+        } else if (result->content_encoding[0] &&
+                   !nsbk_contains_nocase(result->content_encoding,
+                                         "identity")) {
+            return false;
+        }
+        if (!nsbk_redirect_status(result->status) || !result->location[0])
+            return true;
+        if (redirect == NSBK_REDIRECT_MAX) return false;
+        nsbk_url_resolve(current, sizeof(current), current, result->location);
+        if (!current[0]) return false;
+        if (result->status == 303 ||
+            ((result->status == 301 || result->status == 302) &&
+             !nsbk_prefix(active_method, "GET"))) {
+            nsbk_copy(active_method, sizeof(active_method), "GET");
+            active_body = NULL;
+            active_body_length = 0U;
+        }
+    }
+    return false;
+}
+
+static void nsbk_report_progress(nsbk_document_t *document,
+                                 uint8_t percent, const char *phase) {
+    if (!document || !document->progress_callback) return;
+    if (percent > 100U) percent = 100U;
+    document->progress_callback(document->progress_context, percent, phase);
+}
+
+static uint32_t nsbk_fallback_text(const char *input, uint32_t length,
+                                   char *output, uint32_t capacity) {
+    uint32_t input_index = 0U;
+    uint32_t used = 0U;
+    bool in_tag = false;
+    bool pending_space = false;
+    if (!output || capacity == 0U) return 0U;
+    while (input_index < length && used + 1U < capacity) {
+        char character = input[input_index++];
+        if (character == '<') {
+            in_tag = true;
+            if (used > 0U && output[used - 1U] != '\n') output[used++] = '\n';
+            continue;
+        }
+        if (in_tag) { if (character == '>') in_tag = false; continue; }
+        if (character == '\r' || character == '\n' || character == '\t' ||
+            character == ' ') { pending_space = true; continue; }
+        if (pending_space && used > 0U && output[used - 1U] != '\n' &&
+            used + 1U < capacity) output[used++] = ' ';
+        pending_space = false;
+        output[used++] = character;
+    }
+    while (used > 0U && (output[used - 1U] == ' ' ||
+                         output[used - 1U] == '\n')) used--;
+    output[used] = '\0';
+    return used;
+}
+
+static void nsbk_clear_resources(nsbk_document_t *document) {
+    uint32_t i;
+    if (!document) return;
+    for (i = 0U; i < document->stylesheet_count; i++) {
+        if (document->stylesheets[i].data)
+            bk_sys_free(document->stylesheets[i].data);
+        memset(&document->stylesheets[i], 0, sizeof(document->stylesheets[i]));
+    }
+    for (i = 0U; i < document->image_count; i++) {
+        bk_gui_image_free(&document->images[i].image);
+        memset(&document->images[i], 0, sizeof(document->images[i]));
+    }
+    document->stylesheet_count = 0U;
+    document->stylesheet_discovered_count = 0U;
+    document->stylesheet_failure_count = 0U;
+    document->stylesheet_truncated_count = 0U;
+    document->stylesheet_rejected_count = 0U;
+    document->image_count = 0U;
+    document->image_failures = 0U;
+}
+
+bool nsbk_document_init(nsbk_document_t *document) {
+    if (!document) return false;
+    memset(document, 0, sizeof(*document));
+    document->network_data = (char *)bk_sys_alloc(NSBK_NETWORK_BUFFER_SIZE);
+    document->resource_data = (char *)bk_sys_alloc(NSBK_RESOURCE_BUFFER_SIZE);
+    document->decode_data = (char *)bk_sys_alloc(NSBK_DECODE_BUFFER_SIZE);
+    document->text_data = (char *)bk_sys_alloc(NSBK_TEXT_BUFFER_SIZE);
+    document->workspace = bk_sys_alloc(sizeof(nsbk_workspace_t));
+    if (!document->network_data || !document->resource_data ||
+        !document->decode_data || !document->text_data || !document->workspace ||
+        !nsbk_layout_init(&document->layout)) {
+        nsbk_document_destroy(document);
+        return false;
+    }
+    memset(document->workspace, 0, sizeof(nsbk_workspace_t));
+    document->network_data[0] = '\0';
+    document->resource_data[0] = '\0';
+    document->decode_data[0] = '\0';
+    document->text_data[0] = '\0';
+    document->allow_stylesheets = true;
+    document->allow_images = true;
+    document->allow_cookies = true;
+    return true;
+}
+
+void nsbk_document_set_progress(nsbk_document_t *document,
+                                nsbk_progress_callback_t callback,
+                                void *context) {
+    if (!document) return;
+    document->progress_callback = callback;
+    document->progress_context = context;
+}
+
+void nsbk_document_set_cancel_flag(nsbk_document_t *document,
+                                   volatile bool *cancel_flag) {
+    if (!document) return;
+    document->cancel_flag = cancel_flag;
+}
+
+void nsbk_document_set_preferences(nsbk_document_t *document,
+                                   bool stylesheets, bool images,
+                                   bool cookies) {
+    if (!document) return;
+    document->allow_stylesheets = stylesheets;
+    document->allow_images = images;
+    document->allow_cookies = cookies;
+    if (!cookies) document->cookie_count = 0U;
+}
+
+void nsbk_document_destroy(nsbk_document_t *document) {
+    if (!document) return;
+    nsbk_clear_resources(document);
+    if (document->network_data) bk_sys_free(document->network_data);
+    if (document->resource_data) bk_sys_free(document->resource_data);
+    if (document->decode_data) bk_sys_free(document->decode_data);
+    if (document->text_data) bk_sys_free(document->text_data);
+    if (document->workspace) bk_sys_free(document->workspace);
+    nsbk_layout_destroy(&document->layout);
+    document->network_data = NULL;
+    document->resource_data = NULL;
+    document->decode_data = NULL;
+    document->text_data = NULL;
+    document->workspace = NULL;
+}
+
+static bool nsbk_probe_image(const uint8_t *data, uint32_t length,
+                             uint32_t *width, uint32_t *height) {
+    if (!data || !width || !height) return false;
+    if (length >= 24U && data[0] == 137U && data[1] == 'P' &&
+        data[2] == 'N' && data[3] == 'G' && data[4] == 13U &&
+        data[5] == 10U && data[6] == 26U && data[7] == 10U) {
+        *width = ((uint32_t)data[16] << 24) | ((uint32_t)data[17] << 16) |
+                 ((uint32_t)data[18] << 8) | data[19];
+        *height = ((uint32_t)data[20] << 24) | ((uint32_t)data[21] << 16) |
+                  ((uint32_t)data[22] << 8) | data[23];
+        return *width > 0U && *height > 0U;
+    }
+    if (length >= 10U && data[0] == 'G' && data[1] == 'I' && data[2] == 'F') {
+        *width = (uint32_t)data[6] | ((uint32_t)data[7] << 8);
+        *height = (uint32_t)data[8] | ((uint32_t)data[9] << 8);
+        return *width > 0U && *height > 0U;
+    }
+    if (length >= 26U && data[0] == 'B' && data[1] == 'M') {
+        int32_t w = (int32_t)((uint32_t)data[18] | ((uint32_t)data[19] << 8) |
+            ((uint32_t)data[20] << 16) | ((uint32_t)data[21] << 24));
+        int32_t h = (int32_t)((uint32_t)data[22] | ((uint32_t)data[23] << 8) |
+            ((uint32_t)data[24] << 16) | ((uint32_t)data[25] << 24));
+        if (w <= 0 || h == 0 || h == (int32_t)0x80000000U) return false;
+        *width = (uint32_t)w;
+        *height = (uint32_t)(h < 0 ? -h : h);
+        return true;
+    }
+    if (length >= 4U && data[0] == 0xffU && data[1] == 0xd8U) {
+        uint32_t pos = 2U;
+        while (pos + 4U <= length) {
+            uint8_t marker;
+            uint32_t segment;
+            while (pos < length && data[pos] != 0xffU) pos++;
+            while (pos < length && data[pos] == 0xffU) pos++;
+            if (pos >= length) break;
+            marker = data[pos++];
+            if (marker == 0xd8U || marker == 0xd9U ||
+                (marker >= 0xd0U && marker <= 0xd7U)) continue;
+            if (pos + 2U > length) break;
+            segment = ((uint32_t)data[pos] << 8) | data[pos + 1U];
+            if (segment < 2U || pos + segment > length) break;
+            if ((marker >= 0xc0U && marker <= 0xc3U) ||
+                (marker >= 0xc5U && marker <= 0xc7U) ||
+                (marker >= 0xc9U && marker <= 0xcbU) ||
+                (marker >= 0xcdU && marker <= 0xcfU)) {
+                if (segment < 7U) break;
+                *height = ((uint32_t)data[pos + 3U] << 8) | data[pos + 4U];
+                *width = ((uint32_t)data[pos + 5U] << 8) | data[pos + 6U];
+                return *width > 0U && *height > 0U;
+            }
+            pos += segment;
+        }
+    }
+    return false;
+}
+
+static bool nsbk_decode_image(bk_gui_image_t *image, const uint8_t *data,
+                              uint32_t length) {
+    uint32_t width, height;
+    if (!image || !nsbk_probe_image(data, length, &width, &height) ||
+        width > 1024U || height > 768U ||
+        width > NSBK_IMAGE_PIXELS_MAX / height) return false;
+    memset(image, 0, sizeof(*image));
+    if (length >= 8U && data[0] == 137U && data[1] == 'P' &&
+        data[2] == 'N' && data[3] == 'G')
+        return bk_gui_image_decode_png(image, data, length);
+    if (length >= 3U && data[0] == 'G' && data[1] == 'I' && data[2] == 'F')
+        return bk_gui_image_decode_gif(image, data, length);
+    if (length >= 2U && data[0] == 'B' && data[1] == 'M')
+        return bk_gui_image_decode_bmp(image, data, length);
+    if (length >= 2U && data[0] == 0xffU && data[1] == 0xd8U)
+        return bk_gui_image_decode_jpeg(image, data, length);
+    return false;
+}
+
+static bool nsbk_content_is_image(const nsbk_fetch_result_t *response,
+                                  const uint8_t *body, uint32_t length) {
+    uint32_t width, height;
+    if (response && nsbk_prefix(response->content_type, "image/")) return true;
+    return nsbk_probe_image(body, length, &width, &height);
+}
+
+static void nsbk_make_base_url(nsbk_document_t *document,
+                               const nsbk_html_result_t *parsed) {
+    if (parsed && parsed->base_href[0])
+        nsbk_url_resolve(document->base_url, sizeof(document->base_url),
+                         document->final_url, parsed->base_href);
+    else
+        nsbk_copy(document->base_url, sizeof(document->base_url),
+                  document->final_url);
+}
+
+static bool nsbk_stylesheet_url_loaded(const nsbk_document_t *document,
+                                      const char *url) {
+    uint32_t i;
+    if (!document || !url) return false;
+    for (i = 0U; i < document->stylesheet_count; i++)
+        if (strcmp(document->stylesheets[i].url, url) == 0) return true;
+    return false;
+}
+
+static bool nsbk_css_body_is_html(const uint8_t *body, uint32_t length) {
+    uint32_t i = 0U;
+    if (!body) return false;
+    if (length >= 3U && body[0] == 0xefU && body[1] == 0xbbU &&
+        body[2] == 0xbfU) i = 3U;
+    while (i < length && (body[i] == ' ' || body[i] == '\t' ||
+           body[i] == '\r' || body[i] == '\n')) i++;
+    if (i >= length || body[i] != '<') return false;
+    return (i + 5U < length && nsbk_prefix((const char *)body + i, "<html")) ||
+           (i + 9U < length &&
+            nsbk_prefix((const char *)body + i, "<!doctype"));
+}
+
+static bool nsbk_css_response_acceptable(const nsbk_fetch_result_t *response,
+                                         const uint8_t *body,
+                                         uint32_t length) {
+    if (!response || !body || !length) return false;
+    if (nsbk_css_body_is_html(body, length)) return false;
+    if (!response->content_type[0]) return true;
+    if (nsbk_contains_nocase(response->content_type, "text/css") ||
+        nsbk_contains_nocase(response->content_type, "application/css") ||
+        nsbk_contains_nocase(response->content_type, "text/plain") ||
+        nsbk_contains_nocase(response->content_type,
+                             "application/octet-stream")) return true;
+    /* NetSurf sniffs CSS when a server uses an old or generic MIME type. */
+    return !nsbk_contains_nocase(response->content_type, "text/html") &&
+           !nsbk_prefix(response->content_type, "image/");
+}
+
+static bool nsbk_load_one_stylesheet(nsbk_document_t *document,
+                                     const char *reference, const char *base,
+                                     const char *media, uint32_t timeout_ms,
+                                     bool imported) {
+    nsbk_fetch_result_t response;
+    nsbk_loaded_css_t *sheet;
+    const uint8_t *body;
+    uint32_t body_length;
+    uint8_t *copy;
+    char absolute[NSBK_URL_MAX];
+    if (!document || !reference || !reference[0] ||
+        document->stylesheet_count >= NSBK_CSS_RESOURCE_MAX) return false;
+    nsbk_url_resolve(absolute, sizeof(absolute), base, reference);
+    if (!absolute[0]) {
+        document->stylesheet_failure_count++;
+        nsbk_css_log("URL invalida", reference, 0U, 0U);
+        return false;
+    }
+    if (nsbk_stylesheet_url_loaded(document, absolute)) return true;
+    nsbk_css_log(imported ? "import solicitado" : "hoja solicitada",
+                 absolute, 0U, 0U);
+    if (!nsbk_fetch_follow(document, document->resource_data,
+            NSBK_RESOURCE_BUFFER_SIZE, document->decode_data,
+            NSBK_DECODE_BUFFER_SIZE, absolute, "GET", NULL, 0U,
+            timeout_ms, &response)) {
+        document->stylesheet_failure_count++;
+        nsbk_css_log("fallo de red", absolute, 0U, 0U);
+        return false;
+    }
+    /* NETSURF_CSS_HTTP200_BODY_FIX_V2
+     * Recupera el cuerpo cuando llegaron bytes tras las cabeceras, pero
+     * body_length quedó en cero por una cabecera Content-Length incorrecta.
+     */
+    if (response.status >= 200 && response.status < 400 &&
+        response.body_length == 0U &&
+        response.total_length > response.body_offset) {
+        response.body_length =
+            response.total_length - response.body_offset;
+        nsbk_css_log("longitud CSS recuperada", response.final_url,
+                     (uint32_t)response.status, response.body_length);
+    }
+
+    if (response.truncated) {
+        document->stylesheet_truncated_count++;
+        document->stylesheet_failure_count++;
+        nsbk_css_log("respuesta truncada", response.final_url,
+                     (uint32_t)response.status, response.body_length);
+        return false;
+    }
+    /* NETSURF_CSS_ACCEPT_2XX_FIX
+     *
+     * NetSurf upstream entrega al manejador de contenido cualquier respuesta
+     * HTTP 2xx que tenga datos. No mezclamos aquí flags internos del transporte
+     * con la validez del CSS: redirecciones ya fueron resueltas por el fetcher,
+     * y MIME/compresión se comprueban en las etapas siguientes.
+     */
+    if (response.body_length == 0U &&
+        response.total_length > response.body_offset) {
+        response.body_length =
+            response.total_length - response.body_offset;
+    }
+
+    nsbk_css_log("respuesta CSS recibida", response.final_url,
+                 (uint32_t)response.status, response.body_length);
+
+    if (response.status < 200 || response.status >= 300 ||
+        response.body_length == 0U) {
+        document->stylesheet_failure_count++;
+        nsbk_css_log("HTTP rechazado", response.final_url,
+                     (uint32_t)response.status, response.body_length);
+        return false;
+    }
+    if (response.body_length > NSBK_CSS_BYTES_MAX) {
+        document->stylesheet_rejected_count++;
+        document->stylesheet_failure_count++;
+        nsbk_css_log("hoja demasiado grande", response.final_url,
+                     (uint32_t)response.status, response.body_length);
+        return false;
+    }
+    body = (const uint8_t *)document->resource_data + response.body_offset;
+    body_length = response.body_length;
+    if (!nsbk_css_response_acceptable(&response, body, body_length)) {
+        document->stylesheet_rejected_count++;
+        document->stylesheet_failure_count++;
+        nsbk_css_log("contenido no CSS", response.final_url,
+                     (uint32_t)response.status, body_length);
+        return false;
+    }
+    if (body_length >= 3U && body[0] == 0xefU && body[1] == 0xbbU &&
+        body[2] == 0xbfU) {
+        body += 3U;
+        body_length -= 3U;
+    }
+    copy = (uint8_t *)bk_sys_alloc(body_length + 1U);
+    if (!copy) {
+        document->stylesheet_failure_count++;
+        nsbk_css_log("sin memoria", response.final_url,
+                     (uint32_t)response.status, body_length);
+        return false;
+    }
+    memcpy(copy, body, body_length);
+    copy[body_length] = '\0';
+    sheet = &document->stylesheets[document->stylesheet_count++];
+    memset(sheet, 0, sizeof(*sheet));
+    nsbk_copy(sheet->reference, sizeof(sheet->reference), reference);
+    nsbk_copy(sheet->url, sizeof(sheet->url), response.final_url);
+    nsbk_copy(sheet->media, sizeof(sheet->media),
+              media && media[0] ? media : "all");
+    sheet->data = copy;
+    sheet->length = body_length;
+    sheet->http_status = (uint16_t)response.status;
+    sheet->imported = imported;
+    sheet->gzip = response.gzip;
+    nsbk_css_log(imported ? "import cargado" : "hoja cargada",
+                 sheet->url, (uint32_t)sheet->http_status, sheet->length);
+    return true;
+}
+
+static void nsbk_scan_css_imports(nsbk_document_t *document,
+                                  const nsbk_loaded_css_t *source,
+                                  uint32_t timeout_ms) {
+    uint32_t i = 0U;
+    const uint8_t *data;
+    uint32_t length;
+    if (!document || !source || !source->data) return;
+    data = source->data; length = source->length;
+    while (i + 7U < length && document->stylesheet_count < NSBK_CSS_RESOURCE_MAX) {
+        uint32_t start, end;
+        char quote = 0;
+        char reference[NSBK_URL_MAX];
+        if (data[i] != '@' || nsbk_lower((char)data[i+1U]) != 'i' ||
+            nsbk_lower((char)data[i+2U]) != 'm' ||
+            nsbk_lower((char)data[i+3U]) != 'p' ||
+            nsbk_lower((char)data[i+4U]) != 'o' ||
+            nsbk_lower((char)data[i+5U]) != 'r' ||
+            nsbk_lower((char)data[i+6U]) != 't') { i++; continue; }
+        i += 7U;
+        while (i < length && (data[i] == ' ' || data[i] == '\t' ||
+               data[i] == '\r' || data[i] == '\n')) i++;
+        if (i + 4U < length && nsbk_lower((char)data[i]) == 'u' &&
+            nsbk_lower((char)data[i+1U]) == 'r' &&
+            nsbk_lower((char)data[i+2U]) == 'l') {
+            i += 3U;
+            while (i < length && data[i] != '(') i++;
+            if (i < length) i++;
+            while (i < length && (data[i] == ' ' || data[i] == '\t')) i++;
+        }
+        if (i < length && (data[i] == '\'' || data[i] == '"')) quote=(char)data[i++];
+        start=i;
+        while (i < length && ((quote && data[i] != (uint8_t)quote) ||
+              (!quote && data[i] != ')' && data[i] != ';' && data[i] != ' ' &&
+               data[i] != '\t' && data[i] != '\r' && data[i] != '\n'))) i++;
+        end=i;
+        nsbk_copy_range(reference,sizeof(reference),(const char *)data+start,end-start);
+        while (i < length && data[i] != ';') i++;
+        if (i < length) i++;
+        if (reference[0]) {
+            document->stylesheet_discovered_count++;
+            nsbk_load_one_stylesheet(document, reference, source->url,
+                                     "all", timeout_ms, true);
+        }
+    }
+}
+
+static void nsbk_load_stylesheets(nsbk_document_t *document,
+                                  const nsbk_html_result_t *discovery,
+                                  uint32_t timeout_ms) {
+    uint32_t i;
+    if (!document || !document->allow_stylesheets) return;
+    for (i = 0U; i < discovery->stylesheet_ref_count &&
+         document->stylesheet_count < NSBK_CSS_RESOURCE_MAX; i++) {
+        nsbk_report_progress(document,
+            (uint8_t)(54U + (discovery->stylesheet_ref_count ?
+             (i * 11U) / discovery->stylesheet_ref_count : 0U)),
+            "@HEDF6CF4C");
+        document->stylesheet_discovered_count++;
+        nsbk_load_one_stylesheet(document, discovery->stylesheet_refs[i].href,
+                                 document->base_url,
+                                 discovery->stylesheet_refs[i].media,
+                                 timeout_ms, false);
+    }
+    for (i = 0U; i < document->stylesheet_count &&
+         document->stylesheet_count < NSBK_CSS_RESOURCE_MAX; i++)
+        nsbk_scan_css_imports(document, &document->stylesheets[i], timeout_ms);
+}
+
+static int32_t nsbk_base64_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static uint32_t nsbk_decode_data_image(const char *uri, uint8_t *output,
+                                       uint32_t capacity) {
+    const char *comma;
+    const char *cursor;
+    uint32_t used = 0U;
+    uint32_t accumulator = 0U;
+    uint32_t bits = 0U;
+    if (!uri || !output || !capacity || !nsbk_prefix(uri, "data:image/"))
+        return 0U;
+    comma = uri;
+    while (*comma && *comma != ',') comma++;
+    if (*comma != ',' || !nsbk_contains_nocase(uri, ";base64")) return 0U;
+    cursor = comma + 1;
+    while (*cursor) {
+        int32_t value;
+        if (*cursor == '=') break;
+        value = nsbk_base64_value(*cursor++);
+        if (value < 0) continue;
+        accumulator = (accumulator << 6U) | (uint32_t)value;
+        bits += 6U;
+        if (bits >= 8U) {
+            bits -= 8U;
+            if (used >= capacity) return 0U;
+            output[used++] = (uint8_t)((accumulator >> bits) & 0xffU);
+        }
+    }
+    return used;
+}
+
+static bool nsbk_image_url_loaded(const nsbk_document_t *document,
+                                  const char *url) {
+    uint32_t i;
+    if (!document || !url) return false;
+    for (i = 0U; i < document->image_count; i++)
+        if (strcmp(document->images[i].url, url) == 0) return true;
+    return false;
+}
+
+static bool nsbk_load_one_image(nsbk_document_t *document,
+                                const char *reference, const char *base,
+                                uint32_t timeout_ms, uint32_t *total_pixels,
+                                bool count_failure) {
+    nsbk_fetch_result_t response;
+    nsbk_loaded_image_t loaded;
+    char absolute[NSBK_URL_MAX];
+    uint32_t pixels;
+    if (!document || !reference || !reference[0] ||
+        document->image_count >= NSBK_IMAGE_RESOURCE_MAX) return false;
+    if (reference[0] == '#') return false;
+    if (nsbk_prefix(reference, "data:image/")) {
+        uint32_t decoded = nsbk_decode_data_image(reference,
+            (uint8_t *)document->resource_data, NSBK_RESOURCE_BUFFER_SIZE);
+        memset(&loaded, 0, sizeof(loaded));
+        if (!decoded || !nsbk_decode_image(&loaded.image,
+                (const uint8_t *)document->resource_data, decoded)) {
+            if (count_failure) document->image_failures++;
+            return false;
+        }
+        pixels = (uint32_t)loaded.image.width * loaded.image.height;
+        if (!total_pixels || pixels > NSBK_IMAGE_PIXELS_TOTAL - *total_pixels) {
+            bk_gui_image_free(&loaded.image);
+            if (count_failure) document->image_failures++;
+            return false;
+        }
+        *total_pixels += pixels;
+        nsbk_copy(loaded.reference, sizeof(loaded.reference), reference);
+        nsbk_copy(loaded.url, sizeof(loaded.url), reference);
+        document->images[document->image_count++] = loaded;
+        return true;
+    }
+    if (nsbk_prefix(reference, "data:")) return false;
+    nsbk_url_resolve(absolute, sizeof(absolute), base, reference);
+    if (!absolute[0]) return false;
+    if (nsbk_image_url_loaded(document, absolute)) return true;
+    memset(&loaded, 0, sizeof(loaded));
+    if (!nsbk_fetch_follow(document, document->resource_data,
+            NSBK_RESOURCE_BUFFER_SIZE, document->decode_data,
+            NSBK_DECODE_BUFFER_SIZE, absolute, "GET", NULL, 0U,
+            timeout_ms, &response) || response.status < 200 ||
+        response.status >= 400 || !nsbk_decode_image(&loaded.image,
+            (const uint8_t *)document->resource_data + response.body_offset,
+            response.body_length)) {
+        if (count_failure) document->image_failures++;
+        return false;
+    }
+    pixels = (uint32_t)loaded.image.width * loaded.image.height;
+    if (!total_pixels || pixels > NSBK_IMAGE_PIXELS_TOTAL - *total_pixels) {
+        bk_gui_image_free(&loaded.image);
+        if (count_failure) document->image_failures++;
+        return false;
+    }
+    *total_pixels += pixels;
+    nsbk_copy(loaded.reference, sizeof(loaded.reference), reference);
+    nsbk_copy(loaded.url, sizeof(loaded.url), response.final_url);
+    document->images[document->image_count++] = loaded;
+    return true;
+}
+
+static void nsbk_scan_css_images(nsbk_document_t *document,
+                                 const uint8_t *data, uint32_t length,
+                                 const char *base, uint32_t timeout_ms,
+                                 uint32_t *total_pixels) {
+    uint32_t i = 0U;
+    if (!document || !data || !base) return;
+    while (i + 4U < length && document->image_count < NSBK_IMAGE_RESOURCE_MAX) {
+        uint32_t start, end;
+        char quote = 0;
+        char reference[NSBK_URL_MAX];
+        if (nsbk_lower((char)data[i]) != 'u' ||
+            nsbk_lower((char)data[i + 1U]) != 'r' ||
+            nsbk_lower((char)data[i + 2U]) != 'l') { i++; continue; }
+        i += 3U;
+        while (i < length && (data[i] == ' ' || data[i] == '\t' ||
+               data[i] == '\r' || data[i] == '\n')) i++;
+        if (i >= length || data[i] != '(') continue;
+        i++;
+        while (i < length && (data[i] == ' ' || data[i] == '\t' ||
+               data[i] == '\r' || data[i] == '\n')) i++;
+        if (i < length && (data[i] == '\'' || data[i] == '"')) quote = (char)data[i++];
+        start = i;
+        while (i < length && ((quote && data[i] != (uint8_t)quote) ||
+               (!quote && data[i] != ')' && data[i] != ' ' && data[i] != '\t' &&
+                data[i] != '\r' && data[i] != '\n'))) i++;
+        end = i;
+        while (end > start && (data[end - 1U] == ' ' || data[end - 1U] == '\t')) end--;
+        nsbk_copy_range(reference, sizeof(reference), (const char *)data + start,
+                        end - start);
+        if (quote && i < length && data[i] == (uint8_t)quote) i++;
+        while (i < length && data[i] != ')') i++;
+        if (i < length) i++;
+        if (reference[0])
+            nsbk_load_one_image(document, reference, base, timeout_ms,
+                                total_pixels, false);
+    }
+}
+
+static void nsbk_load_images(nsbk_document_t *document,
+                             const nsbk_html_result_t *discovery,
+                             uint32_t timeout_ms) {
+    uint32_t i;
+    uint32_t total_pixels = 0U;
+    if (!document || !document->allow_images) return;
+    for (i = 0U; i < discovery->image_ref_count &&
+         document->image_count < NSBK_IMAGE_RESOURCE_MAX; i++) {
+        nsbk_report_progress(document,
+            (uint8_t)(68U + (discovery->image_ref_count ?
+             (i * 12U) / discovery->image_ref_count : 0U)),
+            "@H346F7087");
+        nsbk_load_one_image(document, discovery->image_refs[i].src,
+                            document->base_url, timeout_ms, &total_pixels, true);
+    }
+    for (i = 0U; i < document->stylesheet_count &&
+         document->image_count < NSBK_IMAGE_RESOURCE_MAX; i++)
+        nsbk_scan_css_images(document, document->stylesheets[i].data,
+            document->stylesheets[i].length, document->stylesheets[i].url,
+            timeout_ms, &total_pixels);
+    if (document->body_length && document->image_count < NSBK_IMAGE_RESOURCE_MAX)
+        nsbk_scan_css_images(document,
+            (const uint8_t *)document->network_data + document->body_offset,
+            document->body_length, document->base_url, timeout_ms, &total_pixels);
+}
+
+static bool nsbk_build_direct_image(nsbk_document_t *document,
+                                    const nsbk_fetch_result_t *response,
+                                    int32_t viewport_width) {
+    nsbk_layout_item_t *item;
+    int32_t width, height;
+    nsbk_loaded_image_t *loaded = &document->images[0];
+    memset(loaded, 0, sizeof(*loaded));
+    if (!nsbk_decode_image(&loaded->image,
+            (const uint8_t *)document->network_data + response->body_offset,
+            response->body_length)) return false;
+    nsbk_copy(loaded->reference, sizeof(loaded->reference), document->final_url);
+    nsbk_copy(loaded->url, sizeof(loaded->url), document->final_url);
+    document->image_count = 1U;
+    nsbk_layout_reset(&document->layout);
+    width = loaded->image.width;
+    height = loaded->image.height;
+    if (viewport_width < 160) viewport_width = 640;
+    if (width > viewport_width - 16) {
+        height = height * (viewport_width - 16) / width;
+        width = viewport_width - 16;
+    }
+    if (height > 420) { width = width * 420 / height; height = 420; }
+    item = nsbk_layout_add(&document->layout, NSBK_LAYOUT_IMAGE);
+    if (!item) return false;
+    item->x = 8;
+    item->y = 8;
+    item->width = width > 0 ? width : 1;
+    item->height = height > 0 ? height : 1;
+    item->image_index = 0;
+    document->layout.width = item->width + 16;
+    document->layout.height = item->height + 16;
+    document->layout.valid = true;
+    document->built_dom = false;
+    document->parsed_with_hubbub = false;
+    document->charset[0] = '\0';
+    nsbk_copy(document->title, sizeof(document->title), "Imagen");
+    nsbk_copy(document->text_data, NSBK_TEXT_BUFFER_SIZE, "[imagen]");
+    document->text_length = 8U;
+    return true;
+}
+
+static void nsbk_apply_parse_result(nsbk_document_t *document,
+                                    const nsbk_html_result_t *parsed,
+                                    nsbk_html_control_t *old_controls,
+                                    bool parse_ok) {
+    uint32_t i;
+    document->parsed_with_hubbub = parse_ok;
+    document->parse_errors = parsed->parse_errors;
+    document->node_count = parsed->node_count;
+    document->element_count = parsed->element_count;
+    document->quirks_mode = parsed->quirks_mode;
+    document->built_dom = parsed->built_dom;
+    document->text_length = parsed->text_length;
+    document->truncated = document->truncated || parsed->truncated;
+    nsbk_copy(document->title, sizeof(document->title), parsed->title);
+    nsbk_copy(document->charset, sizeof(document->charset), parsed->charset);
+    document->link_count = parsed->link_count;
+    for (i = 0U; i < parsed->link_count && i < NSBK_HTML_LINK_MAX; i++)
+        document->links[i] = parsed->links[i];
+    document->form_count = parsed->form_count;
+    for (i = 0U; i < parsed->form_count && i < NSBK_HTML_FORM_MAX; i++)
+        document->forms[i] = parsed->forms[i];
+    document->option_count = parsed->option_count;
+    for (i = 0U; i < parsed->option_count && i < NSBK_HTML_OPTION_MAX; i++)
+        document->options[i] = parsed->options[i];
+    {
+        uint32_t old_count = document->control_count;
+        uint32_t j;
+        if (old_count > NSBK_HTML_CONTROL_MAX) old_count = NSBK_HTML_CONTROL_MAX;
+        if (!old_controls) old_count = 0U;
+        for (i = 0U; i < old_count; i++) old_controls[i] = document->controls[i];
+        document->control_count = parsed->control_count;
+        for (i = 0U; i < parsed->control_count && i < NSBK_HTML_CONTROL_MAX; i++) {
+            document->controls[i] = parsed->controls[i];
+            for (j = 0U; j < old_count; j++) {
+                if (old_controls[j].form_index == document->controls[i].form_index &&
+                    old_controls[j].type == document->controls[i].type &&
+                    strcmp(old_controls[j].name, document->controls[i].name) == 0) {
+                    nsbk_copy(document->controls[i].value,
+                              sizeof(document->controls[i].value),
+                              old_controls[j].value);
+                    document->controls[i].checked = old_controls[j].checked;
+                    if (document->controls[i].type == NSBK_CONTROL_SELECT) {
+                        uint32_t selected;
+                        document->controls[i].selected_option =
+                            old_controls[j].selected_option;
+                        if (document->controls[i].selected_option >=
+                            document->controls[i].option_count)
+                            document->controls[i].selected_option = 0U;
+                        selected = document->controls[i].first_option +
+                                   document->controls[i].selected_option;
+                        if (selected < document->option_count) {
+                            nsbk_copy(document->controls[i].label,
+                                      sizeof(document->controls[i].label),
+                                      document->options[selected].label);
+                            nsbk_copy(document->controls[i].value,
+                                      sizeof(document->controls[i].value),
+                                      document->options[selected].value);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+bool nsbk_document_fetch_request(nsbk_document_t *document, const char *url,
+                                 const char *method, const char *body,
+                                 uint32_t body_length, uint32_t timeout_ms,
+                                 int32_t viewport_width) {
+    nsbk_fetch_result_t response;
+    nsbk_workspace_t *workspace;
+    nsbk_html_result_t *parsed;
+    nsbk_css_resource_t *css_resources;
+    nsbk_image_resource_t *image_resources;
+    nsbk_resource_environment_t *environment;
+    bool parse_ok;
+    uint32_t i;
+    if (!document || !document->network_data || !document->resource_data ||
+        !document->decode_data || !document->text_data ||
+        !document->workspace || !url) return false;
+    workspace = (nsbk_workspace_t *)document->workspace;
+    parsed = &workspace->parsed;
+    css_resources = workspace->css_resources;
+    image_resources = workspace->image_resources;
+    environment = &workspace->environment;
+
+    nsbk_report_progress(document, 3U, "@H9079BFFB");
+    nsbk_clear_resources(document);
+    document->network_length = 0U;
+    document->body_offset = 0U;
+    document->body_length = 0U;
+    document->text_length = 0U;
+    document->http_status = 0;
+    document->tls_error = 0;
+    document->redirect_count = 0U;
+    document->secure = false;
+    document->chunked = false;
+    document->content_gzip = false;
+    document->truncated = false;
+    document->parsed_with_hubbub = false;
+    document->parse_errors = 0U;
+    document->node_count = 0U;
+    document->element_count = 0U;
+    document->quirks_mode = 0U;
+    document->built_dom = false;
+    document->title[0] = '\0';
+    document->charset[0] = '\0';
+    document->content_type[0] = '\0';
+    document->final_url[0] = '\0';
+    document->base_url[0] = '\0';
+    document->error[0] = '\0';
+    document->link_count = 0U;
+    document->form_count = 0U;
+    document->control_count = 0U;
+    document->option_count = 0U;
+    document->viewport_width = viewport_width > 160 ? viewport_width : 640;
+    document->network_data[0] = '\0';
+    document->text_data[0] = '\0';
+    nsbk_layout_reset(&document->layout);
+
+    nsbk_report_progress(document, 10U, "@HEA22FAF6");
+    nsbk_report_progress(document, 15U, "@H58C183BA");
+    if (!nsbk_fetch_follow(document, document->network_data,
+                           NSBK_NETWORK_BUFFER_SIZE, document->decode_data,
+                           NSBK_DECODE_BUFFER_SIZE, url, method, body,
+                           body_length, timeout_ms, &response)) {
+        document->tls_error = response.tls_error;
+        nsbk_copy(document->final_url, sizeof(document->final_url),
+                  response.final_url);
+        if (response.secure && response.tls_error) {
+            nsbk_set_error(document,
+                "@H3702385B");
+        } else if (response.content_encoding[0]) {
+            nsbk_set_error(document,
+                "@H6695C9C8");
+        } else {
+            nsbk_set_error(document,
+                "@H3865A6EF");
+        }
+        nsbk_report_progress(document, 100U, "@H5E488EFE");
+        return false;
+    }
+
+    nsbk_report_progress(document, 34U, "@HAD2EF54E");
+    nsbk_report_progress(document, 40U, "@H957B7DD1");
+    document->network_length = response.total_length;
+    document->body_offset = response.body_offset;
+    document->body_length = response.body_length;
+    document->http_status = response.status;
+    document->tls_error = response.tls_error;
+    document->redirect_count = response.redirects;
+    document->secure = response.secure;
+    document->chunked = response.chunked;
+    document->content_gzip = response.gzip;
+    document->truncated = response.truncated;
+    nsbk_copy(document->final_url, sizeof(document->final_url), response.final_url);
+    nsbk_copy(document->base_url, sizeof(document->base_url), response.final_url);
+    nsbk_copy(document->content_type, sizeof(document->content_type),
+              response.content_type);
+    nsbk_copy(document->charset, sizeof(document->charset), response.charset);
+
+    if (nsbk_content_is_image(&response,
+            (const uint8_t *)document->network_data + response.body_offset,
+            response.body_length)) {
+        nsbk_report_progress(document, 72U, "@H03A70568");
+        if (nsbk_build_direct_image(document, &response,
+                                    document->viewport_width)) {
+            nsbk_report_progress(document, 100U, "@H78297B47");
+            return true;
+        }
+        nsbk_set_error(document,
+            "@HF283D3E0");
+        nsbk_report_progress(document, 100U, "@H4A733AA6");
+        return false;
+    }
+
+    nsbk_report_progress(document, 46U, "@HF797FC93");
+    memset(parsed, 0, sizeof(*parsed));
+    parsed->text = document->text_data;
+    parsed->text_capacity = NSBK_TEXT_BUFFER_SIZE;
+    parsed->layout = &document->layout;
+    parsed->viewport_width = document->viewport_width;
+    parse_ok = nsbk_html_parse(
+        (const uint8_t *)document->network_data + response.body_offset,
+        response.body_length, document->charset, parsed);
+    nsbk_make_base_url(document, parsed);
+    if (parse_ok && parsed->charset[0])
+        nsbk_copy(document->charset, sizeof(document->charset), parsed->charset);
+
+    if (parse_ok) {
+        nsbk_report_progress(document, 53U, "@HA406EE5E");
+        nsbk_load_stylesheets(document, parsed, timeout_ms);
+        nsbk_report_progress(document, 66U, "@H635F05E6");
+        nsbk_load_images(document, parsed, timeout_ms);
+        for (i = 0U; i < document->stylesheet_count; i++) {
+            css_resources[i].reference = document->stylesheets[i].reference;
+            css_resources[i].url = document->stylesheets[i].url;
+            css_resources[i].media = document->stylesheets[i].media;
+            css_resources[i].data = document->stylesheets[i].data;
+            css_resources[i].length = document->stylesheets[i].length;
+            css_resources[i].imported = document->stylesheets[i].imported;
+        }
+        for (i = 0U; i < document->image_count; i++) {
+            image_resources[i].reference = document->images[i].reference;
+            image_resources[i].url = document->images[i].url;
+            image_resources[i].image = &document->images[i].image;
+        }
+        environment->document_url = document->base_url;
+        environment->stylesheets = css_resources;
+        environment->stylesheet_count = document->stylesheet_count;
+        environment->images = image_resources;
+        environment->image_count = document->image_count;
+        nsbk_report_progress(document, 88U, "@H6367DEEC");
+        memset(parsed, 0, sizeof(*parsed));
+        parsed->text = document->text_data;
+        parsed->text_capacity = NSBK_TEXT_BUFFER_SIZE;
+        parsed->layout = &document->layout;
+        parsed->viewport_width = document->viewport_width;
+        parsed->resources = environment;
+        parse_ok = nsbk_html_parse(
+            (const uint8_t *)document->network_data + response.body_offset,
+            response.body_length, document->charset, parsed);
+    }
+    nsbk_apply_parse_result(document, parsed, workspace->old_controls, parse_ok);
+
+    if (!parse_ok) {
+        document->text_length = nsbk_fallback_text(
+            document->network_data + response.body_offset, response.body_length,
+            document->text_data, NSBK_TEXT_BUFFER_SIZE);
+    }
+    if (document->text_length == 0U) {
+        nsbk_copy(document->text_data, NSBK_TEXT_BUFFER_SIZE,
+                  "@H9DFAE573");
+        document->text_length = nsbk_strlen(document->text_data);
+    }
+    nsbk_report_progress(document, 100U, "@H44B39460");
+    return true;
+}
+
+bool nsbk_document_fetch(nsbk_document_t *document, const char *url,
+                         uint32_t timeout_ms, int32_t viewport_width) {
+    return nsbk_document_fetch_request(document, url, "GET", NULL, 0U,
+                                       timeout_ms, viewport_width);
+}
+
+bool nsbk_document_reflow(nsbk_document_t *document, int32_t viewport_width) {
+    nsbk_workspace_t *workspace;
+    nsbk_html_result_t *parsed;
+    nsbk_css_resource_t *css_resources;
+    nsbk_image_resource_t *image_resources;
+    nsbk_resource_environment_t *environment;
+    uint32_t i;
+    bool ok;
+    if (!document || !document->network_data || !document->workspace ||
+        document->body_length == 0U || viewport_width < 160 ||
+        viewport_width == document->viewport_width)
+        return false;
+    workspace = (nsbk_workspace_t *)document->workspace;
+    parsed = &workspace->parsed;
+    css_resources = workspace->css_resources;
+    image_resources = workspace->image_resources;
+    environment = &workspace->environment;
+    document->viewport_width = viewport_width;
+    if (document->image_count == 1U && !document->built_dom) {
+        bk_gui_image_t saved = document->images[0].image;
+        char reference[NSBK_URL_MAX], url[NSBK_URL_MAX];
+        nsbk_copy(reference, sizeof(reference), document->images[0].reference);
+        nsbk_copy(url, sizeof(url), document->images[0].url);
+        nsbk_layout_reset(&document->layout);
+        document->images[0].image = saved;
+        nsbk_copy(document->images[0].reference, sizeof(reference), reference);
+        nsbk_copy(document->images[0].url, sizeof(url), url);
+        {
+            nsbk_layout_item_t *item;
+            int32_t width = saved.width;
+            int32_t height = saved.height;
+            if (width > viewport_width - 16) {
+                height = height * (viewport_width - 16) / width;
+                width = viewport_width - 16;
+            }
+            if (height > 420) { width = width * 420 / height; height = 420; }
+            item = nsbk_layout_add(&document->layout, NSBK_LAYOUT_IMAGE);
+            if (!item) return false;
+            item->x = 8; item->y = 8; item->width = width; item->height = height;
+            item->image_index = 0;
+            document->layout.width = width + 16;
+            document->layout.height = height + 16;
+            document->layout.valid = true;
+        }
+        return true;
+    }
+    for (i = 0U; i < document->stylesheet_count; i++) {
+        css_resources[i].reference = document->stylesheets[i].reference;
+        css_resources[i].url = document->stylesheets[i].url;
+        css_resources[i].data = document->stylesheets[i].data;
+        css_resources[i].length = document->stylesheets[i].length;
+    }
+    for (i = 0U; i < document->image_count; i++) {
+        image_resources[i].reference = document->images[i].reference;
+        image_resources[i].url = document->images[i].url;
+        image_resources[i].image = &document->images[i].image;
+    }
+    environment->document_url = document->base_url;
+    environment->stylesheets = css_resources;
+    environment->stylesheet_count = document->stylesheet_count;
+    environment->images = image_resources;
+    environment->image_count = document->image_count;
+    memset(parsed, 0, sizeof(*parsed));
+    parsed->text = document->text_data;
+    parsed->text_capacity = NSBK_TEXT_BUFFER_SIZE;
+    parsed->layout = &document->layout;
+    parsed->viewport_width = viewport_width;
+    parsed->resources = environment;
+    ok = nsbk_html_parse((const uint8_t *)document->network_data +
+                         document->body_offset, document->body_length,
+                         document->charset, parsed);
+    nsbk_apply_parse_result(document, parsed, workspace->old_controls, ok);
+    return ok;
+}
+
+bool nsbk_form_set_value(nsbk_document_t *document, uint32_t control_index,
+                         const char *value) {
+    if (!document || control_index >= document->control_count) return false;
+    nsbk_copy(document->controls[control_index].value,
+              sizeof(document->controls[control_index].value), value);
+    return true;
+}
+
+bool nsbk_form_toggle(nsbk_document_t *document, uint32_t control_index) {
+    nsbk_html_control_t *control;
+    uint32_t i;
+    if (!document || control_index >= document->control_count) return false;
+    control = &document->controls[control_index];
+    if (control->type != NSBK_CONTROL_CHECKBOX &&
+        control->type != NSBK_CONTROL_RADIO) return false;
+    if (control->type == NSBK_CONTROL_RADIO && !control->checked) {
+        for (i = 0U; i < document->control_count; i++) {
+            nsbk_html_control_t *other = &document->controls[i];
+            if (other->form_index == control->form_index &&
+                other->type == NSBK_CONTROL_RADIO &&
+                strcmp(other->name, control->name) == 0)
+                other->checked = false;
+        }
+        control->checked = true;
+    } else {
+        control->checked = !control->checked;
+    }
+    return true;
+}
+
+bool nsbk_form_select_next(nsbk_document_t *document, uint32_t control_index,
+                           int direction) {
+    nsbk_html_control_t *control;
+    uint32_t attempt;
+    int32_t selected;
+    if (!document || control_index >= document->control_count) return false;
+    control = &document->controls[control_index];
+    if (control->type != NSBK_CONTROL_SELECT || control->disabled ||
+        control->option_count == 0U) return false;
+    selected = (int32_t)control->selected_option;
+    if (direction == 0) direction = 1;
+    for (attempt = 0U; attempt < control->option_count; attempt++) {
+        uint32_t absolute;
+        selected += direction > 0 ? 1 : -1;
+        if (selected < 0) selected = (int32_t)control->option_count - 1;
+        if ((uint32_t)selected >= control->option_count) selected = 0;
+        absolute = control->first_option + (uint32_t)selected;
+        if (absolute >= document->option_count) return false;
+        if (document->options[absolute].disabled) continue;
+        control->selected_option = (uint16_t)selected;
+        nsbk_copy(control->value, sizeof(control->value),
+                  document->options[absolute].value);
+        nsbk_copy(control->label, sizeof(control->label),
+                  document->options[absolute].label);
+        return true;
+    }
+    return false;
+}
+
+
+static bool nsbk_form_append_char(char *output, uint32_t capacity,
+                                  uint32_t *used, char value) {
+    if (!output || !used || *used + 1U >= capacity) return false;
+    output[(*used)++] = value;
+    output[*used] = '\0';
+    return true;
+}
+
+static bool nsbk_form_encode(char *output, uint32_t capacity, uint32_t *used,
+                             const char *value) {
+    static const char hex[] = "0123456789ABCDEF";
+    uint32_t i;
+    for (i = 0U; value && value[i]; i++) {
+        uint8_t c = (uint8_t)value[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+            c == '~') {
+            if (!nsbk_form_append_char(output, capacity, used, (char)c))
+                return false;
+        } else if (c == ' ') {
+            if (!nsbk_form_append_char(output, capacity, used, '+')) return false;
+        } else {
+            if (!nsbk_form_append_char(output, capacity, used, '%') ||
+                !nsbk_form_append_char(output, capacity, used, hex[c >> 4]) ||
+                !nsbk_form_append_char(output, capacity, used, hex[c & 15U]))
+                return false;
+        }
+    }
+    return true;
+}
+
+bool nsbk_form_build_submission(nsbk_document_t *document,
+                                uint32_t form_index,
+                                uint32_t submit_control,
+                                char *url, uint32_t url_capacity,
+                                char *method, uint32_t method_capacity,
+                                char *body, uint32_t body_capacity,
+                                uint32_t *body_length) {
+    nsbk_html_form_t *form;
+    char fields[2048];
+    uint32_t used = 0U;
+    uint32_t i;
+    bool first = true;
+    if (!document || form_index >= document->form_count || !url ||
+        !method || !body || !body_length || body_capacity == 0U) return false;
+    form = &document->forms[form_index];
+    nsbk_url_resolve(url, url_capacity,
+        document->base_url[0] ? document->base_url : document->final_url,
+        form->action[0] ? form->action : document->final_url);
+    nsbk_copy(method, method_capacity,
+              nsbk_prefix(form->method, "post") ? "POST" : "GET");
+    fields[0] = '\0';
+    for (i = 0U; i < document->control_count; i++) {
+        nsbk_html_control_t *control = &document->controls[i];
+        if (control->form_index != form_index || control->disabled ||
+            !control->name[0] || control->type == NSBK_CONTROL_BUTTON ||
+            (control->type == NSBK_CONTROL_SUBMIT && i != submit_control) ||
+            ((control->type == NSBK_CONTROL_CHECKBOX ||
+              control->type == NSBK_CONTROL_RADIO) && !control->checked))
+            continue;
+        if (!first && !nsbk_form_append_char(fields, sizeof(fields), &used, '&'))
+            return false;
+        first = false;
+        if (!nsbk_form_encode(fields, sizeof(fields), &used, control->name) ||
+            !nsbk_form_append_char(fields, sizeof(fields), &used, '=') ||
+            !nsbk_form_encode(fields, sizeof(fields), &used, control->value))
+            return false;
+    }
+    if (nsbk_prefix(method, "GET")) {
+        if (fields[0]) {
+            nsbk_append(url, url_capacity, strchr(url, '?') ? "&" : "?");
+            nsbk_append(url, url_capacity, fields);
+        }
+        body[0] = '\0';
+        *body_length = 0U;
+    } else {
+        if (used + 1U > body_capacity) return false;
+        memcpy(body, fields, used + 1U);
+        *body_length = used;
+    }
+    return url[0] != '\0';
+}
+
+uint32_t nsbk_text_line_count(const char *text, uint32_t length,
+                              uint32_t columns) {
+    uint32_t i;
+    uint32_t line = 1U;
+    uint32_t column = 0U;
+    if (!text || length == 0U || columns == 0U) return 1U;
+    for (i = 0U; i < length; i++) {
+        if (text[i] == '\n') { line++; column = 0U; }
+        else if (++column >= columns) { line++; column = 0U; }
+    }
+    return line;
+}

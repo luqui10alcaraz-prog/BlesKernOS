@@ -17,5 +17,6 @@ typedef struct {
 
 void shell_run(void);
 void shell_execute_line(const char *line);
+bool shell_take_exit_request(void);
 
 #endif

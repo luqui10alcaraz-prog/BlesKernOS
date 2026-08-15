@@ -1,0 +1,270 @@
+--- a/kernel/drivers/ati_rage128_dvr.c
++++ b/kernel/drivers/ati_rage128_dvr.c
+@@ -78,6 +78,7 @@
+ #define R128_CRTC_OFFSET            0x0224U
+ #define R128_CRTC_OFFSET_CNTL       0x0228U
+ #define R128_CRTC_PITCH             0x022CU
++#define R128_CRTC_PIX_WIDTH_MASK    (7U << 8)
+ #define R128_CRTC_CUR_EN            (1U << 16)
+ #define R128_CRTC_EXT_DISP_EN       (1U << 24)
+ #define R128_CRTC_EN                (1U << 25)
+@@ -216,6 +217,8 @@
+ 
+     bool display_saved;
+     bool direct_modeset_ok;
++    bool firmware_info_valid;
++    gfx_info_t firmware_info;
+     uint16_t native_width;
+     uint16_t native_height;
+     uint32_t current_pixel_khz;
+@@ -567,6 +570,11 @@
+         (g_r128.saved_ppll_div_3 & R128_PPLL_FB3_DIV_MASK) != 0U &&
+         r128_post_divisor(g_r128.saved_ppll_div_3) != 0U;
+     g_r128.display_saved = true;
++    kprintf("[ATIR128:TRACE] DISPLAY saved crtc_gen=%x crtc_ext=%x pitch_reg=%u ppll_div3=%x native=%ux%u direct_modeset=%u\n",
++            g_r128.saved_crtc_gen_cntl, g_r128.saved_crtc_ext_cntl,
++            g_r128.saved_crtc_pitch, g_r128.saved_ppll_div_3,
++            (uint32_t)g_r128.native_width, (uint32_t)g_r128.native_height,
++            g_r128.direct_modeset_ok ? 1U : 0U);
+ }
+ 
+ static bool r128_program_pll(uint32_t pixel_khz) {
+@@ -636,7 +644,7 @@
+     if (!vsync_width) vsync_width = 1U;
+     if (vsync_width > 0x1FU) vsync_width = 0x1FU;
+ 
+-    gen = (g_r128.saved_crtc_gen_cntl & R128_CRTC_CUR_EN) |
++    gen = (g_r128.saved_crtc_gen_cntl & ~R128_CRTC_PIX_WIDTH_MASK) |
+           R128_CRTC_EXT_DISP_EN | R128_CRTC_EN | (6U << 8);
+     r128_write(R128_CRTC_GEN_CNTL, gen);
+     r128_write(R128_CRTC_H_TOTAL_DISP,
+@@ -682,19 +690,26 @@
+     r128_write(R128_CRTC_PITCH, g_r128.saved_crtc_pitch);
+     r128_write(R128_CRTC_GEN_CNTL, g_r128.saved_crtc_gen_cntl);
+     r128_write(R128_CRTC_EXT_CNTL, g_r128.saved_crtc_ext_cntl);
+-    if (info) {
+-        info->mode = GFX_MODE_VESA_LFB;
+-        info->framebuffer = g_r128.fb_bar + g_r128.fb_offset;
+-        info->width = g_r128.native_width;
+-        info->height = g_r128.native_height;
+-        info->pitch = (uint16_t)(g_r128.saved_crtc_pitch * 32U);
+-        info->bpp = 32U;
+-    }
+-    g_r128.width = g_r128.native_width;
+-    g_r128.height = g_r128.native_height;
+-    g_r128.pitch = (uint16_t)(g_r128.saved_crtc_pitch * 32U);
+-    g_r128.pitch_offset = ((uint32_t)g_r128.pitch / 32U << 21) |
+-                          (g_r128.fb_offset >> 5);
++    if (g_r128.firmware_info_valid) {
++        if (info) *info = g_r128.firmware_info;
++        g_r128.fb_offset = g_r128.firmware_info.framebuffer - g_r128.fb_bar;
++        g_r128.width = g_r128.firmware_info.width;
++        g_r128.height = g_r128.firmware_info.height;
++        g_r128.pitch = g_r128.firmware_info.pitch;
++        if (g_r128.firmware_info.bpp == 32U &&
++            (g_r128.pitch & 31U) == 0U) {
++            g_r128.pitch_offset = ((uint32_t)g_r128.pitch / 32U << 21) |
++                                  (g_r128.fb_offset >> 5);
++        } else {
++            g_r128.pitch_offset = 0U;
++        }
++    } else {
++        g_r128.width = g_r128.native_width;
++        g_r128.height = g_r128.native_height;
++        g_r128.pitch = (uint16_t)(g_r128.saved_crtc_pitch * 32U);
++        g_r128.pitch_offset = ((uint32_t)g_r128.pitch / 32U << 21) |
++                              (g_r128.fb_offset >> 5);
++    }
+     g_r128.current_pixel_khz = g_r128.native_pixel_khz;
+     return true;
+ }
+@@ -733,6 +748,148 @@
+     return true;
+ }
+ 
++
++static bool r128_prepare_firmware_bootstrap(const gfx_info_t *info) {
++    uint64_t visible_end;
++
++    if (!info || info->mode != GFX_MODE_VESA_LFB ||
++        !info->framebuffer || !info->width || !info->height ||
++        !info->pitch || !info->bpp ||
++        info->width > R128_MAX_COORD || info->height > R128_MAX_COORD)
++        return false;
++
++    g_r128.vram_size = r128_read(R128_CONFIG_MEMSIZE) & 0x03FFFFFFU;
++    if (!g_r128.vram_size || info->framebuffer < g_r128.fb_bar) return false;
++
++    g_r128.fb_offset = info->framebuffer - g_r128.fb_bar;
++    if (g_r128.fb_offset & 31U) return false;
++
++    visible_end = (uint64_t)g_r128.fb_offset +
++                  (uint64_t)info->pitch * info->height;
++    if (visible_end > (uint64_t)g_r128.vram_size) return false;
++
++    g_r128.firmware_info = *info;
++    g_r128.firmware_info_valid = true;
++    g_r128.width = info->width;
++    g_r128.height = info->height;
++    g_r128.pitch = info->pitch;
++    return true;
++}
++
++static void r128_clear_32bpp_framebuffer(const gfx_info_t *info) {
++    volatile uint32_t *pixels;
++    uint32_t words_per_row;
++
++    if (!info || info->bpp != 32U || !info->framebuffer ||
++        info->pitch < (uint16_t)(info->width * 4U))
++        return;
++
++    pixels = (volatile uint32_t *)(uintptr_t)info->framebuffer;
++    words_per_row = (uint32_t)info->pitch / 4U;
++    for (uint32_t y = 0; y < info->height; y++) {
++        volatile uint32_t *row = pixels + y * words_per_row;
++        for (uint32_t x = 0; x < info->width; x++) row[x] = 0U;
++    }
++}
++
++static bool r128_bootstrap_32bpp(gfx_info_t *info,
++                                 uint16_t preferred_width,
++                                 uint16_t preferred_height) {
++    const r128_mode_t *mode;
++    uint16_t target_width;
++    uint16_t target_height;
++    uint16_t pitch;
++    uint32_t old_ext;
++    uint32_t gen;
++    uint64_t visible_end;
++    bool depth_only;
++
++    if (!info || !g_r128.display_saved) return false;
++
++    /*
++     * El primer takeover conserva siempre la resolucion y los timings que dejo
++     * el BIOS. Cambiar solamente profundidad/pitch es mucho mas seguro para el
++     * panel LVDS del portatil que reprogramar PPLL y sincronismos durante boot.
++     * preferred_* queda registrado para diagnostico; los cambios de resolucion
++     * posteriores siguen disponibles mediante set_mode().
++     */
++    target_width = info->width;
++    target_height = info->height;
++    depth_only = true;
++    mode = r128_find_mode(target_width, target_height);
++
++    pitch = (uint16_t)r128_align_up((uint32_t)target_width * 4U, 32U);
++    visible_end = (uint64_t)g_r128.fb_offset +
++                  (uint64_t)pitch * target_height;
++    if (visible_end > (uint64_t)g_r128.vram_size) {
++        kprintf("[ATIR128:TRACE] BOOT32 FAIL VRAM insuficiente need=%u have=%u\n",
++                (uint32_t)visible_end, g_r128.vram_size);
++        return false;
++    }
++
++    kprintf("[ATIR128:TRACE] BOOT32 convert %ux%ux%u pitch=%u -> %ux%ux32 pitch=%u path=%s preferred=%ux%u\n",
++            (uint32_t)info->width, (uint32_t)info->height,
++            (uint32_t)info->bpp, (uint32_t)info->pitch,
++            (uint32_t)target_width, (uint32_t)target_height,
++            (uint32_t)pitch, depth_only ? "depth-only" : "full-modeset",
++            (uint32_t)preferred_width, (uint32_t)preferred_height);
++
++    old_ext = r128_read(R128_CRTC_EXT_CNTL);
++    r128_write(R128_CRTC_EXT_CNTL, old_ext | R128_CRTC_HSYNC_DIS |
++               R128_CRTC_VSYNC_DIS | R128_CRTC_DISPLAY_DIS);
++
++    if (depth_only) {
++        /*
++         * Mantiene CRTC_H/V_* y PPLL exactamente como los configuro el BIOS.
++         * Solo cambia el formato del scanout a 32 bpp y su pitch.
++         */
++        gen = r128_read(R128_CRTC_GEN_CNTL);
++        gen = (gen & ~R128_CRTC_PIX_WIDTH_MASK) |
++              R128_CRTC_EXT_DISP_EN | R128_CRTC_EN | (6U << 8);
++        r128_write(R128_CRTC_OFFSET, g_r128.fb_offset);
++        r128_write(R128_CRTC_PITCH, (uint32_t)pitch / 32U);
++        r128_write(R128_CRTC_GEN_CNTL, gen);
++        if (r128_read(R128_CRTC_PITCH) != (uint32_t)pitch / 32U ||
++            (r128_read(R128_CRTC_GEN_CNTL) & R128_CRTC_PIX_WIDTH_MASK) !=
++                (6U << 8)) {
++            kprintf("[ATIR128:TRACE] BOOT32 FAIL CRTC no acepto profundidad/pitch\n");
++            (void)r128_restore_display(info);
++            return false;
++        }
++    } else {
++        if (!mode || !g_r128.direct_modeset_ok ||
++            !r128_program_pll(mode->pixel_khz) ||
++            !r128_write_mode_registers(mode, pitch)) {
++            kprintf("[ATIR128:TRACE] BOOT32 FAIL programacion CRTC/PPLL; restaurando firmware\n");
++            (void)r128_restore_display(info);
++            return false;
++        }
++    }
++
++    r128_write(R128_CRTC_EXT_CNTL, old_ext & ~(R128_CRTC_HSYNC_DIS |
++               R128_CRTC_VSYNC_DIS | R128_CRTC_DISPLAY_DIS));
++
++    info->mode = GFX_MODE_VESA_LFB;
++    info->framebuffer = g_r128.fb_bar + g_r128.fb_offset;
++    info->width = target_width;
++    info->height = target_height;
++    info->pitch = pitch;
++    info->bpp = 32U;
++
++    if (!r128_validate_mode(info)) {
++        kprintf("[ATIR128:TRACE] BOOT32 FAIL modo 32bpp no valido; restaurando firmware\n");
++        (void)r128_restore_display(info);
++        return false;
++    }
++
++    if (mode) g_r128.current_pixel_khz = mode->pixel_khz;
++    r128_clear_32bpp_framebuffer(info);
++    kprintf("[ATIR128:TRACE] BOOT32 OK mode=%ux%ux32 pitch=%u fb=%x timings=firmware\n",
++            (uint32_t)info->width, (uint32_t)info->height,
++            (uint32_t)info->pitch, info->framebuffer);
++    return true;
++}
++
+ static bool r128_clip_rect(const gfx_info_t *info, int *x, int *y,
+                            int *w, int *h) {
+     if (!info || !x || !y || !w || !h || *w <= 0 || *h <= 0) return false;
+@@ -832,8 +989,8 @@
+             (uint32_t)info->width, (uint32_t)info->height,
+             (uint32_t)info->bpp, (uint32_t)info->pitch, info->framebuffer,
+             g_r128.fb_bar, info->framebuffer - g_r128.fb_bar);
+-    if (!r128_validate_mode(info)) {
+-        kprintf("[ATIR128.DVR] bootstrap incompatible: requiere LFB 32bpp alineado\n");
++    if (!r128_prepare_firmware_bootstrap(info)) {
++        kprintf("[ATIR128.DVR] bootstrap VESA fuera de la VRAM Rage 128\n");
+         return false;
+     }
+ 
+@@ -846,11 +1003,28 @@
+     g_r128.saved_ov0_colour_cntl = r128_read(R128_OV0_COLOUR_CNTL);
+     r128_write(R128_OV0_SCALE_CNTL, 0U);
+ 
++    if (info->bpp == 32U) {
++        if (!r128_validate_mode(info)) {
++            kprintf("[ATIR128.DVR] bootstrap 32bpp invalido o desalineado\n");
++            return false;
++        }
++    } else if (info->bpp == 8U) {
++        if (!r128_bootstrap_32bpp(info, preferred_width, preferred_height)) {
++            kprintf("[ATIR128.DVR] no se pudo convertir el bootstrap VESA 8bpp a 32bpp\n");
++            return false;
++        }
++    } else {
++        kprintf("[ATIR128.DVR] bootstrap %ubpp no soportado; se aceptan 8 o 32bpp\n",
++                (uint32_t)info->bpp);
++        return false;
++    }
++
+     g_r128.accel_ok = true;
+     if (!r128_engine_init()) {
+         g_r128.accel_ok = false;
+         r128_restore_engine();
+-        kprintf("[ATIR128.DVR] el motor 2D no respondio; usando VESA\n");
++        (void)r128_restore_display(info);
++        kprintf("[ATIR128.DVR] el motor 2D no respondio; firmware restaurado y usando VESA\n");
+         return false;
+     }
+     g_r128.active = true;

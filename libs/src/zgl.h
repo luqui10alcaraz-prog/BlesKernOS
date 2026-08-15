@@ -164,6 +164,8 @@ typedef struct GLTexture {
     GLImage images[MAX_TEXTURE_LEVELS];
     struct GLTexture *next, *prev;
     GLint handle;
+    GLint min_filter, mag_filter;
+    GLint wrap_s, wrap_t;
 } GLTexture;
 
 /* buffers */
@@ -396,6 +398,21 @@ void gl_draw_triangle_line(GLVertex *p0, GLVertex *p1, GLVertex *p2);
 void gl_draw_triangle_fill(GLVertex *p0, GLVertex *p1, GLVertex *p2);
 void gl_draw_triangle_select(GLVertex *p0, GLVertex *p1, GLVertex *p2);
 void gl_draw_triangle_feedback(GLVertex *p0, GLVertex *p1, GLVertex *p2);
+
+/* BlesKernOS SVGA3D bridge. */
+void tgl_gpu_context_init(ZBuffer *zbuffer);
+void tgl_gpu_context_close(ZBuffer *zbuffer);
+void tgl_gpu_context_resize(ZBuffer *zbuffer);
+void tgl_gpu_begin_frame(GLContext *context, GLint clear_mask);
+bool tgl_gpu_submit_triangle(GLContext *context, const GLVertex *a,
+                             const GLVertex *b, const GLVertex *c);
+bool tgl_gpu_submit_line(GLContext *context, const GLVertex *a,
+                         const GLVertex *b);
+bool tgl_gpu_submit_point(GLContext *context, const GLVertex *point);
+bool tgl_gpu_resolve(ZBuffer *zbuffer);
+void tgl_gpu_prepare_cpu(ZBuffer *zbuffer);
+void tgl_gpu_flush(void);
+void tgl_gpu_texture_invalidated(GLTexture *texture);
 /* matrix.c */
 void gl_print_matrix(const GLfloat *m);
 /*

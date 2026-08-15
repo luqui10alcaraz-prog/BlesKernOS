@@ -1,0 +1,8 @@
+[Printer]
+Id=ESCP2
+Name=Epson ESC/P2 Compatible on LPT1
+Language=ESCP2
+Transport=LPT
+Port=LPT1
+DPI=120
+EscpMode=1

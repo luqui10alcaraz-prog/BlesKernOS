@@ -79,8 +79,9 @@
         return;
     fz = 1.0 / fz;
     */
-    if (fz != 0.0)
-        fz = 1.0 / fz;
+    if (fz == 0.0)
+        return;
+    fz = 1.0 / fz;
 
     fdx1 *= fz;
     fdy1 *= fz;

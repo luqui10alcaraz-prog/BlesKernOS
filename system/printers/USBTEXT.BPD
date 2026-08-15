@@ -1,0 +1,7 @@
+[Printer]
+Id=USBTEXT
+Name=USB Generic Text Printer
+Language=TEXT
+Transport=LPT
+Port=USBPRN1
+DPI=120

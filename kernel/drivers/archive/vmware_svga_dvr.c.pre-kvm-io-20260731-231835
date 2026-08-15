@@ -1,0 +1,1591 @@
+#include "../include/gfx_driver.h"
+#include "../include/driver.h"
+#include "../include/pci.h"
+#include "../include/pic.h"
+#include "../include/memory.h"
+#include "../include/vga.h"
+#include "../include/task.h"
+#include "../include/svga_transport.h"
+#include "../include/svga3d_protocol.h"
+
+#define VMWARE_SVGA_VENDOR_ID 0x15ADU
+#define VMWARE_SVGA_DEVICE_ID 0x0405U
+
+#define SVGA_PORT_INDEX       0
+#define SVGA_PORT_VALUE       1
+
+#define SVGA_ID_0             0x90000000U
+#define SVGA_ID_1             0x90000001U
+#define SVGA_ID_2             0x90000002U
+
+#define SVGA_REG_ID                       0
+#define SVGA_REG_ENABLE                   1
+#define SVGA_REG_WIDTH                    2
+#define SVGA_REG_HEIGHT                   3
+#define SVGA_REG_MAX_WIDTH                4
+#define SVGA_REG_MAX_HEIGHT               5
+#define SVGA_REG_BITS_PER_PIXEL           7
+#define SVGA_REG_BYTES_PER_LINE          12
+#define SVGA_REG_FB_START                13
+#define SVGA_REG_FB_OFFSET               14
+#define SVGA_REG_VRAM_SIZE               15
+#define SVGA_REG_FB_SIZE                 16
+#define SVGA_REG_CAPABILITIES            17
+#define SVGA_REG_MEM_START               18
+#define SVGA_REG_MEM_SIZE                19
+#define SVGA_REG_CONFIG_DONE             20
+#define SVGA_REG_SYNC                    21
+#define SVGA_REG_BUSY                    22
+#define SVGA_REG_CURSOR_ID               24
+#define SVGA_REG_CURSOR_X                25
+#define SVGA_REG_CURSOR_Y                26
+#define SVGA_REG_CURSOR_ON               27
+#define SVGA_REG_MEM_REGS                30
+#define SVGA_REG_GMR_MAX_IDS             43
+#define SVGA_REG_GMRS_MAX_PAGES          46
+
+#define SVGA_CAP_RECT_FILL               (1U << 0) /* legacy/QEMU */
+#define SVGA_CAP_RECT_COPY               0x00000002U
+#define SVGA_CAP_RASTER_OP               (1U << 4) /* legacy protocol */
+#define SVGA_CAP_CURSOR                  0x00000020U
+#define SVGA_CAP_ALPHA_CURSOR            0x00000200U
+#define SVGA_CAP_EXTENDED_FIFO           0x00008000U
+#define SVGA_CAP_GMR                     0x00100000U
+#define SVGA_CAP_GMR2                    0x00400000U
+#define SVGA_CAP_SCREEN_OBJECT_2         0x00800000U
+
+#define SVGA_FIFO_MIN                     0
+#define SVGA_FIFO_MAX                     1
+#define SVGA_FIFO_NEXT_CMD                2
+#define SVGA_FIFO_STOP                    3
+#define SVGA_FIFO_CAPABILITIES            4
+#define SVGA_FIFO_FENCE                   6
+#define SVGA_FIFO_CURSOR_ON               9
+#define SVGA_FIFO_CURSOR_X               10
+#define SVGA_FIFO_CURSOR_Y               11
+#define SVGA_FIFO_CURSOR_COUNT           12
+#define SVGA_FIFO_CURSOR_LAST_UPDATED    13
+
+#define SVGA_FIFO_CAP_FENCE              (1U << 0)
+#define SVGA_FIFO_CAP_ACCELFRONT         (1U << 1)
+#define SVGA_FIFO_CAP_CURSOR_BYPASS_3    (1U << 4)
+#define SVGA_FIFO_CAP_SCREEN_OBJECT      (1U << 7)
+#define SVGA_FIFO_CAP_GMR2               (1U << 8)
+#define SVGA_FIFO_CAP_SCREEN_OBJECT_2    (1U << 9)
+
+#define SVGA_FIFO_LEGACY_REGS             4U
+#define SVGA_FIFO_EXT_REGS              291U
+#define SVGA_FIFO_MIN_QUEUE       (10U * 1024U)
+
+#define SVGA_CMD_UPDATE                   1U
+#define SVGA_CMD_RECT_FILL                2U /* legacy/QEMU */
+#define SVGA_CMD_RECT_COPY                3U
+#define SVGA_CMD_RECT_ROP_COPY           14U
+#define SVGA_CMD_DEFINE_CURSOR           19U
+#define SVGA_CMD_DEFINE_ALPHA_CURSOR     22U
+#define SVGA_CMD_FRONT_ROP_FILL          29U
+#define SVGA_CMD_FENCE                   30U
+#define SVGA_CMD_DEFINE_SCREEN           34U
+#define SVGA_CMD_DESTROY_SCREEN          35U
+#define SVGA_CMD_DEFINE_GMRFB            36U
+#define SVGA_CMD_BLIT_GMRFB_TO_SCREEN    37U
+#define SVGA_CMD_DEFINE_GMR2             41U
+#define SVGA_CMD_REMAP_GMR2              42U
+
+#define SVGA_ROP_AND                     0x1U
+#define SVGA_ROP_COPY                    0x3U
+#define SVGA_ROP_XOR                     0x6U
+#define SVGA_ROP_OR                      0x7U
+#define SVGA_ROP_INVERT                  0xAU
+
+#define SVGA_GMR_FRAMEBUFFER             0xFFFFFFFEU
+#define SVGA_REMAP_GMR2_PPN32            0U
+#define SVGA_SCREEN_MUST_BE_SET          (1U << 0)
+#define SVGA_SCREEN_IS_PRIMARY           (1U << 1)
+#define SVGA_CURSOR_ON_HIDE              0U
+#define SVGA_CURSOR_ON_SHOW              1U
+
+#define SVGA_SYNC_SPIN_LIMIT       10000000U
+#define SVGA_MAX_DIRTY_RECTS             32U
+#define SVGA_MAX_SURFACES                32U
+#define SVGA_MAX_TRANSPORT_ALLOCS         16U
+#define SVGA_SURFACE_ALIGN               64U
+#define SVGA_GMR_ID                       1U
+
+/* Screen Objects/GMR2/SVGA3D are kept behind an explicit build switch until
+ * the complete command stream is validated on real VMware.  Basic SVGA-II
+ * framebuffer + UPDATE is the stable boot path on both QEMU and Workstation. */
+#ifndef BLES_VMWARE_EXPERIMENTAL_ACCEL
+#define BLES_VMWARE_EXPERIMENTAL_ACCEL 0
+#endif
+#define SVGA_PAGE_SIZE                  4096U
+
+#define ALIGN_UP(v, a) (((v) + ((a) - 1U)) & ~((a) - 1U))
+
+typedef struct {
+    bool used;
+    uint8_t generation;
+    uint16_t width;
+    uint16_t height;
+    uint32_t offset;
+    uint32_t pitch;
+    uint32_t size;
+} svga_surface_t;
+
+typedef struct {
+    bool used;
+    uint8_t generation;
+    uint32_t offset;
+    uint32_t size;
+} svga_transport_allocation_t;
+
+typedef struct {
+    bool active;
+    const pci_device_t *pci;
+    uint16_t io_base;
+    uint32_t protocol_id;
+    uint32_t capabilities;
+    uint32_t fifo_capabilities;
+    uint32_t fifo_register_count;
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t fb_start;
+    uint32_t fb_offset;
+    uint32_t fb_size;
+    uint32_t vram_size;
+    uint32_t fifo_start;
+    uint32_t fifo_size;
+    volatile uint32_t *fifo;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t framebuffer;
+
+    gfx_rect_t dirty[SVGA_MAX_DIRTY_RECTS];
+    uint32_t dirty_count;
+    uint32_t next_fence;
+    uint32_t last_submitted_fence;
+
+    bool cursor_defined;
+    bool cursor_visible;
+    bool cursor_hw_enabled;
+    bool cursor_position_valid;
+    int32_t cursor_x;
+    int32_t cursor_y;
+    uint8_t cursor_bpp;
+    uint32_t cursor_id;
+
+    uint32_t offscreen_base;
+    svga_surface_t surfaces[SVGA_MAX_SURFACES];
+    svga_transport_allocation_t transport_allocs[SVGA_MAX_TRANSPORT_ALLOCS];
+
+    void *gmr_allocation;
+    uint8_t *gmr_buffer;
+    uint32_t gmr_size;
+    uint32_t gmr_pages;
+    bool gmr_defined;
+    bool screen_defined;
+    bool gmr_present;
+} vmware_svga_state_t;
+
+static vmware_svga_state_t g_svga;
+static uint32_t g_svga_transport_generation = 1U;
+static const bk_svga_transport_ops_t g_svga_transport_ops;
+
+static void svga_transport_advance_generation(void) {
+    g_svga_transport_generation++;
+    if (!g_svga_transport_generation) g_svga_transport_generation = 1U;
+}
+
+static bool svga_cursor_show(bool visible);
+static bool svga_cursor_hardware_is_safe(void);
+static bool svga_wait_fence(uint32_t fence);
+static bool svga_emit_define_gmrfb(uint32_t gmr_id, uint32_t offset,
+                                   uint32_t pitch);
+
+static uint32_t svga_read_reg(uint32_t reg) {
+    outl((uint16_t)(g_svga.io_base + SVGA_PORT_INDEX), reg);
+    return inl((uint16_t)(g_svga.io_base + SVGA_PORT_VALUE));
+}
+
+static void svga_write_reg(uint32_t reg, uint32_t value) {
+    outl((uint16_t)(g_svga.io_base + SVGA_PORT_INDEX), reg);
+    outl((uint16_t)(g_svga.io_base + SVGA_PORT_VALUE), value);
+}
+
+static uint32_t svga_fifo_free_bytes(void) {
+    uint32_t min, max, next, stop;
+    if (!g_svga.fifo) return 0;
+    min = g_svga.fifo[SVGA_FIFO_MIN];
+    max = g_svga.fifo[SVGA_FIFO_MAX];
+    next = g_svga.fifo[SVGA_FIFO_NEXT_CMD];
+    stop = g_svga.fifo[SVGA_FIFO_STOP];
+    if (min >= max || next < min || next >= max || stop < min || stop >= max)
+        return 0;
+    if (next >= stop) return (max - next) + (stop - min) - 4U;
+    return stop - next - 4U;
+}
+
+static bool svga_sync_fifo(void) {
+    uint32_t spins = 0;
+    if (!g_svga.fifo) return false;
+    __asm__ volatile ("" : : : "memory");
+    svga_write_reg(SVGA_REG_SYNC, 1);
+    while (svga_read_reg(SVGA_REG_BUSY)) {
+        if (++spins >= SVGA_SYNC_SPIN_LIMIT) return false;
+        __asm__ volatile ("pause");
+    }
+    return true;
+}
+
+static bool svga_fifo_emit(const uint32_t *words, uint32_t count) {
+    uint32_t bytes, next, min, max;
+    bool ok = false;
+    if (!g_svga.active || !g_svga.fifo || !words || !count) return false;
+
+    /* NEXT_CMD is a shared ring pointer.  A timer switch in the middle of one
+     * packet lets a second task splice another command into it, which is much
+     * easier to hit under KVM/WHPX. */
+    task_preempt_disable();
+    bytes = count * 4U;
+    min = g_svga.fifo[SVGA_FIFO_MIN];
+    max = g_svga.fifo[SVGA_FIFO_MAX];
+    if (min >= max || bytes >= max - min) goto out;
+    if (svga_fifo_free_bytes() < bytes) {
+        if (!svga_sync_fifo() || svga_fifo_free_bytes() < bytes) goto out;
+    }
+    next = g_svga.fifo[SVGA_FIFO_NEXT_CMD];
+    for (uint32_t i = 0; i < count; i++) {
+        g_svga.fifo[next / 4U] = words[i];
+        next += 4U;
+        if (next >= max) next = min;
+    }
+    __asm__ volatile ("" : : : "memory");
+    g_svga.fifo[SVGA_FIFO_NEXT_CMD] = next;
+    ok = true;
+out:
+    task_preempt_enable();
+    return ok;
+}
+
+static bool svga_clip_rect(int *x, int *y, int *w, int *h) {
+    if (!x || !y || !w || !h || *w <= 0 || *h <= 0) return false;
+    if (*x < 0) { *w += *x; *x = 0; }
+    if (*y < 0) { *h += *y; *y = 0; }
+    if (*x >= (int)g_svga.width || *y >= (int)g_svga.height) return false;
+    if (*x + *w > (int)g_svga.width) *w = (int)g_svga.width - *x;
+    if (*y + *h > (int)g_svga.height) *h = (int)g_svga.height - *y;
+    return *w > 0 && *h > 0;
+}
+
+static bool svga_rect_touching(gfx_rect_t a, gfx_rect_t b) {
+    return a.x <= b.x + b.w + 2 && b.x <= a.x + a.w + 2 &&
+           a.y <= b.y + b.h + 2 && b.y <= a.y + a.h + 2;
+}
+
+static gfx_rect_t svga_rect_union(gfx_rect_t a, gfx_rect_t b) {
+    int32_t x1 = a.x < b.x ? a.x : b.x;
+    int32_t y1 = a.y < b.y ? a.y : b.y;
+    int32_t x2a = a.x + a.w, x2b = b.x + b.w;
+    int32_t y2a = a.y + a.h, y2b = b.y + b.h;
+    int32_t x2 = x2a > x2b ? x2a : x2b;
+    int32_t y2 = y2a > y2b ? y2a : y2b;
+    return (gfx_rect_t){x1, y1, x2 - x1, y2 - y1};
+}
+
+static bool svga_queue_dirty(int x, int y, int w, int h) {
+    gfx_rect_t rect;
+    if (!svga_clip_rect(&x, &y, &w, &h)) return false;
+    rect = (gfx_rect_t){x, y, w, h};
+    for (uint32_t i = 0; i < g_svga.dirty_count; i++) {
+        if (svga_rect_touching(g_svga.dirty[i], rect)) {
+            g_svga.dirty[i] = svga_rect_union(g_svga.dirty[i], rect);
+            return true;
+        }
+    }
+    if (g_svga.dirty_count < SVGA_MAX_DIRTY_RECTS) {
+        g_svga.dirty[g_svga.dirty_count++] = rect;
+        return true;
+    }
+    g_svga.dirty[0] = svga_rect_union(g_svga.dirty[0], rect);
+    return true;
+}
+
+static bool svga_emit_update(gfx_rect_t rect) {
+    uint32_t command[5];
+    int x = rect.x, y = rect.y, w = rect.w, h = rect.h;
+    if (!svga_clip_rect(&x, &y, &w, &h)) return false;
+    command[0] = SVGA_CMD_UPDATE;
+    command[1] = (uint32_t)x;
+    command[2] = (uint32_t)y;
+    command[3] = (uint32_t)w;
+    command[4] = (uint32_t)h;
+    return svga_fifo_emit(command, 5U);
+}
+
+static bool svga_emit_dirty_updates(void) {
+    for (uint32_t i = 0; i < g_svga.dirty_count; i++) {
+        if (!svga_emit_update(g_svga.dirty[i])) return false;
+    }
+    g_svga.dirty_count = 0;
+    return true;
+}
+
+static bool svga_has_fence(void) {
+    return (g_svga.fifo_capabilities & SVGA_FIFO_CAP_FENCE) != 0U &&
+           g_svga.fifo && g_svga.fifo[SVGA_FIFO_MIN] > SVGA_FIFO_FENCE * 4U;
+}
+
+static bool svga_fence_passed(uint32_t fence) {
+    uint32_t passed;
+    if (!fence || !svga_has_fence()) return true;
+    passed = g_svga.fifo[SVGA_FIFO_FENCE];
+    return (int32_t)(passed - fence) >= 0;
+}
+
+static bool svga_emit_fence(uint32_t *fence_out) {
+    uint32_t command[2];
+    uint32_t fence;
+    if (fence_out) *fence_out = 0U;
+    if (!svga_has_fence()) return true;
+    fence = ++g_svga.next_fence;
+    if (!fence) fence = ++g_svga.next_fence;
+    command[0] = SVGA_CMD_FENCE;
+    command[1] = fence;
+    if (!svga_fifo_emit(command, 2U)) return false;
+    g_svga.last_submitted_fence = fence;
+    if (fence_out) *fence_out = fence;
+    return true;
+}
+
+static bool svga_submit(bool wait, uint32_t *fence_out) {
+    uint32_t fence = 0;
+    if (fence_out) *fence_out = 0U;
+    if (!svga_emit_dirty_updates()) return false;
+    if (!svga_emit_fence(&fence)) return false;
+    __asm__ volatile ("" : : : "memory");
+    svga_write_reg(SVGA_REG_SYNC, 1U);
+    /* QEMU suele exponer FIFO sin fences (fifo caps=0). En ese caso el
+     * camino anterior esperaba SVGA_REG_BUSY incluso cuando wait=false,
+     * convirtiendo cada repintado de GUI en una barrera sincrona. Solo
+     * esperar cuando el llamador lo pide; si la FIFO se llena,
+     * svga_fifo_emit() conserva su sincronizacion de emergencia. */
+    if (!svga_has_fence()) {
+        if (wait && !svga_sync_fifo()) return false;
+    } else if (wait) {
+        uint32_t spins = 0;
+        while (!svga_fence_passed(fence)) {
+            if (++spins >= SVGA_SYNC_SPIN_LIMIT) return false;
+            __asm__ volatile ("pause");
+        }
+    }
+    if (fence_out) *fence_out = fence;
+    return true;
+}
+
+static bool svga_negotiate_id(void) {
+    static const uint32_t ids[] = {SVGA_ID_2, SVGA_ID_1, SVGA_ID_0};
+    for (uint32_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+        svga_write_reg(SVGA_REG_ID, ids[i]);
+        if (svga_read_reg(SVGA_REG_ID) == ids[i]) {
+            g_svga.protocol_id = ids[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool svga_init_fifo(void) {
+    uint32_t register_count, minimum;
+    if (!g_svga.fifo_start || g_svga.fifo_size < SVGA_FIFO_MIN_QUEUE + 16U)
+        return false;
+    g_svga.fifo = (volatile uint32_t *)(uintptr_t)g_svga.fifo_start;
+    svga_write_reg(SVGA_REG_CONFIG_DONE, 0U);
+    register_count = svga_read_reg(SVGA_REG_MEM_REGS);
+    if (register_count < SVGA_FIFO_LEGACY_REGS ||
+        register_count > g_svga.fifo_size / 4U)
+        register_count = (g_svga.capabilities & SVGA_CAP_EXTENDED_FIFO)
+            ? SVGA_FIFO_EXT_REGS : SVGA_FIFO_LEGACY_REGS;
+    minimum = register_count * 4U;
+    if (minimum + SVGA_FIFO_MIN_QUEUE > g_svga.fifo_size) {
+        minimum = SVGA_FIFO_LEGACY_REGS * 4U;
+        if (minimum + SVGA_FIFO_MIN_QUEUE > g_svga.fifo_size) return false;
+    }
+    g_svga.fifo_register_count = minimum / 4U;
+    g_svga.fifo[SVGA_FIFO_MIN] = minimum;
+    g_svga.fifo[SVGA_FIFO_MAX] = g_svga.fifo_size & ~3U;
+    g_svga.fifo[SVGA_FIFO_NEXT_CMD] = minimum;
+    g_svga.fifo[SVGA_FIFO_STOP] = minimum;
+    /* VMware requires the guest 3D hardware version to be advertised before
+     * CONFIG_DONE. QEMU lacks SVGA_CAP_3D, so this write is never attempted
+     * there and the 2D path remains unchanged. */
+    if (BLES_VMWARE_EXPERIMENTAL_ACCEL &&
+        (g_svga.capabilities & (SVGA_CAP_3D | SVGA_CAP_EXTENDED_FIFO)) ==
+            (SVGA_CAP_3D | SVGA_CAP_EXTENDED_FIFO) &&
+        g_svga.fifo_register_count > SVGA_FIFO_GUEST_3D_HWVERSION)
+        g_svga.fifo[SVGA_FIFO_GUEST_3D_HWVERSION] =
+            SVGA3D_GUEST_HWVERSION;
+    __asm__ volatile ("" : : : "memory");
+    svga_write_reg(SVGA_REG_CONFIG_DONE, 1U);
+    g_svga.fifo_capabilities = 0U;
+    if ((g_svga.capabilities & SVGA_CAP_EXTENDED_FIFO) && minimum >= 20U)
+        g_svga.fifo_capabilities = g_svga.fifo[SVGA_FIFO_CAPABILITIES];
+    return true;
+}
+
+static bool svga_mode_fits(uint32_t width, uint32_t height) {
+    uint64_t required;
+    if (!width || !height || width > g_svga.max_width ||
+        height > g_svga.max_height) return false;
+    required = (uint64_t)width * height * 4U;
+    if (!g_svga.vram_size) return true;
+    return required <= g_svga.vram_size;
+}
+
+static void svga_free_gmr_memory(void) {
+    if (g_svga.gmr_allocation) kfree(g_svga.gmr_allocation);
+    g_svga.gmr_allocation = NULL;
+    g_svga.gmr_buffer = NULL;
+    g_svga.gmr_size = 0U;
+    g_svga.gmr_pages = 0U;
+    g_svga.gmr_defined = false;
+    g_svga.gmr_present = false;
+}
+
+static void svga_release_gmr_resources(void) {
+    uint32_t undefine[3] = {SVGA_CMD_DEFINE_GMR2, SVGA_GMR_ID, 0U};
+    bool emitted = false;
+
+    if (g_svga.active && g_svga.fifo) {
+        if (g_svga.last_submitted_fence)
+            (void)svga_wait_fence(g_svga.last_submitted_fence);
+        if (g_svga.gmr_defined) {
+            emitted = svga_fifo_emit(undefine, 3U) || emitted;
+            g_svga.gmr_defined = false;
+        }
+        if (g_svga.screen_defined) {
+            emitted = svga_emit_define_gmrfb(SVGA_GMR_FRAMEBUFFER,
+                                              g_svga.fb_offset,
+                                              g_svga.pitch) || emitted;
+        }
+        if (emitted) (void)svga_submit(true, NULL);
+    }
+    svga_free_gmr_memory();
+}
+
+static void svga_release_accel_resources(void) {
+    uint32_t destroy[2] = {SVGA_CMD_DESTROY_SCREEN, 0U};
+
+    svga_release_gmr_resources();
+    if (g_svga.active && g_svga.fifo && g_svga.screen_defined) {
+        if (svga_fifo_emit(destroy, 2U)) (void)svga_submit(true, NULL);
+    }
+    g_svga.screen_defined = false;
+}
+
+static bool svga_emit_define_gmrfb(uint32_t gmr_id, uint32_t offset,
+                                   uint32_t pitch) {
+    uint32_t command[5];
+    command[0] = SVGA_CMD_DEFINE_GMRFB;
+    command[1] = gmr_id;
+    command[2] = offset;
+    command[3] = pitch;
+    command[4] = 32U | (24U << 8); /* bitsPerPixel + colorDepth */
+    return svga_fifo_emit(command, 5U);
+}
+
+static bool svga_define_screen_framebuffer(void) {
+    uint32_t command[12];
+    if (!(g_svga.fifo_capabilities & (SVGA_FIFO_CAP_SCREEN_OBJECT |
+                                      SVGA_FIFO_CAP_SCREEN_OBJECT_2)))
+        return false;
+    command[0] = SVGA_CMD_DEFINE_SCREEN;
+    command[1] = 44U; /* sizeof SVGAScreenObject */
+    command[2] = 0U;
+    command[3] = SVGA_SCREEN_MUST_BE_SET | SVGA_SCREEN_IS_PRIMARY;
+    command[4] = g_svga.width;
+    command[5] = g_svga.height;
+    command[6] = 0U;
+    command[7] = 0U;
+    command[8] = SVGA_GMR_FRAMEBUFFER;
+    command[9] = 0U;
+    command[10] = g_svga.pitch;
+    command[11] = 0U;
+    if (!svga_fifo_emit(command, 12U)) return false;
+    g_svga.screen_defined = true;
+    return true;
+}
+
+static bool svga_setup_screen_object(void) {
+    uint32_t destroy[2] = {SVGA_CMD_DESTROY_SCREEN, 0U};
+    if (!(g_svga.fifo_capabilities & (SVGA_FIFO_CAP_SCREEN_OBJECT |
+                                      SVGA_FIFO_CAP_SCREEN_OBJECT_2)))
+        return false;
+    if (!svga_define_screen_framebuffer() ||
+        !svga_emit_define_gmrfb(SVGA_GMR_FRAMEBUFFER, g_svga.fb_offset,
+                                g_svga.pitch) ||
+        !svga_submit(true, NULL)) {
+        if (g_svga.screen_defined) {
+            (void)svga_fifo_emit(destroy, 2U);
+            (void)svga_submit(true, NULL);
+        }
+        g_svga.screen_defined = false;
+        return false;
+    }
+    return true;
+}
+
+static bool svga_setup_gmr_backbuffer(void) {
+    uint32_t max_ids, max_pages, bytes, pages;
+    uint32_t *command;
+    uint32_t define[3];
+    uintptr_t aligned;
+
+    svga_release_gmr_resources();
+    if (!g_svga.screen_defined ||
+        !(g_svga.capabilities & SVGA_CAP_GMR2) ||
+        !(g_svga.fifo_capabilities & SVGA_FIFO_CAP_GMR2))
+        return false;
+
+    max_ids = svga_read_reg(SVGA_REG_GMR_MAX_IDS);
+    max_pages = svga_read_reg(SVGA_REG_GMRS_MAX_PAGES);
+    bytes = g_svga.pitch * g_svga.height;
+    pages = ALIGN_UP(bytes, SVGA_PAGE_SIZE) / SVGA_PAGE_SIZE;
+    if (max_ids <= SVGA_GMR_ID || !pages || (max_pages && pages > max_pages))
+        return false;
+
+    g_svga.gmr_allocation = kmalloc((size_t)pages * SVGA_PAGE_SIZE +
+                                     SVGA_PAGE_SIZE - 1U);
+    if (!g_svga.gmr_allocation) return false;
+    aligned = ALIGN_UP((uintptr_t)g_svga.gmr_allocation, SVGA_PAGE_SIZE);
+    g_svga.gmr_buffer = (uint8_t *)aligned;
+    g_svga.gmr_size = pages * SVGA_PAGE_SIZE;
+    g_svga.gmr_pages = pages;
+    kmemset(g_svga.gmr_buffer, 0, g_svga.gmr_size);
+
+    define[0] = SVGA_CMD_DEFINE_GMR2;
+    define[1] = SVGA_GMR_ID;
+    define[2] = pages;
+    if (!svga_fifo_emit(define, 3U)) goto fail;
+    g_svga.gmr_defined = true;
+
+    command = (uint32_t *)kmalloc((size_t)(5U + pages) * sizeof(uint32_t));
+    if (!command) goto fail;
+    command[0] = SVGA_CMD_REMAP_GMR2;
+    command[1] = SVGA_GMR_ID;
+    command[2] = SVGA_REMAP_GMR2_PPN32;
+    command[3] = 0U;
+    command[4] = pages;
+    for (uint32_t i = 0; i < pages; i++)
+        command[5U + i] = (uint32_t)((aligned >> 12) + i);
+    if (!svga_fifo_emit(command, 5U + pages)) {
+        kfree(command);
+        goto fail;
+    }
+    kfree(command);
+
+    if (!svga_emit_define_gmrfb(SVGA_GMR_ID, 0U, g_svga.pitch)) goto fail;
+    if (!svga_submit(true, NULL)) goto fail;
+    g_svga.gmr_defined = true;
+    g_svga.gmr_present = true;
+    return true;
+
+fail:
+    svga_release_gmr_resources();
+    return false;
+}
+
+static bool svga_set_mode_internal(gfx_info_t *info, uint16_t width,
+                                   uint16_t height) {
+    uint32_t actual_width, actual_height, actual_bpp, pitch, offset;
+    uint64_t required;
+    if (!info || !svga_mode_fits(width, height)) return false;
+
+    if (g_svga.active) {
+        (void)svga_submit(true, NULL);
+        /* Screen objects and the GMR framebuffer belong to the old mode.
+         * Tear them down before changing geometry so VMware never keeps
+         * references to stale pitches or backing memory. */
+        svga_release_accel_resources();
+    }
+    svga_write_reg(SVGA_REG_ENABLE, 0U);
+    svga_write_reg(SVGA_REG_WIDTH, width);
+    svga_write_reg(SVGA_REG_HEIGHT, height);
+    svga_write_reg(SVGA_REG_BITS_PER_PIXEL, 32U);
+    svga_write_reg(SVGA_REG_ENABLE, 1U);
+
+    actual_width = svga_read_reg(SVGA_REG_WIDTH);
+    actual_height = svga_read_reg(SVGA_REG_HEIGHT);
+    actual_bpp = svga_read_reg(SVGA_REG_BITS_PER_PIXEL);
+    pitch = svga_read_reg(SVGA_REG_BYTES_PER_LINE);
+    offset = svga_read_reg(SVGA_REG_FB_OFFSET);
+    if (!pitch) pitch = actual_width * 4U;
+    required = (uint64_t)pitch * actual_height;
+    if (actual_width != width || actual_height != height || actual_bpp != 32U ||
+        pitch > 0xFFFFU || offset > 0xFFFFFFFFU - g_svga.fb_start ||
+        (g_svga.vram_size && required + offset > g_svga.vram_size))
+        return false;
+
+    g_svga.width = actual_width;
+    g_svga.height = actual_height;
+    g_svga.pitch = pitch;
+    g_svga.fb_offset = offset;
+    g_svga.framebuffer = g_svga.fb_start + offset;
+    g_svga.dirty_count = 0U;
+    g_svga.offscreen_base = ALIGN_UP(offset + pitch * actual_height,
+                                     SVGA_SURFACE_ALIGN);
+    kmemset(g_svga.surfaces, 0, sizeof(g_svga.surfaces));
+    kmemset(g_svga.transport_allocs, 0, sizeof(g_svga.transport_allocs));
+    g_svga.screen_defined = false;
+    g_svga.cursor_defined = false;
+    g_svga.cursor_visible = false;
+    g_svga.cursor_position_valid = false;
+
+    info->mode = GFX_MODE_VMWARE_SVGA;
+    info->framebuffer = g_svga.framebuffer;
+    info->width = (uint16_t)actual_width;
+    info->height = (uint16_t)actual_height;
+    info->pitch = (uint16_t)pitch;
+    info->bpp = 32;
+
+    if (BLES_VMWARE_EXPERIMENTAL_ACCEL && svga_setup_screen_object())
+        (void)svga_setup_gmr_backbuffer();
+    svga_transport_advance_generation();
+    return true;
+}
+
+static const pci_device_t *svga_find_device(void) {
+    for (uint32_t i = 0; i < pci_device_count(); i++) {
+        const pci_device_t *dev = pci_device_at(i);
+        if (dev && dev->vendor_id == VMWARE_SVGA_VENDOR_ID &&
+            dev->device_id == VMWARE_SVGA_DEVICE_ID) return dev;
+    }
+    return NULL;
+}
+
+static bool svga_activate(gfx_info_t *info, uint16_t preferred_width,
+                          uint16_t preferred_height) {
+    const pci_device_t *dev;
+    uint32_t io_base, fb_bar_base, fifo_bar_base, width, height;
+    if (!info) return false;
+    if (g_svga.active) {
+        info->mode = GFX_MODE_VMWARE_SVGA;
+        info->framebuffer = g_svga.framebuffer;
+        info->width = (uint16_t)g_svga.width;
+        info->height = (uint16_t)g_svga.height;
+        info->pitch = (uint16_t)g_svga.pitch;
+        info->bpp = 32;
+        return true;
+    }
+
+    dev = svga_find_device();
+    if (!dev || !(dev->bars[0] & 1U)) return false;
+    io_base = dev->bars[0] & 0xFFFFFFFCU;
+    fb_bar_base = (dev->bars[1] & 1U) ? 0U : (dev->bars[1] & 0xFFFFFFF0U);
+    fifo_bar_base = (dev->bars[2] & 1U) ? 0U : (dev->bars[2] & 0xFFFFFFF0U);
+    if (!io_base || io_base > 0xFFF0U) return false;
+
+    kmemset(&g_svga, 0, sizeof(g_svga));
+    g_svga.pci = dev;
+    g_svga.io_base = (uint16_t)io_base;
+    g_svga.next_fence = 1U;
+    if (!pci_enable_command(dev, PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+                            PCI_COMMAND_BUSMASTER)) return false;
+    if (!svga_negotiate_id()) return false;
+
+    g_svga.capabilities = svga_read_reg(SVGA_REG_CAPABILITIES);
+    g_svga.max_width = svga_read_reg(SVGA_REG_MAX_WIDTH);
+    g_svga.max_height = svga_read_reg(SVGA_REG_MAX_HEIGHT);
+    g_svga.fb_start = svga_read_reg(SVGA_REG_FB_START);
+    g_svga.fb_offset = svga_read_reg(SVGA_REG_FB_OFFSET);
+    g_svga.fb_size = svga_read_reg(SVGA_REG_FB_SIZE);
+    g_svga.vram_size = svga_read_reg(SVGA_REG_VRAM_SIZE);
+    g_svga.fifo_start = svga_read_reg(SVGA_REG_MEM_START);
+    g_svga.fifo_size = svga_read_reg(SVGA_REG_MEM_SIZE);
+    if (!g_svga.fb_start) g_svga.fb_start = fb_bar_base;
+    if (!g_svga.fifo_start) g_svga.fifo_start = fifo_bar_base;
+    if (!g_svga.max_width || !g_svga.max_height || !g_svga.fb_start ||
+        !svga_init_fifo()) {
+        svga_write_reg(SVGA_REG_ENABLE, 0U);
+        return false;
+    }
+
+    g_svga.cursor_hw_enabled = svga_cursor_hardware_is_safe();
+    g_svga.active = true;
+    width = preferred_width ? preferred_width : 800U;
+    height = preferred_height ? preferred_height : 600U;
+    if (!svga_mode_fits(width, height)) {
+        width = g_svga.max_width >= 800U ? 800U : g_svga.max_width;
+        height = g_svga.max_height >= 600U ? 600U : g_svga.max_height;
+    }
+    if (!svga_set_mode_internal(info, (uint16_t)width, (uint16_t)height)) {
+        g_svga.active = false;
+        svga_write_reg(SVGA_REG_CONFIG_DONE, 0U);
+        svga_write_reg(SVGA_REG_ENABLE, 0U);
+        return false;
+    }
+
+    kprintf("[SVGA.DVR] VMware SVGA-II ID=%x IO=%x FB=%x FIFO=%x\n",
+            g_svga.protocol_id, g_svga.io_base, g_svga.framebuffer,
+            g_svga.fifo_start);
+    kprintf("[SVGA.DVR] %ux%ux32 pitch=%u caps=%x fifo=%x GMR=%s\n",
+            g_svga.width, g_svga.height, g_svga.pitch,
+            g_svga.capabilities, g_svga.fifo_capabilities,
+            g_svga.gmr_present ? "activo" : "fallback");
+    if (g_svga.cursor_hw_enabled) {
+        kprintf("[SVGA.DVR] cursor: hardware (FIFO bypass 3)\n");
+    } else if (g_svga.capabilities & SVGA_CAP_CURSOR) {
+        kprintf("[SVGA.DVR] cursor: software fallback; bypass 2 relativo es inseguro\n");
+    }
+    return true;
+}
+
+static void svga_disable(void) {
+    if (!g_svga.active) return;
+    (void)svga_submit(true, NULL);
+    (void)svga_cursor_show(false);
+    svga_release_accel_resources();
+    svga_write_reg(SVGA_REG_CONFIG_DONE, 0U);
+    svga_write_reg(SVGA_REG_ENABLE, 0U);
+    g_svga.active = false;
+    g_svga.dirty_count = 0U;
+    svga_transport_advance_generation();
+}
+
+static bool svga_list_modes(gfx_display_mode_t *modes, uint32_t max_modes,
+                            uint32_t *count) {
+    static const gfx_display_mode_t candidates[] = {
+        {640, 480, 32}, {800, 600, 32}, {1024, 768, 32},
+        {1152, 864, 32}, {1280, 720, 32}, {1280, 800, 32},
+        {1280, 1024, 32}, {1366, 768, 32}, {1440, 900, 32},
+        {1600, 900, 32}, {1680, 1050, 32}, {1920, 1080, 32}
+    };
+    uint32_t found = 0;
+    if (!count) return false;
+    *count = 0;
+    if (!g_svga.active || !modes || !max_modes) return false;
+    for (uint32_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (found >= max_modes) break;
+        if (svga_mode_fits(candidates[i].width, candidates[i].height))
+            modes[found++] = candidates[i];
+    }
+    *count = found;
+    return found != 0U;
+}
+
+static bool svga_set_mode(gfx_info_t *info, uint16_t width, uint16_t height,
+                          uint8_t bpp) {
+    uint16_t old_width, old_height;
+    if (!g_svga.active || !info || bpp != 32U) return false;
+    old_width = info->width;
+    old_height = info->height;
+    if (!svga_submit(true, NULL)) return false;
+    svga_release_accel_resources();
+    if (!svga_set_mode_internal(info, width, height)) {
+        (void)svga_set_mode_internal(info, old_width, old_height);
+        return false;
+    }
+    return true;
+}
+
+static void svga_copy_rect_to_vram(const gfx_info_t *info,
+                                   const uint32_t *pixels,
+                                   uint32_t source_pitch, gfx_rect_t rect,
+                                   uint8_t *destination) {
+    for (int y = 0; y < rect.h; y++) {
+        uint32_t *dst = (uint32_t *)(destination +
+            (uint32_t)(rect.y + y) * info->pitch + (uint32_t)rect.x * 4U);
+        const uint32_t *src = pixels +
+            (uint32_t)(rect.y + y) * source_pitch + (uint32_t)rect.x;
+        kmemcpy(dst, src, (size_t)rect.w * sizeof(uint32_t));
+    }
+}
+
+static bool svga_emit_gmr_blit(gfx_rect_t rect) {
+    uint32_t command[9];
+    command[0] = SVGA_CMD_BLIT_GMRFB_TO_SCREEN;
+    command[1] = (uint32_t)rect.x;
+    command[2] = (uint32_t)rect.y;
+    command[3] = (uint32_t)rect.x;
+    command[4] = (uint32_t)rect.y;
+    command[5] = (uint32_t)(rect.x + rect.w);
+    command[6] = (uint32_t)(rect.y + rect.h);
+    command[7] = 0U;
+    command[8] = 0U; /* local padding, not emitted */
+    return svga_fifo_emit(command, 8U);
+}
+
+static bool svga_present_buffer(const gfx_info_t *info,
+                                const uint32_t *pixels,
+                                uint32_t source_pitch,
+                                const gfx_rect_t *rects,
+                                uint32_t rect_count,
+                                uint32_t *fence_out) {
+    if (fence_out) *fence_out = 0U;
+    if (!g_svga.active || !info || !pixels || !rects || !rect_count ||
+        source_pitch < info->width) return false;
+    if (g_svga.gmr_present && g_svga.last_submitted_fence &&
+        !svga_wait_fence(g_svga.last_submitted_fence)) {
+        /* Nunca sobrescribir memoria que el host aún podría estar leyendo. */
+        g_svga.gmr_present = false;
+    }
+    if (rect_count > SVGA_MAX_DIRTY_RECTS) rect_count = SVGA_MAX_DIRTY_RECTS;
+
+    for (uint32_t i = 0; i < rect_count; i++) {
+        int x = rects[i].x, y = rects[i].y;
+        int w = rects[i].w, h = rects[i].h;
+        gfx_rect_t rect;
+        if (!svga_clip_rect(&x, &y, &w, &h)) continue;
+        rect = (gfx_rect_t){x, y, w, h};
+        if (g_svga.gmr_present && g_svga.gmr_buffer) {
+            svga_copy_rect_to_vram(info, pixels, source_pitch, rect,
+                                   g_svga.gmr_buffer);
+            if (!svga_emit_gmr_blit(rect)) {
+                g_svga.gmr_present = false;
+                svga_copy_rect_to_vram(info, pixels, source_pitch, rect,
+                    (uint8_t *)(uintptr_t)info->framebuffer);
+                (void)svga_queue_dirty(x, y, w, h);
+            }
+        } else {
+            svga_copy_rect_to_vram(info, pixels, source_pitch, rect,
+                (uint8_t *)(uintptr_t)info->framebuffer);
+            (void)svga_queue_dirty(x, y, w, h);
+        }
+    }
+    return svga_submit(false, fence_out);
+}
+
+static bool svga_update_rect(int x, int y, int w, int h) {
+    return g_svga.active && svga_queue_dirty(x, y, w, h);
+}
+
+static bool svga_flush(uint32_t *fence_out) {
+    return g_svga.active && svga_submit(false, fence_out);
+}
+
+static bool svga_wait_fence(uint32_t fence) {
+    uint32_t spins = 0;
+    if (!g_svga.active || !fence || !svga_has_fence()) return true;
+    svga_write_reg(SVGA_REG_SYNC, 1U);
+    while (!svga_fence_passed(fence)) {
+        if (++spins >= SVGA_SYNC_SPIN_LIMIT) return false;
+        __asm__ volatile ("pause");
+    }
+    return true;
+}
+
+static bool svga_fill_rect(const gfx_info_t *info, int x, int y,
+                           int w, int h, uint32_t rgb,
+                           uint32_t *fence_out) {
+    uint32_t command[7];
+    if (fence_out) *fence_out = 0U;
+    if (!g_svga.active || !info || !svga_clip_rect(&x, &y, &w, &h))
+        return false;
+    rgb &= 0x00FFFFFFU;
+    if (g_svga.capabilities & SVGA_CAP_RECT_FILL) {
+        command[0] = SVGA_CMD_RECT_FILL;
+        command[1] = rgb;
+        command[2] = (uint32_t)x;
+        command[3] = (uint32_t)y;
+        command[4] = (uint32_t)w;
+        command[5] = (uint32_t)h;
+        if (svga_fifo_emit(command, 6U)) return svga_submit(false, fence_out);
+    }
+    if ((g_svga.fifo_capabilities & SVGA_FIFO_CAP_ACCELFRONT)) {
+        command[0] = SVGA_CMD_FRONT_ROP_FILL;
+        command[1] = rgb;
+        command[2] = (uint32_t)x;
+        command[3] = (uint32_t)y;
+        command[4] = (uint32_t)w;
+        command[5] = (uint32_t)h;
+        command[6] = SVGA_ROP_COPY;
+        if (svga_fifo_emit(command, 7U)) return svga_submit(false, fence_out);
+    }
+    for (int row = 0; row < h; row++) {
+        uint32_t *dst = (uint32_t *)(uintptr_t)
+            (info->framebuffer + (uint32_t)(y + row) * info->pitch) + x;
+        for (int col = 0; col < w; col++) dst[col] = rgb;
+    }
+    (void)svga_queue_dirty(x, y, w, h);
+    return svga_submit(false, fence_out);
+}
+
+static uint32_t svga_apply_rop(uint32_t source, uint32_t destination,
+                               gfx_rop_t rop) {
+    source &= 0x00FFFFFFU;
+    destination &= 0x00FFFFFFU;
+    switch (rop) {
+        case GFX_ROP_XOR: return source ^ destination;
+        case GFX_ROP_AND: return source & destination;
+        case GFX_ROP_OR: return source | destination;
+        case GFX_ROP_INVERT: return (~destination) & 0x00FFFFFFU;
+        case GFX_ROP_COPY:
+        default: return source;
+    }
+}
+
+static uint32_t svga_hw_rop(gfx_rop_t rop) {
+    switch (rop) {
+        case GFX_ROP_XOR: return SVGA_ROP_XOR;
+        case GFX_ROP_AND: return SVGA_ROP_AND;
+        case GFX_ROP_OR: return SVGA_ROP_OR;
+        case GFX_ROP_INVERT: return SVGA_ROP_INVERT;
+        case GFX_ROP_COPY:
+        default: return SVGA_ROP_COPY;
+    }
+}
+
+static bool svga_clip_blit(const gfx_info_t *info, int *src_x, int *src_y,
+                           int *dst_x, int *dst_y, int *w, int *h) {
+    if (!info || !src_x || !src_y || !dst_x || !dst_y || !w || !h ||
+        *w <= 0 || *h <= 0) return false;
+    if (*src_x < 0) { int d = -*src_x; *src_x = 0; *dst_x += d; *w -= d; }
+    if (*src_y < 0) { int d = -*src_y; *src_y = 0; *dst_y += d; *h -= d; }
+    if (*dst_x < 0) { int d = -*dst_x; *dst_x = 0; *src_x += d; *w -= d; }
+    if (*dst_y < 0) { int d = -*dst_y; *dst_y = 0; *src_y += d; *h -= d; }
+    if (*src_x + *w > info->width) *w = info->width - *src_x;
+    if (*dst_x + *w > info->width) *w = info->width - *dst_x;
+    if (*src_y + *h > info->height) *h = info->height - *src_y;
+    if (*dst_y + *h > info->height) *h = info->height - *dst_y;
+    return *w > 0 && *h > 0;
+}
+
+static bool svga_bitblt(const gfx_info_t *info, int src_x, int src_y,
+                        int dst_x, int dst_y, int w, int h, gfx_rop_t rop,
+                        uint32_t *fence_out) {
+    uint32_t command[8];
+    int row_start, row_end, row_step;
+    if (fence_out) *fence_out = 0U;
+    if (!g_svga.active || !svga_clip_blit(info, &src_x, &src_y, &dst_x,
+                                           &dst_y, &w, &h)) return false;
+
+    if (rop == GFX_ROP_COPY && (g_svga.capabilities & SVGA_CAP_RECT_COPY)) {
+        command[0] = SVGA_CMD_RECT_COPY;
+        command[1] = (uint32_t)src_x;
+        command[2] = (uint32_t)src_y;
+        command[3] = (uint32_t)dst_x;
+        command[4] = (uint32_t)dst_y;
+        command[5] = (uint32_t)w;
+        command[6] = (uint32_t)h;
+        if (svga_fifo_emit(command, 7U)) return svga_submit(false, fence_out);
+    } else if ((g_svga.capabilities & SVGA_CAP_RASTER_OP) &&
+               rop != GFX_ROP_INVERT) {
+        command[0] = SVGA_CMD_RECT_ROP_COPY;
+        command[1] = (uint32_t)src_x;
+        command[2] = (uint32_t)src_y;
+        command[3] = (uint32_t)dst_x;
+        command[4] = (uint32_t)dst_y;
+        command[5] = (uint32_t)w;
+        command[6] = (uint32_t)h;
+        command[7] = svga_hw_rop(rop);
+        if (svga_fifo_emit(command, 8U)) return svga_submit(false, fence_out);
+    }
+
+    row_start = dst_y > src_y ? h - 1 : 0;
+    row_end = dst_y > src_y ? -1 : h;
+    row_step = dst_y > src_y ? -1 : 1;
+    for (int row = row_start; row != row_end; row += row_step) {
+        uint32_t *src = (uint32_t *)(uintptr_t)
+            (info->framebuffer + (uint32_t)(src_y + row) * info->pitch) + src_x;
+        uint32_t *dst = (uint32_t *)(uintptr_t)
+            (info->framebuffer + (uint32_t)(dst_y + row) * info->pitch) + dst_x;
+        if (dst_x > src_x && dst_x < src_x + w) {
+            for (int col = w - 1; col >= 0; col--)
+                dst[col] = svga_apply_rop(src[col], dst[col], rop);
+        } else {
+            for (int col = 0; col < w; col++)
+                dst[col] = svga_apply_rop(src[col], dst[col], rop);
+        }
+    }
+    (void)svga_queue_dirty(dst_x, dst_y, w, h);
+    return svga_submit(false, fence_out);
+}
+
+static uint32_t svga_bitmap_stride(uint16_t width, uint32_t depth) {
+    return ((uint32_t)width * depth + 31U) / 32U * 4U;
+}
+
+static bool svga_cursor_bypass3_available(void) {
+    return (g_svga.capabilities & SVGA_CAP_CURSOR) != 0U &&
+           (g_svga.fifo_capabilities & SVGA_FIFO_CAP_CURSOR_BYPASS_3) != 0U;
+}
+
+static bool svga_cursor_hardware_is_safe(void) {
+    /*
+     * BlesKernOS currently receives relative PS/2 mouse packets.  QEMU's
+     * legacy Cursor Bypass 2 path updates the GTK pointer by physically
+     * warping the host cursor whenever CURSOR_ON is written.  That creates a
+     * feedback loop between guest-relative motion and the host pointer.
+     *
+     * Cursor Bypass 3 uses FIFO registers and does not require the legacy
+     * CURSOR_ON register commit, so keep hardware cursor support only on that
+     * modern path.  Older devices fall back to the compositor's software
+     * cursor instead of producing jumps or disappearing pointers.
+     */
+    return svga_cursor_bypass3_available();
+}
+
+static bool svga_cursor_use_legacy_mono(void) {
+    /*
+     * QEMU's legacy vmware-vga frontend advertises the classic cursor but no
+     * extended FIFO/alpha-cursor path.  A 1-bpp AND/XOR cursor is the most
+     * portable format for that interface (and avoids transparent host cursors
+     * seen with some GTK/Win32 builds when using the classic 32-bpp payload).
+     */
+    return (g_svga.capabilities & SVGA_CAP_ALPHA_CURSOR) == 0U &&
+           (g_svga.capabilities & SVGA_CAP_EXTENDED_FIFO) == 0U;
+}
+
+static bool svga_cursor_define(const uint32_t *argb, uint16_t width,
+                               uint16_t height, uint16_t hot_x,
+                               uint16_t hot_y) {
+    uint32_t and_stride, xor_stride, and_bytes, xor_bytes;
+    uint32_t header_words = 8U, total_words;
+    uint32_t *command;
+    uint8_t *and_mask, *xor_mask;
+    bool mono;
+    bool submitted;
+
+    if (!g_svga.active || !g_svga.cursor_hw_enabled ||
+        !(g_svga.capabilities & SVGA_CAP_CURSOR) ||
+        !argb || !width || !height || width > 64U || height > 64U ||
+        hot_x >= width || hot_y >= height) return false;
+
+    mono = svga_cursor_use_legacy_mono();
+    and_stride = svga_bitmap_stride(width, 1U);
+    xor_stride = svga_bitmap_stride(width, mono ? 1U : 32U);
+    and_bytes = and_stride * height;
+    xor_bytes = xor_stride * height;
+    total_words = header_words + (and_bytes + xor_bytes) / 4U;
+    command = (uint32_t *)kmalloc((size_t)total_words * sizeof(uint32_t));
+    if (!command) return false;
+    kmemset(command, 0, (size_t)total_words * sizeof(uint32_t));
+
+    command[0] = SVGA_CMD_DEFINE_CURSOR;
+    command[1] = ++g_svga.cursor_id;
+    if (!g_svga.cursor_id) command[1] = ++g_svga.cursor_id;
+    command[2] = hot_x;
+    command[3] = hot_y;
+    command[4] = width;
+    command[5] = height;
+    command[6] = 1U;              /* profundidad de la mascara AND */
+    command[7] = mono ? 1U : 32U; /* profundidad de la mascara XOR */
+    and_mask = (uint8_t *)&command[8];
+    xor_mask = and_mask + and_bytes;
+
+    /* AND=1 significa transparente; AND=0 deja visible el pixel XOR. */
+    kmemset(and_mask, 0xFF, and_bytes);
+    for (uint16_t y = 0; y < height; y++) {
+        for (uint16_t x = 0; x < width; x++) {
+            uint32_t pixel = argb[(uint32_t)y * width + x];
+            uint8_t alpha = (uint8_t)(pixel >> 24);
+            uint8_t bit = (uint8_t)(0x80U >> (x & 7U));
+            uint32_t and_offset = (uint32_t)y * and_stride + (x >> 3);
+
+            if (alpha < 0x80U) continue;
+            and_mask[and_offset] &= (uint8_t)~bit;
+            if (mono) {
+                uint32_t red = (pixel >> 16) & 0xFFU;
+                uint32_t green = (pixel >> 8) & 0xFFU;
+                uint32_t blue = pixel & 0xFFU;
+                uint32_t luminance = red * 77U + green * 150U + blue * 29U;
+                if (luminance >= (96U << 8))
+                    xor_mask[(uint32_t)y * xor_stride + (x >> 3)] |= bit;
+            } else {
+                ((uint32_t *)(xor_mask + (uint32_t)y * xor_stride))[x] =
+                    pixel & 0x00FFFFFFU;
+            }
+        }
+    }
+
+    if (!svga_fifo_emit(command, total_words)) {
+        kfree(command);
+        return false;
+    }
+    kfree(command);
+
+    /* Espere la definición antes de seleccionar/mostrar el cursor. */
+    submitted = svga_submit(true, NULL);
+    if (!submitted) return false;
+    svga_write_reg(SVGA_REG_CURSOR_ID, g_svga.cursor_id);
+    g_svga.cursor_defined = true;
+    g_svga.cursor_visible = false;
+    g_svga.cursor_position_valid = false;
+    g_svga.cursor_bpp = mono ? 1U : 32U;
+    kprintf("[SVGA.DVR] cursor hardware definido: %ux%u, %u bpp, id=%u\n",
+            width, height, g_svga.cursor_bpp, g_svga.cursor_id);
+    return true;
+}
+
+static bool svga_cursor_move(int x, int y) {
+    if (!g_svga.active || !g_svga.cursor_hw_enabled ||
+        !g_svga.cursor_defined) return false;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (g_svga.width && (uint32_t)x >= g_svga.width)
+        x = (int)g_svga.width - 1;
+    if (g_svga.height && (uint32_t)y >= g_svga.height)
+        y = (int)g_svga.height - 1;
+
+    if (g_svga.cursor_position_valid &&
+        g_svga.cursor_x == x && g_svga.cursor_y == y) return true;
+
+    if (g_svga.fifo_capabilities & SVGA_FIFO_CAP_CURSOR_BYPASS_3) {
+        g_svga.fifo[SVGA_FIFO_CURSOR_X] = (uint32_t)x;
+        g_svga.fifo[SVGA_FIFO_CURSOR_Y] = (uint32_t)y;
+        g_svga.fifo[SVGA_FIFO_CURSOR_ON] = g_svga.cursor_visible
+            ? SVGA_CURSOR_ON_SHOW : SVGA_CURSOR_ON_HIDE;
+        __asm__ volatile ("" : : : "memory");
+        g_svga.fifo[SVGA_FIFO_CURSOR_COUNT]++;
+        __asm__ volatile ("" : : : "memory");
+    } else {
+        /* No se usa actualmente: el bypass 2 cae al cursor software. */
+        svga_write_reg(SVGA_REG_CURSOR_ID, g_svga.cursor_id);
+        svga_write_reg(SVGA_REG_CURSOR_X, (uint32_t)x);
+        svga_write_reg(SVGA_REG_CURSOR_Y, (uint32_t)y);
+        svga_write_reg(SVGA_REG_CURSOR_ON, g_svga.cursor_visible
+            ? SVGA_CURSOR_ON_SHOW : SVGA_CURSOR_ON_HIDE);
+    }
+    g_svga.cursor_x = x;
+    g_svga.cursor_y = y;
+    g_svga.cursor_position_valid = true;
+    return true;
+}
+
+static bool svga_cursor_show(bool visible) {
+    if (!g_svga.active || !g_svga.cursor_hw_enabled ||
+        !g_svga.cursor_defined) return false;
+    if (g_svga.cursor_visible == visible) return true;
+
+    g_svga.cursor_visible = visible;
+    /* El compositor define y muestra antes del primer move. Difiera SHOW hasta
+       disponer de una coordenada válida para evitar un salto inicial. */
+    if (visible && !g_svga.cursor_position_valid) return true;
+
+    if (g_svga.fifo_capabilities & SVGA_FIFO_CAP_CURSOR_BYPASS_3) {
+        g_svga.fifo[SVGA_FIFO_CURSOR_ON] = visible
+            ? SVGA_CURSOR_ON_SHOW : SVGA_CURSOR_ON_HIDE;
+        __asm__ volatile ("" : : : "memory");
+        g_svga.fifo[SVGA_FIFO_CURSOR_COUNT]++;
+        __asm__ volatile ("" : : : "memory");
+    } else {
+        svga_write_reg(SVGA_REG_CURSOR_ID, g_svga.cursor_id);
+        svga_write_reg(SVGA_REG_CURSOR_ON,
+                       visible ? SVGA_CURSOR_ON_SHOW : SVGA_CURSOR_ON_HIDE);
+    }
+    return true;
+}
+
+static gfx_surface_handle_t svga_surface_handle(uint32_t index) {
+    return ((uint32_t)g_svga.surfaces[index].generation << 8) | (index + 1U);
+}
+
+static svga_surface_t *svga_surface_from_handle(gfx_surface_handle_t handle) {
+    uint32_t index = (handle & 0xFFU);
+    uint8_t generation = (uint8_t)(handle >> 8);
+    if (!index || index > SVGA_MAX_SURFACES) return NULL;
+    index--;
+    if (!g_svga.surfaces[index].used ||
+        g_svga.surfaces[index].generation != generation) return NULL;
+    return &g_svga.surfaces[index];
+}
+
+static bool svga_region_overlaps(uint32_t candidate, uint32_t size,
+                                 uint32_t offset, uint32_t used_size) {
+    return candidate < offset + used_size && offset < candidate + size;
+}
+
+static bool svga_surface_find_space(uint32_t size, uint32_t alignment,
+                                    uint32_t *offset_out) {
+    uint32_t candidate;
+    if (!offset_out || !size || !alignment || (alignment & (alignment - 1U)) ||
+        !g_svga.vram_size) return false;
+    candidate = ALIGN_UP(g_svga.offscreen_base, alignment);
+    while (candidate <= g_svga.vram_size &&
+           size <= g_svga.vram_size - candidate) {
+        uint32_t next_candidate = candidate;
+        bool overlap = false;
+        for (uint32_t i = 0; i < SVGA_MAX_SURFACES; i++) {
+            const svga_surface_t *surface = &g_svga.surfaces[i];
+            if (!surface->used) continue;
+            if (svga_region_overlaps(candidate, size, surface->offset,
+                                     surface->size)) {
+                uint32_t after = ALIGN_UP(surface->offset + surface->size,
+                                          alignment);
+                if (after > next_candidate) next_candidate = after;
+                overlap = true;
+            }
+        }
+        for (uint32_t i = 0; i < SVGA_MAX_TRANSPORT_ALLOCS; i++) {
+            const svga_transport_allocation_t *allocation =
+                &g_svga.transport_allocs[i];
+            if (!allocation->used) continue;
+            if (svga_region_overlaps(candidate, size, allocation->offset,
+                                     allocation->size)) {
+                uint32_t after = ALIGN_UP(allocation->offset + allocation->size,
+                                          alignment);
+                if (after > next_candidate) next_candidate = after;
+                overlap = true;
+            }
+        }
+        if (!overlap) {
+            *offset_out = candidate;
+            return true;
+        }
+        if (next_candidate <= candidate) return false;
+        candidate = next_candidate;
+    }
+    return false;
+}
+
+static bool svga_surface_create(uint16_t width, uint16_t height,
+                                gfx_surface_handle_t *handle_out) {
+    uint32_t slot, pitch, size, offset;
+    if (handle_out) *handle_out = GFX_SURFACE_INVALID;
+    if (!g_svga.active || !handle_out || !width || !height) return false;
+    pitch = ALIGN_UP((uint32_t)width * 4U, SVGA_SURFACE_ALIGN);
+    size = ALIGN_UP(pitch * height, SVGA_SURFACE_ALIGN);
+    for (slot = 0; slot < SVGA_MAX_SURFACES; slot++)
+        if (!g_svga.surfaces[slot].used) break;
+    if (slot == SVGA_MAX_SURFACES || !svga_surface_find_space(size, SVGA_SURFACE_ALIGN, &offset))
+        return false;
+    g_svga.surfaces[slot].used = true;
+    if (++g_svga.surfaces[slot].generation == 0U)
+        g_svga.surfaces[slot].generation = 1U;
+    g_svga.surfaces[slot].width = width;
+    g_svga.surfaces[slot].height = height;
+    g_svga.surfaces[slot].offset = offset;
+    g_svga.surfaces[slot].pitch = pitch;
+    g_svga.surfaces[slot].size = size;
+    *handle_out = svga_surface_handle(slot);
+    return true;
+}
+
+static bool svga_surface_destroy(gfx_surface_handle_t handle) {
+    svga_surface_t *surface = svga_surface_from_handle(handle);
+    if (!surface) return false;
+    surface->used = false;
+    return true;
+}
+
+static bool svga_surface_upload(gfx_surface_handle_t handle,
+                                const uint32_t *pixels,
+                                uint32_t source_pitch,
+                                const gfx_rect_t *requested) {
+    svga_surface_t *surface = svga_surface_from_handle(handle);
+    gfx_rect_t rect;
+    uint8_t *base;
+    if (!surface || !pixels || source_pitch < surface->width) return false;
+    rect = requested ? *requested : (gfx_rect_t){0, 0, surface->width,
+                                                 surface->height};
+    if (rect.x < 0) { rect.w += rect.x; rect.x = 0; }
+    if (rect.y < 0) { rect.h += rect.y; rect.y = 0; }
+    if (rect.x + rect.w > surface->width) rect.w = surface->width - rect.x;
+    if (rect.y + rect.h > surface->height) rect.h = surface->height - rect.y;
+    if (rect.w <= 0 || rect.h <= 0) return false;
+    base = (uint8_t *)(uintptr_t)(g_svga.fb_start + surface->offset);
+    for (int y = 0; y < rect.h; y++) {
+        uint32_t *dst = (uint32_t *)(base +
+            (uint32_t)(rect.y + y) * surface->pitch + (uint32_t)rect.x * 4U);
+        const uint32_t *src = pixels +
+            (uint32_t)(rect.y + y) * source_pitch + (uint32_t)rect.x;
+        kmemcpy(dst, src, (size_t)rect.w * 4U);
+    }
+    return true;
+}
+
+static bool svga_surface_blit(const gfx_info_t *info,
+                              gfx_surface_handle_t handle,
+                              int src_x, int src_y, int dst_x, int dst_y,
+                              int w, int h, uint32_t *fence_out) {
+    svga_surface_t *surface = svga_surface_from_handle(handle);
+    uint8_t *base;
+    if (fence_out) *fence_out = 0U;
+    if (!surface || !info || w <= 0 || h <= 0) return false;
+    if (src_x < 0) { int d = -src_x; src_x = 0; dst_x += d; w -= d; }
+    if (src_y < 0) { int d = -src_y; src_y = 0; dst_y += d; h -= d; }
+    if (dst_x < 0) { int d = -dst_x; dst_x = 0; src_x += d; w -= d; }
+    if (dst_y < 0) { int d = -dst_y; dst_y = 0; src_y += d; h -= d; }
+    if (src_x + w > surface->width) w = surface->width - src_x;
+    if (src_y + h > surface->height) h = surface->height - src_y;
+    if (dst_x + w > info->width) w = info->width - dst_x;
+    if (dst_y + h > info->height) h = info->height - dst_y;
+    if (w <= 0 || h <= 0) return false;
+
+    if (g_svga.screen_defined) {
+        gfx_rect_t destination = {dst_x, dst_y, w, h};
+        uint32_t command[8];
+        bool restored;
+
+        command[0] = SVGA_CMD_BLIT_GMRFB_TO_SCREEN;
+        command[1] = (uint32_t)src_x;
+        command[2] = (uint32_t)src_y;
+        command[3] = (uint32_t)destination.x;
+        command[4] = (uint32_t)destination.y;
+        command[5] = (uint32_t)(destination.x + destination.w);
+        command[6] = (uint32_t)(destination.y + destination.h);
+        command[7] = 0U;
+
+        if (svga_emit_define_gmrfb(SVGA_GMR_FRAMEBUFFER, surface->offset,
+                                    surface->pitch) &&
+            svga_fifo_emit(command, 8U)) {
+            restored = g_svga.gmr_present
+                ? svga_emit_define_gmrfb(SVGA_GMR_ID, 0U, g_svga.pitch)
+                : svga_emit_define_gmrfb(SVGA_GMR_FRAMEBUFFER,
+                                         g_svga.fb_offset, g_svga.pitch);
+            if (restored) return svga_submit(false, fence_out);
+        }
+
+        /* Si no se pudo restaurar el GMRFB, no seguir usando la ruta GMR
+         * hasta la próxima reconfiguración. El camino CPU sigue siendo
+         * seguro y conserva la imagen. */
+        g_svga.gmr_present = false;
+        (void)svga_emit_define_gmrfb(SVGA_GMR_FRAMEBUFFER,
+                                     g_svga.fb_offset, g_svga.pitch);
+        (void)svga_submit(true, NULL);
+    }
+
+    base = (uint8_t *)(uintptr_t)(g_svga.fb_start + surface->offset);
+    for (int row = 0; row < h; row++) {
+        const uint32_t *src = (const uint32_t *)(base +
+            (uint32_t)(src_y + row) * surface->pitch) + src_x;
+        uint32_t *dst = (uint32_t *)(uintptr_t)
+            (info->framebuffer + (uint32_t)(dst_y + row) * info->pitch) + dst_x;
+        kmemcpy(dst, src, (size_t)w * 4U);
+    }
+    (void)svga_queue_dirty(dst_x, dst_y, w, h);
+    return svga_submit(false, fence_out);
+}
+
+static bool svga_transport_is_active(void *context UNUSED) {
+    return g_svga.active && g_svga.fifo != NULL;
+}
+
+static uint32_t svga_transport_generation(void *context UNUSED) {
+    return g_svga_transport_generation;
+}
+
+static uint32_t svga_transport_device_capabilities(void *context UNUSED) {
+    uint32_t caps = g_svga.active ? g_svga.capabilities : 0U;
+    if (!BLES_VMWARE_EXPERIMENTAL_ACCEL)
+        caps &= ~(SVGA_CAP_3D | SVGA_CAP_GMR | SVGA_CAP_GMR2 |
+                  SVGA_CAP_SCREEN_OBJECT_2);
+    return caps;
+}
+
+static uint32_t svga_transport_fifo_capabilities(void *context UNUSED) {
+    uint32_t caps = g_svga.active ? g_svga.fifo_capabilities : 0U;
+    if (!BLES_VMWARE_EXPERIMENTAL_ACCEL)
+        caps &= ~(SVGA_FIFO_CAP_SCREEN_OBJECT | SVGA_FIFO_CAP_GMR2 |
+                  SVGA_FIFO_CAP_SCREEN_OBJECT_2);
+    return caps;
+}
+
+static uint32_t svga_transport_fifo_register_count(void *context UNUSED) {
+    return g_svga.active ? g_svga.fifo_register_count : 0U;
+}
+
+static uint32_t svga_transport_fifo_register_read(void *context UNUSED,
+                                                   uint32_t index) {
+    if (!g_svga.active || !g_svga.fifo ||
+        index >= g_svga.fifo_register_count) return 0U;
+    return g_svga.fifo[index];
+}
+
+static bool svga_transport_fifo_register_write(void *context UNUSED,
+                                                uint32_t index,
+                                                uint32_t value) {
+    if (!g_svga.active || !g_svga.fifo ||
+        index >= g_svga.fifo_register_count) return false;
+    g_svga.fifo[index] = value;
+    __asm__ volatile ("" : : : "memory");
+    return true;
+}
+
+static bool svga_transport_emit(void *context UNUSED, const void *bytes,
+                                uint32_t byte_count) {
+    if (!bytes || !byte_count || (byte_count & 3U)) return false;
+    return svga_fifo_emit((const uint32_t *)bytes, byte_count / 4U);
+}
+
+static bool svga_transport_submit(void *context UNUSED, bool wait,
+                                  uint32_t *fence_out) {
+    return svga_submit(wait, fence_out);
+}
+
+static bool svga_transport_wait_fence(void *context UNUSED, uint32_t fence) {
+    return svga_wait_fence(fence);
+}
+
+static uint32_t svga_transport_allocation_handle(uint32_t slot) {
+    return ((uint32_t)g_svga.transport_allocs[slot].generation << 8) |
+           (slot + 1U);
+}
+
+static svga_transport_allocation_t *svga_transport_allocation_from_handle(
+    uint32_t handle) {
+    uint32_t slot = handle & 0xFFU;
+    uint8_t generation = (uint8_t)(handle >> 8);
+    if (!slot || slot > SVGA_MAX_TRANSPORT_ALLOCS) return NULL;
+    slot--;
+    if (!g_svga.transport_allocs[slot].used ||
+        g_svga.transport_allocs[slot].generation != generation) return NULL;
+    return &g_svga.transport_allocs[slot];
+}
+
+static bool svga_transport_vram_allocate(void *context UNUSED, uint32_t size,
+                                          uint32_t alignment,
+                                          uint32_t *handle_out,
+                                          uint32_t *offset_out) {
+    uint32_t slot, offset;
+    if (handle_out) *handle_out = BK_SVGA_TRANSPORT_INVALID_ALLOCATION;
+    if (offset_out) *offset_out = 0U;
+    if (!g_svga.active || !handle_out || !offset_out || !size ||
+        !alignment || (alignment & (alignment - 1U))) return false;
+    size = ALIGN_UP(size, alignment);
+    for (slot = 0; slot < SVGA_MAX_TRANSPORT_ALLOCS; slot++)
+        if (!g_svga.transport_allocs[slot].used) break;
+    if (slot == SVGA_MAX_TRANSPORT_ALLOCS ||
+        !svga_surface_find_space(size, alignment, &offset)) return false;
+    g_svga.transport_allocs[slot].used = true;
+    if (++g_svga.transport_allocs[slot].generation == 0U)
+        g_svga.transport_allocs[slot].generation = 1U;
+    g_svga.transport_allocs[slot].offset = offset;
+    g_svga.transport_allocs[slot].size = size;
+    *handle_out = svga_transport_allocation_handle(slot);
+    *offset_out = offset;
+    return true;
+}
+
+static bool svga_transport_vram_free(void *context UNUSED, uint32_t handle) {
+    svga_transport_allocation_t *allocation =
+        svga_transport_allocation_from_handle(handle);
+    if (!allocation) return false;
+    allocation->used = false;
+    allocation->offset = 0U;
+    allocation->size = 0U;
+    return true;
+}
+
+static void *svga_transport_vram_pointer(void *context UNUSED,
+                                         uint32_t offset, uint32_t size) {
+    if (!g_svga.active || offset > g_svga.vram_size ||
+        size > g_svga.vram_size - offset) return NULL;
+    return (void *)(uintptr_t)(g_svga.fb_start + offset);
+}
+
+static bool svga_transport_display_info(void *context UNUSED,
+                                        uint32_t *width, uint32_t *height,
+                                        uint32_t *pitch,
+                                        uint32_t *framebuffer_offset) {
+    if (!g_svga.active) return false;
+    if (width) *width = g_svga.width;
+    if (height) *height = g_svga.height;
+    if (pitch) *pitch = g_svga.pitch;
+    if (framebuffer_offset) *framebuffer_offset = g_svga.fb_offset;
+    return true;
+}
+
+static const bk_svga_transport_ops_t g_svga_transport_ops = {
+    BK_SVGA_TRANSPORT_ABI_VERSION,
+    sizeof(bk_svga_transport_ops_t),
+    "vmware_svga",
+    NULL,
+    svga_transport_is_active,
+    svga_transport_generation,
+    svga_transport_device_capabilities,
+    svga_transport_fifo_capabilities,
+    svga_transport_fifo_register_count,
+    svga_transport_fifo_register_read,
+    svga_transport_fifo_register_write,
+    svga_transport_emit,
+    svga_transport_submit,
+    svga_transport_wait_fence,
+    svga_transport_vram_allocate,
+    svga_transport_vram_free,
+    svga_transport_vram_pointer,
+    svga_transport_display_info
+};
+
+static uint32_t svga_runtime_capabilities(void) {
+    uint32_t caps = GFX_CAP_PRESENT_BUFFER | GFX_CAP_DIRTY_RECTS |
+                    GFX_CAP_BITBLT | GFX_CAP_FILL;
+    uint64_t visible_end;
+
+    if (!g_svga.active) return 0U;
+    if (g_svga.cursor_hw_enabled) caps |= GFX_CAP_HW_CURSOR;
+    if (svga_has_fence()) caps |= GFX_CAP_FENCE;
+    visible_end = (uint64_t)g_svga.fb_offset +
+                  (uint64_t)g_svga.pitch * g_svga.height;
+    if (g_svga.vram_size > visible_end + SVGA_SURFACE_ALIGN)
+        caps |= GFX_CAP_OFFSCREEN_VRAM;
+    if (BLES_VMWARE_EXPERIMENTAL_ACCEL && g_svga.gmr_present)
+        caps |= GFX_CAP_GMR;
+    if (BLES_VMWARE_EXPERIMENTAL_ACCEL && g_svga.screen_defined)
+        caps |= GFX_CAP_SURFACE_BLIT_HW;
+    if (g_svga.capabilities & SVGA_CAP_RECT_COPY)
+        caps |= GFX_CAP_BITBLT_COPY_HW;
+    if (g_svga.capabilities & SVGA_CAP_RASTER_OP)
+        caps |= GFX_CAP_BITBLT_ROP_HW;
+    return caps;
+}
+
+static bool vmware_svga_driver_init(void) {
+    static const gfx_driver_ops_t ops = {
+        BK_GFX_DRIVER_ABI_VERSION,
+        sizeof(gfx_driver_ops_t),
+        "vmware_svga",
+        200U,
+        GFX_CAP_PRESENT_BUFFER | GFX_CAP_DIRTY_RECTS | GFX_CAP_HW_CURSOR |
+        GFX_CAP_FENCE | GFX_CAP_OFFSCREEN_VRAM | GFX_CAP_GMR |
+        GFX_CAP_BITBLT | GFX_CAP_FILL | GFX_CAP_SURFACE_BLIT_HW,
+        svga_activate,
+        svga_runtime_capabilities,
+        svga_disable,
+        svga_list_modes,
+        svga_set_mode,
+        svga_present_buffer,
+        svga_update_rect,
+        svga_flush,
+        svga_wait_fence,
+        svga_fill_rect,
+        svga_bitblt,
+        svga_cursor_define,
+        svga_cursor_move,
+        svga_cursor_show,
+        svga_surface_create,
+        svga_surface_destroy,
+        svga_surface_upload,
+        svga_surface_blit
+    };
+    if (!svga_find_device()) {
+        kprintf("[SVGA.DVR] dispositivo 15AD:0405 no detectado\n");
+        return false;
+    }
+    if (!svga_transport_register(&g_svga_transport_ops)) {
+        kprintf("[SVGA.DVR] el transporte SVGA ya esta ocupado\n");
+        return false;
+    }
+    if (!gfx_register_driver(&ops)) {
+        (void)svga_transport_unregister(&g_svga_transport_ops);
+        return false;
+    }
+    return true;
+}
+
+static void vmware_svga_driver_shutdown(void) {
+    svga_disable();
+    (void)svga_transport_unregister(&g_svga_transport_ops);
+}
+
+const bk_driver_module_t *bleskernos_driver_query(void) {
+    static const bk_driver_module_t module = {
+        BK_DRIVER_ABI_VERSION,
+        sizeof(bk_driver_module_t),
+        "vmware_svga",
+        "VMware SVGA-II 2D: framebuffer, FIFO, BitBlt, VRAM y transporte SVGA3D",
+        vmware_svga_driver_init,
+        vmware_svga_driver_shutdown
+    };
+    return &module;
+}

@@ -17,8 +17,12 @@ typedef struct {
     uint16_t height;
 } gui_gif_animation_t;
 
-/* Decodes the first frame of a GIF87a/GIF89a image into ARGB pixels. */
+/* Decodes uncompressed 24/32-bit BMP and the first GIF frame to ARGB. */
+bool gui_bmp_decode(gui_image_t *image, const uint8_t *data, uint32_t length);
+bool gui_png_decode(gui_image_t *image, const uint8_t *data, uint32_t length);
 bool gui_gif_decode(gui_image_t *image, const uint8_t *data, uint32_t length);
+bool gui_jpeg_decode(gui_image_t *image, const uint8_t *data, uint32_t length);
+bool gui_svg_decode(gui_image_t *image, const uint8_t *data, uint32_t length);
 
 /* Reads and decodes a GIF from the virtual filesystem. */
 bool gui_gif_load(gui_image_t *image, const char *path);

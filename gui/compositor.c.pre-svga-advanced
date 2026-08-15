@@ -1,0 +1,330 @@
+#include "gui.h"
+
+static const char *g_arrow_cursor[GUI_CURSOR_HEIGHT] = {
+    "XX                              ",
+    "XoX                             ",
+    "X.oX                            ",
+    "X..oX                           ",
+    "X...oX                          ",
+    "X....oX                         ",
+    "X.....oX                        ",
+    "X......oX                       ",
+    "X.......oX                      ",
+    "X........oX                     ",
+    "X.....oXXXX                     ",
+    "X..oo.oX                        ",
+    "X.oXX..X                        ",
+    "XoX Xo.oX                       ",
+    "XX   X..X                       ",
+    "     XooX                       ",
+    "      XX                        ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                ",
+    "                                "
+};
+
+static gui_rect_t cursor_rect(const gui_desktop_t *desktop, int x, int y) {
+    int hot_x = desktop && desktop->cursor_custom ? desktop->cursor_hotspot_x : 0;
+    int hot_y = desktop && desktop->cursor_custom ? desktop->cursor_hotspot_y : 0;
+    return (gui_rect_t){x - hot_x, y - hot_y,
+                        GUI_CURSOR_WIDTH, GUI_CURSOR_HEIGHT};
+}
+
+static uint8_t compositor_planned_cursor_rects(const gui_desktop_t *desktop,
+                                               gui_rect_t *rects,
+                                               uint8_t max_rects) {
+    uint8_t count = 0;
+
+    if (!desktop || !rects || !max_rects) return 0;
+    if (desktop->cursor_trail_enabled) {
+        for (uint8_t i = 0;
+             i < desktop->cursor_trail_count && count < max_rects - 1;
+             i++) {
+            rects[count++] = cursor_rect(desktop, desktop->cursor_trail_x[i],
+                                         desktop->cursor_trail_y[i]);
+        }
+    }
+    rects[count++] = cursor_rect(desktop, desktop->mouse_x, desktop->mouse_y);
+    return count;
+}
+
+static void dirty_union(gui_rect_t *dirty, bool *valid, gui_rect_t rect) {
+    if (!dirty || !valid || rect.w <= 0 || rect.h <= 0) return;
+    if (*valid) *dirty = gui_rect_union(*dirty, rect);
+    else {
+        *dirty = rect;
+        *valid = true;
+    }
+}
+
+static bool compositor_content_dirty_rect(gui_desktop_t *desktop,
+                                           gui_rect_t *out) {
+    gui_window_t *window;
+    gui_rect_t screen;
+    gui_rect_t dirty = {0, 0, 0, 0};
+    gui_rect_t clipped;
+    bool valid = false;
+
+    if (!desktop || !out) return false;
+    screen = (gui_rect_t){0, 0, desktop->surface.width,
+                          desktop->surface.height};
+    if (!desktop->paint_valid) {
+        *out = screen;
+        return true;
+    }
+
+    if (desktop->dirty_valid)
+        dirty_union(&dirty, &valid, desktop->dirty_rect);
+
+    window = desktop->first_window;
+    while (window) {
+        if (window->dirty) {
+            if (window->paint_bounds_valid)
+                dirty_union(&dirty, &valid, window->paint_bounds);
+            if (window->visible)
+                dirty_union(&dirty, &valid, window->bounds);
+        }
+        window = window->next;
+    }
+
+    if (!valid) return false;
+    if (!gui_rect_intersect(screen, dirty, &clipped)) return false;
+    *out = clipped;
+    return true;
+}
+
+static void compositor_finish_windows(gui_desktop_t *desktop) {
+    gui_window_t *window;
+
+    if (!desktop) return;
+    window = desktop->first_window;
+    while (window) {
+        if (!window->content_repaint) window->dirty = false;
+        if (window->visible) {
+            window->paint_bounds = window->bounds;
+            window->paint_bounds_valid = true;
+        } else {
+            window->paint_bounds_valid = false;
+        }
+        window = window->next;
+    }
+}
+
+static void paint_cursor_with_palette(gui_surface_t *surface, int x, int y,
+                                      uint32_t dark, uint32_t mid,
+                                      uint32_t light) {
+    for (int row = 0; row < GUI_CURSOR_HEIGHT; row++) {
+        for (int col = 0; col < GUI_CURSOR_WIDTH; col++) {
+            char px = g_arrow_cursor[row][col];
+            uint32_t color;
+
+            if (px == ' ') continue;
+            if (px == 'X') color = dark;
+            else if (px == 'o') color = mid;
+            else color = light;
+
+            gui_gfx_putpixel(surface, x + col, y + row, color);
+        }
+    }
+}
+
+static uint32_t cursor_alpha_blend(uint32_t destination, uint32_t source) {
+    uint32_t alpha = source >> 24;
+    uint32_t inverse;
+    uint32_t rb;
+    uint32_t g;
+    if (!alpha) return destination;
+    if (alpha >= 255U) return source & 0x00FFFFFFU;
+    inverse = 255U - alpha;
+    rb = ((((source & 0x00FF00FFU) * alpha) +
+           ((destination & 0x00FF00FFU) * inverse)) >> 8) & 0x00FF00FFU;
+    g = ((((source & 0x0000FF00U) * alpha) +
+          ((destination & 0x0000FF00U) * inverse)) >> 8) & 0x0000FF00U;
+    return rb | g;
+}
+
+static void paint_cursor(gui_desktop_t *desktop, gui_surface_t *surface,
+                         int x, int y) {
+    int origin_x;
+    int origin_y;
+    if (!desktop || !desktop->cursor_custom || !desktop->cursor_width ||
+        !desktop->cursor_height) {
+        paint_cursor_with_palette(surface, x, y,
+                                  0x00000000, 0x00808080, 0x00FFFFFF);
+        return;
+    }
+    origin_x = x - desktop->cursor_hotspot_x;
+    origin_y = y - desktop->cursor_hotspot_y;
+    for (int row = 0; row < desktop->cursor_height; row++) {
+        int py = origin_y + row;
+        if (py < 0 || py >= surface->height) continue;
+        for (int col = 0; col < desktop->cursor_width; col++) {
+            int px = origin_x + col;
+            uint32_t source;
+            uint32_t destination;
+            if (px < 0 || px >= surface->width) continue;
+            source = desktop->cursor_pixels[row * GUI_CURSOR_WIDTH + col];
+            if (!(source >> 24)) continue;
+            destination = surface->pixels[(uint32_t)py * surface->pitch +
+                                          (uint32_t)px];
+            gui_gfx_putpixel(surface, px, py,
+                             cursor_alpha_blend(destination, source));
+        }
+    }
+}
+
+static bool compositor_has_content_dirty(const gui_desktop_t *desktop) {
+    const gui_window_t *window;
+    if (!desktop || !desktop->paint_valid || desktop->dirty_valid) return true;
+    for (window = desktop->first_window; window; window = window->next)
+        if (window->dirty) return true;
+    return false;
+}
+
+static void cursor_restore_background(gui_desktop_t *desktop) {
+    gui_rect_t rect;
+    if (!desktop || !desktop->cursor_valid ||
+        desktop->cursor_trail_enabled || !desktop->surface.pixels) return;
+    rect = desktop->cursor_rect;
+    for (int row = 0; row < GUI_CURSOR_HEIGHT; row++) {
+        int y = rect.y + row;
+        if (y < 0 || y >= desktop->surface.height) continue;
+        for (int col = 0; col < GUI_CURSOR_WIDTH; col++) {
+            int x = rect.x + col;
+            if (x < 0 || x >= desktop->surface.width) continue;
+            desktop->surface.pixels[(uint32_t)y * desktop->surface.pitch +
+                                    (uint32_t)x] =
+                desktop->cursor_backing[row * GUI_CURSOR_WIDTH + col];
+        }
+    }
+}
+
+static void cursor_save_background(gui_desktop_t *desktop, int x, int y) {
+    if (!desktop || !desktop->surface.pixels) return;
+    for (int row = 0; row < GUI_CURSOR_HEIGHT; row++) {
+        int py = y + row;
+        for (int col = 0; col < GUI_CURSOR_WIDTH; col++) {
+            int px = x + col;
+            uint32_t color = 0U;
+            if (px >= 0 && py >= 0 && px < desktop->surface.width &&
+                py < desktop->surface.height)
+                color = desktop->surface.pixels[(uint32_t)py *
+                    desktop->surface.pitch + (uint32_t)px];
+            desktop->cursor_backing[row * GUI_CURSOR_WIDTH + col] = color;
+        }
+    }
+}
+
+void gui_compositor_paint(gui_desktop_t *desktop) {
+    gui_rect_t content_rect = {0, 0, 0, 0};
+    gui_rect_t present_rects[3];
+    gui_rect_t new_cursor;
+    gui_rect_t screen;
+    gui_rect_t planned[GUI_CURSOR_TRAIL_MAX + 1];
+    uint8_t planned_count;
+    uint8_t present_count = 0;
+    uint32_t dirty_generation;
+    bool content_dirty;
+    bool content_valid;
+    bool old_cursor_valid;
+
+    if (!desktop) return;
+    content_dirty = compositor_has_content_dirty(desktop);
+    content_valid = compositor_content_dirty_rect(desktop, &content_rect);
+    old_cursor_valid = desktop->cursor_valid;
+    screen = (gui_rect_t){0, 0, desktop->surface.width,
+                          desktop->surface.height};
+    planned_count = compositor_planned_cursor_rects(desktop, planned,
+                                                    GUI_CURSOR_TRAIL_MAX + 1);
+    /* Los trails sí forman parte temporal del surface y necesitan recomponer
+       sus posiciones previas. Se mantiene este camino sólo cuando la opción
+       está activada; el cursor normal usa backing store. */
+    if (desktop->cursor_trail_enabled) {
+        bool trail_valid = content_valid;
+        for (uint8_t i = 0; i < desktop->cursor_paint_count; i++)
+            dirty_union(&content_rect, &trail_valid,
+                        desktop->cursor_paint_rects[i]);
+        for (uint8_t i = 0; i < planned_count; i++)
+            dirty_union(&content_rect, &trail_valid, planned[i]);
+        if (trail_valid) {
+            gui_rect_t clipped;
+            if (gui_rect_intersect(screen, content_rect, &clipped)) {
+                content_rect = clipped;
+                content_valid = true;
+                content_dirty = true;
+            }
+        }
+    }
+    /* El cursor no forma parte permanente del contenido. Restaurar su fondo
+       permite moverlo sin volver a ejecutar todos los pintores de ventanas. */
+    cursor_restore_background(desktop);
+    dirty_generation = desktop->dirty_generation;
+    if (content_valid) gui_gfx_set_clip(&desktop->surface, content_rect);
+    if (content_valid &&
+        (content_dirty || desktop->cursor_trail_enabled)) {
+        gui_gfx_clear(&desktop->surface, 0x005080B0);
+        gui_desktop_paint_programs(desktop);
+    }
+    if (desktop->cursor_trail_enabled && planned_count > 1) {
+        for (uint8_t i = 0; i + 1 < planned_count; i++) {
+            uint8_t t = (uint8_t)(48 + (i * 128) /
+                (planned_count > 1 ? planned_count - 1 : 1));
+            uint32_t dark = gui_color_lerp(0x00B8B8B8, 0x00000000, t);
+            uint32_t mid = gui_color_lerp(0x00E0E0E0, 0x00808080, t);
+            paint_cursor_with_palette(&desktop->surface,
+                                      planned[i].x, planned[i].y,
+                                      dark, mid, 0x00FFFFFF);
+        }
+    }
+    gui_gfx_reset_clip(&desktop->surface);
+    {
+        gui_rect_t cursor_area = cursor_rect(desktop, desktop->mouse_x,
+                                             desktop->mouse_y);
+        cursor_save_background(desktop, cursor_area.x, cursor_area.y);
+        paint_cursor(desktop, &desktop->surface,
+                     desktop->mouse_x, desktop->mouse_y);
+        new_cursor = cursor_area;
+    }
+    if (content_valid)
+        present_rects[present_count++] = content_rect;
+    /* Nunca una el cursor con una región de contenido lejana (por ejemplo el
+       reloj del deskbar). Ese bounding box era proporcional a la altura del
+       mouse y explicaba por qué arriba se sentía mucho más lento. */
+    if (old_cursor_valid &&
+        (!content_valid || desktop->cursor_rect.x < content_rect.x ||
+         desktop->cursor_rect.y < content_rect.y ||
+         desktop->cursor_rect.x + desktop->cursor_rect.w >
+             content_rect.x + content_rect.w ||
+         desktop->cursor_rect.y + desktop->cursor_rect.h >
+             content_rect.y + content_rect.h))
+        present_rects[present_count++] = desktop->cursor_rect;
+    if (!content_valid || new_cursor.x < content_rect.x ||
+        new_cursor.y < content_rect.y ||
+        new_cursor.x + new_cursor.w > content_rect.x + content_rect.w ||
+        new_cursor.y + new_cursor.h > content_rect.y + content_rect.h)
+        present_rects[present_count++] = new_cursor;
+    gui_gfx_present_rects(&desktop->surface, present_rects, present_count);
+    if (content_valid) compositor_finish_windows(desktop);
+    /* No borre una invalidacion producida por una app Ring 3 mientras este
+     * frame se estaba componiendo/presentando. */
+    if (content_valid && desktop->dirty_generation == dirty_generation)
+        desktop->dirty_valid = false;
+    desktop->cursor_rect = new_cursor;
+    desktop->cursor_valid = true;
+    desktop->cursor_paint_count = planned_count;
+    for (uint8_t i = 0; i < planned_count; i++)
+        desktop->cursor_paint_rects[i] = planned[i];
+    desktop->paint_valid = true;
+}

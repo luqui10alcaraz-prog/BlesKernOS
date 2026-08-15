@@ -8,6 +8,10 @@
 #include "msghandling.h"
 #include "zbuffer.h"
 
+void tgl_gpu_context_close(ZBuffer *zbuffer);
+void tgl_gpu_context_resize(ZBuffer *zbuffer);
+bool tgl_gpu_resolve(ZBuffer *zbuffer);
+
 ZBuffer *ZB_open(GLint xsize,
                  GLint ysize,
                  GLint mode,
@@ -72,6 +76,7 @@ error:
 
 void ZB_close(ZBuffer *zb)
 {
+    tgl_gpu_context_close(zb);
     if (zb->frame_buffer_allocated)
         gl_free(zb->pbuf);
 
@@ -128,6 +133,7 @@ GLint ZB_resize(ZBuffer *zb, void *frame_buffer, GLint xsize, GLint ysize)
     /* Reset dirty rectangle after resize to avoid stale bounds */
     ZB_resetDirtyRect(zb);
 #endif
+    tgl_gpu_context_resize(zb);
 
     return 0;
 }
@@ -301,6 +307,7 @@ static void ZB_copyBuffer(ZBuffer *zb, void *buf, GLint linesize)
 #if TGL_FEATURE_RENDER_BITS == 16
 void ZB_copyFrameBuffer(ZBuffer *zb, void *buf, GLint linesize)
 {
+    (void)tgl_gpu_resolve(zb);
     ZB_copyBuffer(zb, buf, linesize);
 }
 #endif
@@ -311,6 +318,7 @@ void ZB_copyFrameBuffer(ZBuffer *zb, void *buf, GLint linesize)
 
 void ZB_copyFrameBuffer(ZBuffer *zb, void *buf, GLint linesize)
 {
+    (void)tgl_gpu_resolve(zb);
     ZB_copyBuffer(zb, buf, linesize);
 }
 #endif

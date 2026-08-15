@@ -653,7 +653,33 @@ void glTexEnvi(GLint target, GLint pname, GLint param)
 
 void glTexParameteri(GLint target, GLint pname, GLint param)
 {
+    GLContext *c = gl_get_context();
 #include "error_check_no_context.h"
+    if (!c || !c->current_texture || target != GL_TEXTURE_2D) return;
+    switch (pname) {
+    case GL_TEXTURE_MIN_FILTER:
+        if (param == GL_NEAREST || param == GL_LINEAR ||
+            param == GL_NEAREST_MIPMAP_NEAREST ||
+            param == GL_NEAREST_MIPMAP_LINEAR ||
+            param == GL_LINEAR_MIPMAP_NEAREST ||
+            param == GL_LINEAR_MIPMAP_LINEAR)
+            c->current_texture->min_filter = param;
+        break;
+    case GL_TEXTURE_MAG_FILTER:
+        if (param == GL_NEAREST || param == GL_LINEAR)
+            c->current_texture->mag_filter = param;
+        break;
+    case GL_TEXTURE_WRAP_S:
+        if (param == GL_REPEAT || param == GL_CLAMP)
+            c->current_texture->wrap_s = param;
+        break;
+    case GL_TEXTURE_WRAP_T:
+        if (param == GL_REPEAT || param == GL_CLAMP)
+            c->current_texture->wrap_t = param;
+        break;
+    default:
+        break;
+    }
 }
 
 /*
@@ -729,7 +755,8 @@ void glCallList(GLuint list)
     gl_add_op(p);
 }
 void glFlush(void)
-{ /* nothing to do */
+{
+    tgl_gpu_flush();
 }
 
 void glHint(GLint target, GLint mode)

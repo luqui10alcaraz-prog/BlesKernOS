@@ -1,0 +1,51 @@
+--- Makefile
++++ Makefile
+@@ -20,7 +20,7 @@
+ 
+ # Flags
+ NASM_FLAGS := -f bin
+-CC_FLAGS   := -m32 -mfpmath=387 -mno-sse -mno-sse2 -ffreestanding -fno-builtin -nostdlib -nostdinc -Os -Wall -MMD -MP -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables
++CC_FLAGS   := -march=i486 -mtune=pentium -m32 -mfpmath=387 -mno-sse -mno-sse2 -ffreestanding -fno-builtin -nostdlib -nostdinc -Os -Wall -MMD -MP -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables
+ LD_FLAGS   := -m elf_i386 -T kernel/linker.ld
+ INCLUDE_FLAGS := -I. -Ikernel -Iprograms -Ilibs/tinygl -Ilibs/src
+ WIN32_CFLAGS := -m32 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -ffunction-sections -fdata-sections
+@@ -450,8 +450,8 @@
+ 	@echo "[MESA] Compilando $<..."
+ 	$(CC) $(MESA35_CFLAGS) -c $< -o $@
+ 
+-# Rutas calientes del escritorio. -mtune cambia la planificación para P6 sin
+-# exigir instrucciones posteriores a i386; el resto del sistema conserva -Os.
++# Rutas calientes del escritorio. -O2 conserva compatibilidad i486 y
++# optimiza la planificación para Pentium; el resto del sistema conserva -Os.
+ HOT_GUI_OBJS := \
+ 	build/kernel/memory.o \
+ 	build/gui/gfx.o \
+@@ -465,7 +465,7 @@
+ $(HOT_GUI_OBJS): build/%.o: %.c | build
+ 	@mkdir -p $(dir $@)
+ 	@echo "[GCC:HOT] Compilando $<..."
+-	$(CC) $(CC_FLAGS) -O2 -mtune=pentium3 $(INCLUDE_FLAGS) -c $< -o $@
++	$(CC) $(CC_FLAGS) -O2 -mtune=pentium $(INCLUDE_FLAGS) -c $< -o $@
+ 
+ # Kernel: compilar C a objeto
+ build/%.o: %.c | build
+--- kernel/linker.ld
++++ kernel/linker.ld
+@@ -63,8 +63,16 @@
+     ASSERT(__bss_end <= 0x00340000,
+            "kernel .bss deja muy poco heap para el modo de 4 MiB")
+ 
++    /* Metadata generada por toolchains modernos que no se usa en el kernel.
++     * Descartarla evita inflar el binario plano y ocupar el espacio reservado
++     * antes de la BSS. */
+     /DISCARD/ : {
+-        *(.note.GNU-stack)
++        *(.eh_frame)
++        *(.eh_frame.*)
++        *(.eh_frame_hdr)
++        *(.gcc_except_table)
++        *(.gcc_except_table.*)
++        *(.note*)
+         *(.comment)
+     }
+ }
