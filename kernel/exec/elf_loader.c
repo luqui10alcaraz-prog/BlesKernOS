@@ -392,6 +392,7 @@ static uint32_t elf_vision_private_symbol(const char *name) {
     VISION_PRIVATE_EXPORT(gui_window_begin_content_paint);
     VISION_PRIVATE_EXPORT(gui_window_end_content_paint);
     VISION_PRIVATE_EXPORT(gui_get_desktop);
+    VISION_PRIVATE_EXPORT(gui_vision_owner_pid);
     VISION_PRIVATE_EXPORT(bk_vision_driver_window_event);
     VISION_PRIVATE_EXPORT(task_queue_user_upcall_owned);
     VISION_PRIVATE_EXPORT(task_current_process_id);
